@@ -21,6 +21,7 @@
 #include <limits.h>
 #include <stdint.h>
 #include <time.h>
+#include <sys/stat.h>
 
 #define OFORT_ALLOC_TARGET_CHILD (OFORT_MAX_CHILDREN - 1)
 #ifdef _WIN32
@@ -110,6 +111,10 @@ typedef struct {
     int is_direct;
     int recl;
     int is_formatted;
+    char access[16];
+    char form[16];
+    char action[16];
+    char position[16];
 } OfortUnitFile;
 
 struct OfortInterpreter {
@@ -286,6 +291,7 @@ static int node_is_profiled_statement(const OfortNode *n) {
     case FND_OPEN:
     case FND_CLOSE:
     case FND_REWIND:
+    case FND_INQUIRE:
     case FND_ALLOCATE:
     case FND_DEALLOCATE:
     case FND_RETURN:
@@ -1294,6 +1300,7 @@ static const KeywordEntry fortran_keywords[] = {
     {"SAVE", FTOK_SAVE}, {"DATA", FTOK_DATA},
     {"PRINT", FTOK_PRINT}, {"WRITE", FTOK_WRITE}, {"READ", FTOK_READ},
     {"OPEN", FTOK_OPEN}, {"CLOSE", FTOK_CLOSE}, {"REWIND", FTOK_REWIND},
+    {"INQUIRE", FTOK_INQUIRE},
     {NULL, FTOK_EOF}
 };
 
@@ -1814,6 +1821,7 @@ static const char *token_type_name(OfortTokenType type) {
         case FTOK_OPEN: return "OPEN";
         case FTOK_CLOSE: return "CLOSE";
         case FTOK_REWIND: return "REWIND";
+        case FTOK_INQUIRE: return "INQUIRE";
         case FTOK_TRUE: return ".TRUE.";
         case FTOK_FALSE: return ".FALSE.";
         case FTOK_PLUS: return "'+'";
@@ -1928,7 +1936,15 @@ static const char *token_arg_name(OfortToken *t) {
     if (t->type == FTOK_RESULT) return "result";
     if (t->type == FTOK_ALLOCATABLE) return "allocatable";
     if (t->type == FTOK_END) return "end";
-    if (t->type == FTOK_IN || t->type == FTOK_OUT || t->type == FTOK_INOUT) return NULL;
+    if (t->type == FTOK_READ) return "read";
+    if (t->type == FTOK_WRITE) return "write";
+    if (t->type == FTOK_OPEN) return "open";
+    if (t->type == FTOK_CLOSE) return "close";
+    if (t->type == FTOK_REWIND) return "rewind";
+    if (t->type == FTOK_INQUIRE) return "inquire";
+    if (t->type == FTOK_IN) return "in";
+    if (t->type == FTOK_OUT) return "out";
+    if (t->type == FTOK_INOUT) return "inout";
     return NULL;
 }
 
@@ -3730,34 +3746,40 @@ static OfortNode *parse_open_stmt(OfortInterpreter *I) {
 
     expect(I, FTOK_LPAREN);
     while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
-        if (check(I, FTOK_IDENT) && peek_ahead(I, 1)->type == FTOK_ASSIGN) {
-            OfortToken *name = advance(I);
+        if (check_keyword_arg(I)) {
+            const char *name = token_arg_name(advance(I));
             advance(I); /* = */
-            if (str_eq_nocase(name->str_val, "unit")) {
+            if (str_eq_nocase(name, "unit")) {
                 n->children[0] = parse_expr(I);
                 if (n->n_children < 1) n->n_children = 1;
-            } else if (str_eq_nocase(name->str_val, "newunit")) {
+            } else if (str_eq_nocase(name, "newunit")) {
                 n->children[0] = parse_expr(I);
                 n->bool_val = 1;
                 if (n->n_children < 1) n->n_children = 1;
-            } else if (str_eq_nocase(name->str_val, "file")) {
+            } else if (str_eq_nocase(name, "file")) {
                 n->children[1] = parse_expr(I);
                 if (n->n_children < 2) n->n_children = 2;
-            } else if (str_eq_nocase(name->str_val, "status")) {
+            } else if (str_eq_nocase(name, "status")) {
                 n->children[2] = parse_expr(I);
                 if (n->n_children < 3) n->n_children = 3;
-            } else if (str_eq_nocase(name->str_val, "iostat")) {
+            } else if (str_eq_nocase(name, "iostat")) {
                 n->children[4] = parse_expr(I);
                 if (n->n_children < 5) n->n_children = 5;
-            } else if (str_eq_nocase(name->str_val, "access")) {
+            } else if (str_eq_nocase(name, "access")) {
                 n->children[5] = parse_expr(I);
                 if (n->n_children < 6) n->n_children = 6;
-            } else if (str_eq_nocase(name->str_val, "form")) {
+            } else if (str_eq_nocase(name, "form")) {
                 n->children[6] = parse_expr(I);
                 if (n->n_children < 7) n->n_children = 7;
-            } else if (str_eq_nocase(name->str_val, "recl")) {
+            } else if (str_eq_nocase(name, "recl")) {
                 n->children[7] = parse_expr(I);
                 if (n->n_children < 8) n->n_children = 8;
+            } else if (str_eq_nocase(name, "action")) {
+                n->children[8] = parse_expr(I);
+                if (n->n_children < 9) n->n_children = 9;
+            } else if (str_eq_nocase(name, "position")) {
+                n->children[9] = parse_expr(I);
+                if (n->n_children < 10) n->n_children = 10;
             } else {
                 parse_expr(I);
             }
@@ -3783,12 +3805,15 @@ static OfortNode *parse_close_stmt(OfortInterpreter *I) {
 
     expect(I, FTOK_LPAREN);
     while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
-        if (check(I, FTOK_IDENT) && peek_ahead(I, 1)->type == FTOK_ASSIGN) {
-            OfortToken *name = advance(I);
+        if (check_keyword_arg(I)) {
+            const char *name = token_arg_name(advance(I));
             advance(I); /* = */
-            if (str_eq_nocase(name->str_val, "unit")) {
+            if (str_eq_nocase(name, "unit")) {
                 n->children[0] = parse_expr(I);
                 n->n_children = 1;
+            } else if (str_eq_nocase(name, "status")) {
+                n->children[1] = parse_expr(I);
+                if (n->n_children < 2) n->n_children = 2;
             } else {
                 parse_expr(I);
             }
@@ -4253,6 +4278,59 @@ static OfortNode *parse_deallocate(OfortInterpreter *I) {
     return n;
 }
 
+static OfortNode *parse_inquire_stmt(OfortInterpreter *I) {
+    OfortToken *it = advance(I); /* INQUIRE */
+    OfortNode *n = alloc_node(I, FND_INQUIRE);
+    int cap = 0;
+    n->line = it->line;
+
+    expect(I, FTOK_LPAREN);
+    while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+        if (check_keyword_arg(I)) {
+            const char *name = token_arg_name(advance(I));
+            advance(I); /* = */
+            if (str_eq_nocase(name, "unit")) {
+                n->children[0] = parse_expr(I);
+                if (n->n_children < 1) n->n_children = 1;
+            } else if (str_eq_nocase(name, "file")) {
+                n->children[1] = parse_expr(I);
+                if (n->n_children < 2) n->n_children = 2;
+            } else if (str_eq_nocase(name, "iolength")) {
+                n->children[2] = parse_expr(I);
+                if (n->n_children < 3) n->n_children = 3;
+            } else {
+                OfortNode *target = parse_expr(I);
+                if (n->n_stmts >= cap) {
+                    cap = cap ? cap * 2 : 8;
+                    n->stmts = (OfortNode **)realloc(n->stmts, sizeof(OfortNode *) * cap);
+                    if (!n->stmts) ofort_error(I, "Out of memory");
+                }
+                copy_cstr(n->param_names[n->n_stmts], sizeof(n->param_names[n->n_stmts]), name);
+                n->stmts[n->n_stmts++] = target;
+            }
+        } else {
+            parse_expr(I);
+        }
+        if (check(I, FTOK_COMMA)) advance(I);
+        else break;
+    }
+    expect(I, FTOK_RPAREN);
+
+    while (n->children[2] && !check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
+        OfortNode *item = parse_expr(I);
+        if (n->n_stmts >= cap) {
+            cap = cap ? cap * 2 : 8;
+            n->stmts = (OfortNode **)realloc(n->stmts, sizeof(OfortNode *) * cap);
+            if (!n->stmts) ofort_error(I, "Out of memory");
+        }
+        copy_cstr(n->param_names[n->n_stmts], sizeof(n->param_names[n->n_stmts]), "$iolength_item");
+        n->stmts[n->n_stmts++] = item;
+        if (check(I, FTOK_COMMA)) advance(I);
+        else break;
+    }
+    return n;
+}
+
 static char implicit_type_code(OfortValType type) {
     switch (type) {
         case FVAL_INTEGER: return 'I';
@@ -4641,6 +4719,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     if (t->type == FTOK_OPEN) { leave_spec_section(I); return parse_open_stmt(I); }
     if (t->type == FTOK_CLOSE) { leave_spec_section(I); return parse_close_stmt(I); }
     if (t->type == FTOK_REWIND) { leave_spec_section(I); return parse_rewind_stmt(I); }
+    if (t->type == FTOK_INQUIRE) { leave_spec_section(I); return parse_inquire_stmt(I); }
 
     /* CALL */
     if (t->type == FTOK_CALL && peek_ahead(I, 1)->type == FTOK_IDENT) {
@@ -5870,6 +5949,10 @@ static void set_unit_file(OfortInterpreter *I, int unit, const char *path) {
     entry->is_direct = 0;
     entry->is_formatted = 1;
     entry->recl = 0;
+    copy_cstr(entry->access, sizeof(entry->access), "sequential");
+    copy_cstr(entry->form, sizeof(entry->form), "formatted");
+    copy_cstr(entry->action, sizeof(entry->action), "readwrite");
+    copy_cstr(entry->position, sizeof(entry->position), "asis");
 }
 
 static OfortUnitFile *ensure_unit_file(OfortInterpreter *I, int unit, int for_write) {
@@ -5900,11 +5983,75 @@ static void remove_unit_file(OfortInterpreter *I, int unit) {
 }
 
 static int next_newunit(OfortInterpreter *I) {
-    for (int unit = 10; unit < 10000; unit++) {
+    for (int unit = -10; unit > -10000; unit--) {
         if (!find_unit_file(I, unit)) return unit;
     }
     ofort_error(I, "No available NEWUNIT value");
     return -1;
+}
+
+static int file_size_bytes(const char *path, long long *size_out) {
+    struct stat st;
+    if (size_out) *size_out = -1;
+    if (!path || !*path) return 0;
+    if (stat(path, &st) != 0) return 0;
+    if (size_out) *size_out = (long long)st.st_size;
+    return 1;
+}
+
+static OfortUnitFile *find_unit_by_file(OfortInterpreter *I, const char *path) {
+    char trimmed[512];
+    size_t len = path ? strlen(path) : 0;
+    while (len > 0 && path[len - 1] == ' ') len--;
+    if (len >= sizeof(trimmed)) len = sizeof(trimmed) - 1;
+    if (len > 0) memcpy(trimmed, path, len);
+    trimmed[len] = '\0';
+    for (int i = 0; i < I->n_unit_files; i++) {
+        if (strcmp(I->unit_files[i].path, trimmed) == 0) return &I->unit_files[i];
+    }
+    return NULL;
+}
+
+static void copy_trimmed_path(char *dst, size_t dst_size, const char *path) {
+    size_t len = path ? strlen(path) : 0;
+    if (dst_size == 0) return;
+    while (len > 0 && path[len - 1] == ' ') len--;
+    if (len >= dst_size) len = dst_size - 1;
+    if (len > 0) memcpy(dst, path, len);
+    dst[len] = '\0';
+}
+
+static void upper_from_lower(char *dst, size_t dst_size, const char *src) {
+    size_t i;
+    if (dst_size == 0) return;
+    if (!src) src = "";
+    for (i = 0; i + 1 < dst_size && src[i]; i++) {
+        dst[i] = (char)toupper((unsigned char)src[i]);
+    }
+    dst[i] = '\0';
+}
+
+static void inquire_assign_target(OfortInterpreter *I, OfortNode *target, OfortValue val) {
+    if (!target || target->type != FND_IDENT) {
+        free_value(&val);
+        ofort_error(I, "INQUIRE output specifier must be a variable");
+    }
+    set_var(I, target->name, val);
+}
+
+static int inquire_iolength_value(OfortValue v) {
+    if (v.type == FVAL_CHARACTER) return v.v.s ? (int)strlen(v.v.s) : 0;
+    if (v.type == FVAL_DOUBLE) return 8;
+    if (v.type == FVAL_REAL) return 4;
+    if (v.type == FVAL_INTEGER) return v.kind > 0 ? v.kind : 4;
+    if (v.type == FVAL_LOGICAL) return 4;
+    if (v.type == FVAL_COMPLEX) return v.kind > 0 ? 2 * v.kind : 8;
+    if (v.type == FVAL_ARRAY) {
+        int total = 0;
+        for (int i = 0; i < v.v.arr.len; i++) total += inquire_iolength_value(v.v.arr.data[i]);
+        return total;
+    }
+    return 0;
 }
 
 static void write_values_to_file(OfortInterpreter *I, const char *path, OfortValue *vals, int nvals) {
@@ -10302,9 +10449,15 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         OfortUnitFile *entry;
         char access_opt[64];
         char form_opt[64];
+        char action_opt[64];
+        char position_opt[64];
         int recl = 0;
         int is_direct = 0;
         int is_formatted = 1;
+        access_opt[0] = '\0';
+        form_opt[0] = '\0';
+        action_opt[0] = '\0';
+        position_opt[0] = '\0';
         if (fv.type != FVAL_CHARACTER)
             ofort_error(I, "OPEN FILE must be CHARACTER");
         if (n->children[5]) {
@@ -10328,6 +10481,20 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             recl = (int)val_to_int(rv);
             free_value(&rv);
         }
+        if (n->children[8]) {
+            OfortValue av2 = eval_node(I, n->children[8]);
+            if (av2.type == FVAL_CHARACTER) {
+                copy_trimmed_fortran_identifier(av2.v.s ? av2.v.s : "", action_opt, sizeof(action_opt));
+            }
+            free_value(&av2);
+        }
+        if (n->children[9]) {
+            OfortValue pv = eval_node(I, n->children[9]);
+            if (pv.type == FVAL_CHARACTER) {
+                copy_trimmed_fortran_identifier(pv.v.s ? pv.v.s : "", position_opt, sizeof(position_opt));
+            }
+            free_value(&pv);
+        }
         if (n->bool_val) {
             unit = next_newunit(I);
             if (n->children[0]->type == FND_IDENT) {
@@ -10344,6 +10511,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             entry->is_direct = is_direct;
             entry->is_formatted = is_formatted;
             entry->recl = recl;
+            copy_cstr(entry->access, sizeof(entry->access), access_opt[0] ? access_opt : (is_direct ? "direct" : "sequential"));
+            copy_cstr(entry->form, sizeof(entry->form), form_opt[0] ? form_opt : (is_formatted ? "formatted" : "unformatted"));
+            copy_cstr(entry->action, sizeof(entry->action), action_opt[0] ? action_opt : "readwrite");
+            copy_cstr(entry->position, sizeof(entry->position), position_opt[0] ? position_opt : "asis");
         }
         if (n->children[2]) {
             OfortValue sv = eval_node(I, n->children[2]);
@@ -10363,8 +10534,140 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
     case FND_CLOSE: {
         if (n->children[0]) {
             OfortValue uv = eval_node(I, n->children[0]);
-            remove_unit_file(I, (int)val_to_int(uv));
+            int unit = (int)val_to_int(uv);
+            OfortUnitFile *entry = find_unit_file(I, unit);
+            char path[512];
+            int delete_file = 0;
+            path[0] = '\0';
+            if (entry) copy_cstr(path, sizeof(path), entry->path);
+            if (n->children[1]) {
+                OfortValue sv = eval_node(I, n->children[1]);
+                if (sv.type == FVAL_CHARACTER && sv.v.s && str_eq_nocase(sv.v.s, "delete")) {
+                    delete_file = 1;
+                }
+                free_value(&sv);
+            }
+            remove_unit_file(I, unit);
+            if (delete_file && path[0]) remove(path);
             free_value(&uv);
+        }
+        break;
+    }
+
+    case FND_INQUIRE: {
+        OfortUnitFile *entry = NULL;
+        char file_path[512];
+        int by_file = 0;
+        int by_unit = 0;
+        int unit = 0;
+        long long size = -1;
+        int exists = 0;
+
+        file_path[0] = '\0';
+        if (n->children[2]) {
+            int total = 0;
+            for (int i = 0; i < n->n_stmts; i++) {
+                if (!str_eq_nocase(n->param_names[i], "$iolength_item")) continue;
+                OfortValue v = eval_node(I, n->stmts[i]);
+                total += inquire_iolength_value(v);
+                free_value(&v);
+            }
+            inquire_assign_target(I, n->children[2], make_integer(total));
+            break;
+        }
+        if (n->children[0]) {
+            OfortValue uv = eval_node(I, n->children[0]);
+            unit = (int)val_to_int(uv);
+            entry = find_unit_file(I, unit);
+            by_unit = 1;
+            if (entry) copy_cstr(file_path, sizeof(file_path), entry->path);
+            free_value(&uv);
+        }
+        if (n->children[1]) {
+            OfortValue fv = eval_node(I, n->children[1]);
+            if (fv.type != FVAL_CHARACTER)
+                ofort_error(I, "INQUIRE FILE must be CHARACTER");
+            copy_trimmed_path(file_path, sizeof(file_path), fv.v.s ? fv.v.s : "");
+            entry = find_unit_by_file(I, file_path);
+            by_file = 1;
+            if (entry) unit = entry->unit;
+            free_value(&fv);
+        }
+        exists = file_size_bytes(file_path, &size);
+
+        for (int i = 0; i < n->n_stmts; i++) {
+            const char *name = n->param_names[i];
+            OfortNode *target = n->stmts[i];
+            char tmp[256];
+            if (str_eq_nocase(name, "$iolength_item")) continue;
+            if (str_eq_nocase(name, "exist")) {
+                inquire_assign_target(I, target, make_logical(exists));
+            } else if (str_eq_nocase(name, "opened")) {
+                inquire_assign_target(I, target, make_logical(entry != NULL));
+            } else if (str_eq_nocase(name, "named")) {
+                inquire_assign_target(I, target, make_logical(file_path[0] != '\0'));
+            } else if (str_eq_nocase(name, "name")) {
+                inquire_assign_target(I, target, make_character(file_path));
+            } else if (str_eq_nocase(name, "number")) {
+                inquire_assign_target(I, target, make_integer(entry ? entry->unit : -1));
+            } else if (str_eq_nocase(name, "access")) {
+                upper_from_lower(tmp, sizeof(tmp), entry ? entry->access : "UNKNOWN");
+                inquire_assign_target(I, target, make_character(tmp));
+            } else if (str_eq_nocase(name, "action")) {
+                upper_from_lower(tmp, sizeof(tmp), entry ? entry->action : "UNKNOWN");
+                inquire_assign_target(I, target, make_character(tmp));
+            } else if (str_eq_nocase(name, "blank")) {
+                inquire_assign_target(I, target, make_character("NULL"));
+            } else if (str_eq_nocase(name, "decimal")) {
+                inquire_assign_target(I, target, make_character("POINT"));
+            } else if (str_eq_nocase(name, "delim")) {
+                inquire_assign_target(I, target, make_character("NONE"));
+            } else if (str_eq_nocase(name, "direct")) {
+                inquire_assign_target(I, target, make_character(entry && entry->is_direct ? "YES" : "NO"));
+            } else if (str_eq_nocase(name, "encoding")) {
+                inquire_assign_target(I, target, make_character("UNKNOWN"));
+            } else if (str_eq_nocase(name, "form")) {
+                upper_from_lower(tmp, sizeof(tmp), entry ? entry->form : "UNKNOWN");
+                inquire_assign_target(I, target, make_character(tmp));
+            } else if (str_eq_nocase(name, "formatted")) {
+                inquire_assign_target(I, target, make_character(entry && entry->is_formatted ? "YES" : "NO"));
+            } else if (str_eq_nocase(name, "unformatted")) {
+                inquire_assign_target(I, target, make_character(entry && !entry->is_formatted ? "YES" : "NO"));
+            } else if (str_eq_nocase(name, "pad")) {
+                inquire_assign_target(I, target, make_character("YES"));
+            } else if (str_eq_nocase(name, "position")) {
+                upper_from_lower(tmp, sizeof(tmp), entry ? entry->position : "UNKNOWN");
+                inquire_assign_target(I, target, make_character(tmp));
+            } else if (str_eq_nocase(name, "read")) {
+                int yes = !entry || !str_eq_nocase(entry->action, "write");
+                inquire_assign_target(I, target, make_character(yes ? "YES" : "NO"));
+            } else if (str_eq_nocase(name, "write")) {
+                int yes = !entry || !str_eq_nocase(entry->action, "read");
+                inquire_assign_target(I, target, make_character(yes ? "YES" : "NO"));
+            } else if (str_eq_nocase(name, "readwrite")) {
+                int yes = entry && str_eq_nocase(entry->action, "readwrite");
+                inquire_assign_target(I, target, make_character(yes ? "YES" : "NO"));
+            } else if (str_eq_nocase(name, "sequential")) {
+                int yes = entry && !str_eq_nocase(entry->access, "stream") && !entry->is_direct;
+                inquire_assign_target(I, target, make_character(yes ? "YES" : "NO"));
+            } else if (str_eq_nocase(name, "stream")) {
+                int yes = entry && str_eq_nocase(entry->access, "stream");
+                inquire_assign_target(I, target, make_character(yes ? "YES" : "NO"));
+            } else if (str_eq_nocase(name, "sign")) {
+                inquire_assign_target(I, target, make_character("PROCESSOR_DEFINED"));
+            } else if (str_eq_nocase(name, "recl")) {
+                inquire_assign_target(I, target, make_integer(entry ? (entry->recl > 0 ? entry->recl : -2) : -1));
+            } else if (str_eq_nocase(name, "size")) {
+                inquire_assign_target(I, target, make_integer(exists ? size : -1));
+            } else if (str_eq_nocase(name, "pos")) {
+                inquire_assign_target(I, target, make_integer(exists ? size + 1 : 1));
+            } else if (str_eq_nocase(name, "iostat")) {
+                inquire_assign_target(I, target, make_integer(0));
+            } else {
+                (void)by_file;
+                (void)by_unit;
+                inquire_assign_target(I, target, make_integer(0));
+            }
         }
         break;
     }
