@@ -171,6 +171,7 @@ struct OfortInterpreter {
     char command_args[OFORT_MAX_PARAMS][OFORT_MAX_STRLEN];
     int procedure_depth;
     int consumed_bare_end;
+    int in_spec_section;
     /* node pool for memory management */
     OfortNode **node_pool;
     int node_pool_len;
@@ -203,6 +204,8 @@ static int assign_token_to_read_target(OfortInterpreter *I, OfortNode *target, c
 static int paren_item_is_implied_do(OfortInterpreter *I);
 static int procedure_body_declares_name(OfortNode *body, const char *name);
 static OfortNode *parse_implied_do(OfortInterpreter *I);
+static OfortNode *parse_expr(OfortInterpreter *I);
+static OfortNode *parse_statement(OfortInterpreter *I);
 static int execute_elemental_function_call(OfortInterpreter *I, OfortNode *call,
                                            OfortFunc *func, OfortNode *fn,
                                            OfortValue *args, int nargs,
@@ -1986,6 +1989,102 @@ static int check_keyword_arg(OfortInterpreter *I) {
     return token_arg_name(peek(I)) != NULL && peek_ahead(I, 1)->type == FTOK_ASSIGN;
 }
 
+static int is_statement_function_header(OfortInterpreter *I) {
+    int depth;
+    int pos;
+    if (!I || !I->in_spec_section) return 0;
+    if (peek(I)->type != FTOK_IDENT) return 0;
+    if (peek_ahead(I, 1)->type != FTOK_LPAREN) return 0;
+
+    depth = 1;
+    pos = I->tok_pos + 2;
+    while (pos < I->n_tokens && depth > 0) {
+        OfortTokenType t = I->tokens[pos].type;
+        if (t == FTOK_NEWLINE || t == FTOK_EOF) return 0;
+        if (t == FTOK_RPAREN) {
+            depth--;
+            if (depth == 0) {
+                if (I->tokens[pos + 1].type == FTOK_ASSIGN) return 1;
+                return 0;
+            }
+        }
+        if (t == FTOK_LPAREN) {
+            depth++;
+        } else if (depth == 1 && t != FTOK_COMMA && t != FTOK_IDENT && t != FTOK_RPAREN) {
+            return 0;
+        }
+        pos++;
+    }
+    return 0;
+}
+
+static OfortNode *parse_statement_function(OfortInterpreter *I) {
+    OfortToken *name_tok = advance(I); /* function name */
+    OfortNode *n = alloc_node(I, FND_STMT_FUNCTION);
+    copy_cstr(n->name, sizeof(n->name), name_tok->str_val);
+    n->line = name_tok->line;
+
+    expect(I, FTOK_LPAREN);
+    while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+        OfortToken *arg;
+        if (n->n_params >= OFORT_MAX_PARAMS) ofort_error(I, "Too many statement function arguments");
+        arg = expect(I, FTOK_IDENT);
+        copy_cstr(n->param_names[n->n_params], sizeof(n->param_names[n->n_params]), arg->str_val);
+        n->param_types[n->n_params] = FVAL_VOID;
+        n->param_optional[n->n_params] = 0;
+        n->n_params++;
+        if (check(I, FTOK_COMMA)) {
+            advance(I);
+        } else {
+            break;
+        }
+    }
+    expect(I, FTOK_RPAREN);
+
+    if (!check(I, FTOK_ASSIGN)) ofort_error(I, "Expected = in statement function");
+    advance(I);
+
+    n->children[0] = parse_expr(I);
+    n->n_children = 1;
+    return n;
+}
+
+static int is_simple_identifier_call(const OfortNode *call) {
+    if (!call || call->type != FND_FUNC_CALL) return 0;
+    for (int i = 0; i < call->n_stmts; i++) {
+        if (!call->stmts || !call->stmts[i] || call->stmts[i]->type != FND_IDENT) return 0;
+    }
+    return 1;
+}
+
+static OfortNode *parse_statement_function_from_call(OfortInterpreter *I, OfortNode *call) {
+    OfortNode *n;
+    if (!I || !call || call->type != FND_FUNC_CALL) return NULL;
+    if (!is_simple_identifier_call(call)) return NULL;
+    n = alloc_node(I, FND_STMT_FUNCTION);
+    copy_cstr(n->name, sizeof(n->name), call->name);
+    n->line = call->line;
+
+    for (int i = 0; i < call->n_stmts && i < OFORT_MAX_PARAMS; i++) {
+        copy_cstr(n->param_names[i], sizeof(n->param_names[i]), call->stmts[i]->name);
+        n->param_types[i] = FVAL_VOID;
+        n->param_optional[i] = 0;
+        n->n_params++;
+    }
+    if (call->n_stmts > OFORT_MAX_PARAMS)
+        ofort_error(I, "Too many statement function arguments");
+
+    if (!check(I, FTOK_ASSIGN)) ofort_error(I, "Expected = in statement function");
+    advance(I);
+    n->children[0] = parse_expr(I);
+    n->n_children = 1;
+    return n;
+}
+
+static void leave_spec_section(OfortInterpreter *I) {
+    if (I) I->in_spec_section = 0;
+}
+
 static OfortNode *parse_interface_block(OfortInterpreter *I) {
     OfortToken *it = advance(I); /* INTERFACE */
     OfortNode *n = alloc_node(I, FND_INTERFACE);
@@ -3703,12 +3802,14 @@ static OfortNode *parse_subroutine(OfortInterpreter *I) {
         }
         expect(I, FTOK_RPAREN);
     }
-    skip_newlines(I);
-
-    /* body */
-    n->children[0] = parse_block_until_end(I, "SUBROUTINE");
-    n->n_children = 1;
-    consume_end(I, "SUBROUTINE");
+    {
+        int prev_spec_section = I->in_spec_section;
+        I->in_spec_section = 1;
+        n->children[0] = parse_block_until_end(I, "SUBROUTINE");
+        I->in_spec_section = prev_spec_section;
+        n->n_children = 1;
+        consume_end(I, "SUBROUTINE");
+    }
     return n;
 }
 
@@ -3749,10 +3850,14 @@ static OfortNode *parse_function_with_type(OfortInterpreter *I, OfortValType res
     }
     skip_newlines(I);
 
-    /* body */
-    n->children[0] = parse_block_until_end(I, "FUNCTION");
-    n->n_children = 1;
-    consume_end(I, "FUNCTION");
+    {
+        int prev_spec_section = I->in_spec_section;
+        I->in_spec_section = 1;
+        n->children[0] = parse_block_until_end(I, "FUNCTION");
+        I->in_spec_section = prev_spec_section;
+        n->n_children = 1;
+        consume_end(I, "FUNCTION");
+    }
     return n;
 }
 
@@ -3785,10 +3890,14 @@ static OfortNode *parse_module(OfortInterpreter *I) {
     n->line = mt->line;
     skip_newlines(I);
 
-    /* body (may include CONTAINS section) */
-    n->children[0] = parse_block_until_end(I, "MODULE");
-    n->n_children = 1;
-    consume_end(I, "MODULE");
+    {
+        int prev_spec_section = I->in_spec_section;
+        I->in_spec_section = 1;
+        n->children[0] = parse_block_until_end(I, "MODULE");
+        I->in_spec_section = prev_spec_section;
+        n->n_children = 1;
+        consume_end(I, "MODULE");
+    }
     return n;
 }
 
@@ -4319,6 +4428,10 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         }
     }
 
+    if (I->in_spec_section && is_statement_function_header(I)) {
+        return parse_statement_function(I);
+    }
+
     /* IMPLICIT NONE */
     if (t->type == FTOK_IMPLICIT) {
         return parse_implicit_stmt(I);
@@ -4362,6 +4475,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         OfortToken *gt = advance(I);
         if (token_ident_upper(gt, "GO")) advance(I); /* TO */
         OfortToken *target = expect(I, FTOK_INT_LIT);
+        leave_spec_section(I);
         OfortNode *n = alloc_node(I, FND_GOTO);
         n->int_val = target->int_val;
         n->line = gt->line;
@@ -4369,11 +4483,13 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     }
 
     if (token_ident_upper(t, "FORALL")) {
+        leave_spec_section(I);
         return parse_forall_stmt(I);
     }
 
     if (token_ident_upper(t, "CONTINUE")) {
         OfortToken *ct = advance(I);
+        leave_spec_section(I);
         OfortNode *n = alloc_node(I, FND_CONTINUE);
         n->int_val = stmt_label;
         n->line = ct->line;
@@ -4477,30 +4593,31 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     if (t->type == FTOK_MODULE) return parse_module(I);
 
     /* IF */
-    if (t->type == FTOK_IF) return parse_if(I);
+    if (t->type == FTOK_IF) { leave_spec_section(I); return parse_if(I); }
 
     /* DO */
-    if (t->type == FTOK_DO) return parse_do(I);
+    if (t->type == FTOK_DO) { leave_spec_section(I); return parse_do(I); }
 
     /* SELECT CASE */
-    if (t->type == FTOK_SELECT) return parse_select_case(I);
+    if (t->type == FTOK_SELECT) { leave_spec_section(I); return parse_select_case(I); }
 
     /* PRINT */
-    if (t->type == FTOK_PRINT) return parse_print(I);
+    if (t->type == FTOK_PRINT) { leave_spec_section(I); return parse_print(I); }
 
     /* WRITE */
-    if (t->type == FTOK_WRITE) return parse_write(I);
+    if (t->type == FTOK_WRITE) { leave_spec_section(I); return parse_write(I); }
 
     /* READ */
-    if (t->type == FTOK_READ) return parse_read_stmt(I);
+    if (t->type == FTOK_READ) { leave_spec_section(I); return parse_read_stmt(I); }
 
     /* OPEN/CLOSE */
-    if (t->type == FTOK_OPEN) return parse_open_stmt(I);
-    if (t->type == FTOK_CLOSE) return parse_close_stmt(I);
-    if (t->type == FTOK_REWIND) return parse_rewind_stmt(I);
+    if (t->type == FTOK_OPEN) { leave_spec_section(I); return parse_open_stmt(I); }
+    if (t->type == FTOK_CLOSE) { leave_spec_section(I); return parse_close_stmt(I); }
+    if (t->type == FTOK_REWIND) { leave_spec_section(I); return parse_rewind_stmt(I); }
 
     /* CALL */
     if (t->type == FTOK_CALL && peek_ahead(I, 1)->type == FTOK_IDENT) {
+        leave_spec_section(I);
         OfortToken *ct = advance(I);
         OfortToken *base = expect(I, FTOK_IDENT);
         OfortNode *callee = alloc_node(I, FND_IDENT);
@@ -4565,6 +4682,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     /* RETURN */
     if (t->type == FTOK_RETURN) {
         advance(I);
+        leave_spec_section(I);
         OfortNode *n = alloc_node(I, FND_RETURN);
         n->line = t->line;
         return n;
@@ -4573,6 +4691,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     /* EXIT */
     if (t->type == FTOK_EXIT) {
         advance(I);
+        leave_spec_section(I);
         if (check(I, FTOK_IDENT)) advance(I); /* optional construct name */
         OfortNode *n = alloc_node(I, FND_EXIT);
         n->line = t->line;
@@ -4582,6 +4701,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     /* CYCLE */
     if (t->type == FTOK_CYCLE) {
         advance(I);
+        leave_spec_section(I);
         if (check(I, FTOK_IDENT)) advance(I); /* optional construct name */
         OfortNode *n = alloc_node(I, FND_CYCLE);
         n->line = t->line;
@@ -4597,6 +4717,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     /* STOP */
     if (t->type == FTOK_STOP) {
         advance(I);
+        leave_spec_section(I);
         OfortNode *n = alloc_node(I, FND_STOP);
         n->line = t->line;
         /* optional stop message */
@@ -4611,10 +4732,10 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     }
 
     /* ALLOCATE */
-    if (t->type == FTOK_ALLOCATE) return parse_allocate(I);
+    if (t->type == FTOK_ALLOCATE) { leave_spec_section(I); return parse_allocate(I); }
 
     /* DEALLOCATE */
-    if (t->type == FTOK_DEALLOCATE) return parse_deallocate(I);
+    if (t->type == FTOK_DEALLOCATE) { leave_spec_section(I); return parse_deallocate(I); }
 
     /* END (bare) — shouldn't be reached normally */
     if (t->type == FTOK_END) {
@@ -4626,6 +4747,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     /* DATA statement: DATA var /value/ — simplified */
     if (t->type == FTOK_DATA) {
         advance(I);
+        leave_spec_section(I);
         /* skip until newline */
         while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) advance(I);
         return NULL;
@@ -4653,12 +4775,17 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
             return n;
         }
         if (check(I, FTOK_ASSIGN)) {
+            if (I->in_spec_section && is_simple_identifier_call(expr)) {
+                OfortNode *sf = parse_statement_function_from_call(I, expr);
+                if (sf) return sf;
+            }
             if (expr->type != FND_IDENT && expr->type != FND_FUNC_CALL &&
                 expr->type != FND_MEMBER && expr->type != FND_ARRAY_REF) {
                 ofort_error(I, "Invalid assignment target at line %d", t->line);
             }
             advance(I);
             OfortNode *rhs = parse_expr(I);
+            leave_spec_section(I);
             OfortNode *n = alloc_node(I, FND_ASSIGN);
             n->children[0] = expr;
             n->children[1] = rhs;
@@ -4667,6 +4794,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
             return n;
         }
         /* Expression statement (e.g., function call as statement) */
+        leave_spec_section(I);
         OfortNode *n = alloc_node(I, FND_EXPR_STMT);
         n->children[0] = expr;
         n->n_children = 1;
@@ -4728,6 +4856,8 @@ static OfortNode *parse_program(OfortInterpreter *I) {
     prog->stmts = NULL;
     prog->n_stmts = 0;
     int cap = 0;
+    int prev_spec_section = I->in_spec_section;
+    I->in_spec_section = 1;
 
     skip_newlines(I);
     while (peek(I)->type != FTOK_EOF) {
@@ -4749,6 +4879,7 @@ static OfortNode *parse_program(OfortInterpreter *I) {
         }
         skip_newlines(I);
     }
+    I->in_spec_section = prev_spec_section;
     return prog;
 }
 
@@ -7204,6 +7335,32 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         if (!func) func = find_matching_generic_func(I, n->name, args, nargs);
         if (func && func->is_function) {
             OfortNode *fn = func->node;
+            if (fn && fn->type == FND_STMT_FUNCTION) {
+                OfortValue result;
+                if (nargs != fn->n_params) {
+                    for (int i = 0; i < nargs; i++) free_value(&args[i]);
+                    ofort_error(I, "Wrong number of arguments in statement function '%s' (expected %d, got %d)",
+                                fn->name, fn->n_params, nargs);
+                }
+                push_scope(I);
+                for (int i = 0; i < fn->n_params; i++) {
+                    if (i < nargs && args[i].type != FVAL_VOID) {
+                        declare_var(I, fn->param_names[i], copy_value(args[i]));
+                    } else if (fn->param_optional[i]) {
+                        declare_absent_optional_var(I, fn->param_names[i]);
+                    } else {
+                        pop_scope(I);
+                        for (int j = 0; j < nargs; j++) free_value(&args[j]);
+                        ofort_error(I, "Missing required argument '%s' in statement function '%s'",
+                                    fn->param_names[i], fn->name);
+                    }
+                }
+                result = eval_node(I, fn->children[0]);
+                pop_scope(I);
+                for (int i = 0; i < nargs; i++) free_value(&args[i]);
+                return result;
+            }
+            fn = func->node;
             OfortValue elemental_result;
             if (execute_elemental_function_call(I, n, func, fn, args, nargs, &elemental_result)) {
                 for (int i = 0; i < nargs; i++) free_value(&args[i]);
@@ -9114,14 +9271,17 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         if (body && body->type == FND_BLOCK) {
             for (int i = 0; i < body->n_stmts; i++) {
                 OfortNode *s = body->stmts[i];
-                if (s && (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION)) {
+                if (s && (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION ||
+                          s->type == FND_STMT_FUNCTION)) {
                     annotate_procedure_params(s);
-                    (void)register_func(I, s->name, s, s->type == FND_FUNCTION);
+                    (void)register_func(I, s->name, s, s->type == FND_FUNCTION || s->type == FND_STMT_FUNCTION);
                 }
             }
             for (int i = 0; i < body->n_stmts; i++) {
                 OfortNode *s = body->stmts[i];
-                if (s && (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION)) continue;
+                if (s && (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION ||
+                          s->type == FND_STMT_FUNCTION))
+                    continue;
                 exec_node(I, s);
                 if (I->goto_active) {
                     int target = find_statement_label(body, I->goto_label);
@@ -9181,10 +9341,11 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     continue;
                 } else if (s->type == FND_INTERFACE) {
                     register_generic(I, s);
-                } else if (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION) {
+                } else if (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION ||
+                           s->type == FND_STMT_FUNCTION) {
                     OfortFunc *func;
                     annotate_procedure_params(s);
-                    func = register_func(I, s->name, s, s->type == FND_FUNCTION);
+                    func = register_func(I, s->name, s, s->type == FND_FUNCTION || s->type == FND_STMT_FUNCTION);
                     copy_cstr(func->module_name, sizeof(func->module_name), mod->name);
                 } else if (s->type == FND_TYPE_DEF) {
                     exec_node(I, s);
@@ -10428,6 +10589,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         for (int i = 0; i < nargs; i++) free_value(&args[i]);
         break;
     }
+
+    case FND_STMT_FUNCTION:
+        (void)register_func(I, n->name, n, 1);
+        break;
 
     case FND_SUBROUTINE:
     case FND_FUNCTION: {
@@ -12746,7 +12911,8 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
         for (int i = 0; i < interp->ast->n_stmts; i++) {
             OfortNode *s = interp->ast->stmts[i];
             if (!s) continue;
-            if (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION || s->type == FND_MODULE) {
+            if (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION ||
+                s->type == FND_STMT_FUNCTION || s->type == FND_MODULE) {
                 exec_node(interp, s);
             }
         }
@@ -12759,7 +12925,8 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
         for (int i = 0; i < interp->ast->n_stmts; i++) {
             OfortNode *s = interp->ast->stmts[i];
             if (!s) continue;
-            if (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION || s->type == FND_MODULE)
+            if (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION ||
+                s->type == FND_STMT_FUNCTION || s->type == FND_MODULE)
                 continue; /* already registered */
             exec_node(interp, s);
             if (interp->goto_active) {
