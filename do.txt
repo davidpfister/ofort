@@ -1,5 +1,3 @@
-fix xstorage_size.f90
-
 fix xallocatable_len.f90
 
 fix xforall.f90
