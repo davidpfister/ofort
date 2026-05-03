@@ -166,6 +166,7 @@ struct OfortInterpreter {
     int current_line;
     int print_expr_statements;
     int suppress_output;
+    int live_stdout;
     int command_argc;
     char command_args[OFORT_MAX_PARAMS][OFORT_MAX_STRLEN];
     int procedure_depth;
@@ -198,6 +199,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
                                 char arg_names[OFORT_MAX_PARAMS][256]);
 static int is_intrinsic(const char *name);
 static void value_to_string(OfortInterpreter *I, OfortValue v, char *buf, int bufsize);
+static int assign_token_to_read_target(OfortInterpreter *I, OfortNode *target, const char *tok);
 static int paren_item_is_implied_do(OfortInterpreter *I);
 static int procedure_body_declares_name(OfortNode *body, const char *name);
 static OfortNode *parse_implied_do(OfortInterpreter *I);
@@ -325,6 +327,15 @@ static void out_appendf(OfortInterpreter *I, const char *fmt, ...) {
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     out_append(I, buf);
+}
+
+static void flush_live_stdout_if_needed(OfortInterpreter *I) {
+    if (!I || !I->live_stdout) return;
+    if (I->out_len <= 0) return;
+    fputs(I->output, stdout);
+    fflush(stdout);
+    I->out_len = 0;
+    I->output[0] = '\0';
 }
 
 static int infer_error_line(const char *message) {
@@ -5838,6 +5849,95 @@ static void assign_line_to_character_target(OfortInterpreter *I, OfortNode *targ
     v->val = make_character(line ? line : "");
 }
 
+static int read_next_token_stdin(char *buf, int bufsize) {
+    int c;
+    int len = 0;
+
+    do {
+        c = fgetc(stdin);
+        if (c == EOF) return 0;
+    } while (isspace((unsigned char)c));
+
+    while (c != EOF && !isspace((unsigned char)c)) {
+        if (len < bufsize - 1) {
+            buf[len++] = (char)c;
+        }
+        c = fgetc(stdin);
+    }
+    buf[len] = '\0';
+    return 1;
+}
+
+static int read_next_line_stdin(char *buf, int bufsize) {
+    if (!fgets(buf, bufsize, stdin)) return 0;
+    buf[strcspn(buf, "\r\n")] = '\0';
+    return 1;
+}
+
+static void flush_stdout_for_read(OfortInterpreter *I) {
+    if (!I) {
+        return;
+    }
+    if (I->out_len <= 0) {
+        fflush(stdout);
+        return;
+    }
+    fputs(I->output, stdout);
+    fflush(stdout);
+    I->out_len = 0;
+    I->output[0] = '\0';
+}
+
+static int read_values_from_stdin(OfortInterpreter *I, OfortNode *n, int is_stream) {
+    char tok[1024];
+    int status = 0;
+
+    flush_stdout_for_read(I);
+
+    if (format_is_character_line_read(n->format_str) && n->n_stmts > 0) {
+        if (!read_next_line_stdin(tok, sizeof(tok))) {
+            tok[0] = '\0';
+            status = 1;
+        }
+        assign_line_to_character_target(I, n->stmts[0], tok);
+        return status;
+    }
+
+    for (int i = 0; i < n->n_stmts; i++) {
+        if (n->stmts[i]->type == FND_IDENT) {
+            OfortVar *v = find_var(I, n->stmts[i]->name);
+            if (v && v->val.type == FVAL_ARRAY) {
+                for (int j = 0; j < v->val.v.arr.len; j++) {
+                    int ok;
+                    if (is_stream) {
+                        ok = read_next_line_stdin(tok, sizeof(tok));
+                    } else {
+                        ok = read_next_token_stdin(tok, sizeof(tok));
+                    }
+                    if (!ok) {
+                        status = 1;
+                        break;
+                    }
+                    assign_token_to_value(&v->val.v.arr.data[j], tok);
+                }
+                continue;
+            }
+        }
+        int ok;
+        if (is_stream) {
+            ok = read_next_line_stdin(tok, sizeof(tok));
+        } else {
+            ok = read_next_token_stdin(tok, sizeof(tok));
+        }
+        if (!ok) {
+            status = 1;
+            break;
+        }
+        assign_token_to_read_target(I, n->stmts[i], tok);
+    }
+    return status;
+}
+
 static int assign_token_to_read_target(OfortInterpreter *I, OfortNode *target, const char *tok) {
     if (target->type == FND_IDENT) {
         OfortVar *v = find_var(I, target->name);
@@ -9713,6 +9813,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         int nvals = 0;
         OfortValue *vals = eval_io_list(I, n, &nvals);
         format_output(I, n->format_str, vals, nvals);
+        flush_live_stdout_if_needed(I);
         for (int i = 0; i < nvals; i++) free_value(&vals[i]);
         free(vals);
         break;
@@ -9723,6 +9824,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         OfortValue *vals = eval_io_list(I, n, &nvals);
         char fmt_buf[OFORT_MAX_STRLEN];
         const char *fmt = write_format_string(I, n, fmt_buf, sizeof(fmt_buf));
+        int wrote_stdout = 0;
+
         if (n->children[0] && write_to_internal_target(I, n->children[0], fmt, vals, nvals)) {
             /* Internal character WRITE completed. */
         } else if (n->children[0] && n->children[0]->type == FND_IDENT) {
@@ -9752,6 +9855,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 free_value(&uv);
                 if (!entry && unit == 6) {
                     format_output(I, fmt, vals, nvals);
+                    wrote_stdout = 1;
                 } else {
                     if (!entry) entry = ensure_unit_file(I, unit, 1);
                     if (!entry) ofort_error(I, "Unit %d is not open", unit);
@@ -9766,6 +9870,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             free_value(&uv);
             if (!entry && unit == 6) {
                 format_output(I, fmt, vals, nvals);
+                wrote_stdout = 1;
             } else {
                 if (!entry) entry = ensure_unit_file(I, unit, 1);
                 if (!entry) ofort_error(I, "Unit %d is not open", unit);
@@ -9774,7 +9879,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
         } else {
             format_output(I, fmt, vals, nvals);
+            wrote_stdout = 1;
         }
+        if (wrote_stdout) flush_live_stdout_if_needed(I);
         for (int i = 0; i < nvals; i++) free_value(&vals[i]);
         free(vals);
         break;
@@ -9790,13 +9897,20 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 int unit = (int)val_to_int(uv);
                 OfortUnitFile *entry = find_unit_file(I, unit);
                 free_value(&uv);
-                if (!entry) entry = ensure_unit_file(I, unit, 0);
-                if (!entry) ofort_error(I, "Unit %d is not open", unit);
-                if (n->bool_val) read_values_from_stream_file(I, entry, n);
-                else {
-                    int status = read_values_from_file(I, entry, n);
+                if (unit == 5) {
+                    int status = read_values_from_stdin(I, n, n->bool_val);
                     if (n->children[4] && n->children[4]->type == FND_IDENT) {
                         set_var(I, n->children[4]->name, make_integer(status));
+                    }
+                } else {
+                    if (!entry) entry = ensure_unit_file(I, unit, 0);
+                    if (!entry) ofort_error(I, "Unit %d is not open", unit);
+                    if (n->bool_val) read_values_from_stream_file(I, entry, n);
+                    else {
+                        int status = read_values_from_file(I, entry, n);
+                        if (n->children[4] && n->children[4]->type == FND_IDENT) {
+                            set_var(I, n->children[4]->name, make_integer(status));
+                        }
                     }
                 }
             }
@@ -12704,6 +12818,12 @@ void ofort_set_print_expr_statements(OfortInterpreter *interp, int enabled) {
 void ofort_set_suppress_output(OfortInterpreter *interp, int enabled) {
     if (interp) {
         interp->suppress_output = enabled ? 1 : 0;
+    }
+}
+
+void ofort_set_live_stdout(OfortInterpreter *interp, int enabled) {
+    if (interp) {
+        interp->live_stdout = enabled ? 1 : 0;
     }
 }
 
