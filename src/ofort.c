@@ -293,6 +293,7 @@ static int node_is_profiled_statement(const OfortNode *n) {
     case FND_CLOSE:
     case FND_REWIND:
     case FND_INQUIRE:
+    case FND_SELECT_RANK:
     case FND_ALLOCATE:
     case FND_DEALLOCATE:
     case FND_RETURN:
@@ -1035,6 +1036,7 @@ static OfortFunc *find_matching_generic_proc(OfortInterpreter *I, const char *na
                 break;
             }
             if (fn->param_n_dims[j] != actual_rank &&
+                fn->param_n_dims[j] != -1 &&
                 !(fn->is_elemental && fn->param_n_dims[j] == 0 && actual_rank > 0) &&
                 !(args[j].type == FVAL_ARRAY && !args[j].v.arr.allocated &&
                   actual_rank == 0 && fn->param_n_dims[j] > 0)) {
@@ -3110,7 +3112,11 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
             decl->n_dims = 0;
             int dim_cap = 0;
             while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
-                if (check(I, FTOK_COLON)) {
+                if (check(I, FTOK_USER_OP) && strcmp(peek(I)->str_val, "..") == 0) {
+                    advance(I);
+                    decl->n_dims = -1; /* assumed-rank dummy: x(..) */
+                    break;
+                } else if (check(I, FTOK_COLON)) {
                     advance(I);
                     decl->dims[decl->n_dims++] = 0;
                 } else if (check(I, FTOK_STAR)) {
@@ -3397,6 +3403,71 @@ static OfortNode *parse_select_case(OfortInterpreter *I) {
     }
     consume_end(I, "SELECT");
     /* skip optional CASE after END SELECT (i.e. END SELECT) -- already consumed */
+    return n;
+}
+
+static OfortNode *parse_select_rank(OfortInterpreter *I) {
+    OfortToken *st = advance(I); /* SELECT */
+    OfortNode *n;
+    int cap = 0;
+    expect(I, FTOK_IDENT); /* RANK */
+    expect(I, FTOK_LPAREN);
+    OfortNode *expr = parse_expr(I);
+    expect(I, FTOK_RPAREN);
+    skip_newlines(I);
+
+    n = alloc_node(I, FND_SELECT_RANK);
+    n->children[0] = expr;
+    n->n_children = 1;
+    n->line = st->line;
+
+    while (!check_end(I, "SELECT") && !check(I, FTOK_EOF)) {
+        skip_newlines(I);
+        if (check_end(I, "SELECT")) break;
+        if (token_ident_upper(peek(I), "RANK")) {
+            OfortToken *rt = advance(I);
+            OfortNode *rb = alloc_node(I, FND_CASE_BLOCK);
+            rb->line = rt->line;
+            if (check(I, FTOK_DEFAULT)) {
+                advance(I);
+                rb->bool_val = 1;
+            } else {
+                expect(I, FTOK_LPAREN);
+                rb->children[0] = parse_expr(I);
+                rb->n_children = 1;
+                expect(I, FTOK_RPAREN);
+            }
+            skip_newlines(I);
+
+            OfortNode *body = alloc_node(I, FND_BLOCK);
+            int bcap = 0;
+            while (!token_ident_upper(peek(I), "RANK") && !check_end(I, "SELECT") && !check(I, FTOK_EOF)) {
+                OfortNode *s;
+                skip_newlines(I);
+                if (token_ident_upper(peek(I), "RANK") || check_end(I, "SELECT")) break;
+                s = parse_statement(I);
+                if (s) {
+                    if (body->n_stmts >= bcap) {
+                        bcap = bcap ? bcap * 2 : 8;
+                        body->stmts = (OfortNode **)realloc(body->stmts, sizeof(OfortNode *) * bcap);
+                        if (!body->stmts) ofort_error(I, "Out of memory");
+                    }
+                    body->stmts[body->n_stmts++] = s;
+                }
+                skip_newlines(I);
+            }
+            rb->children[rb->n_children++] = body;
+            if (n->n_stmts >= cap) {
+                cap = cap ? cap * 2 : 8;
+                n->stmts = (OfortNode **)realloc(n->stmts, sizeof(OfortNode *) * cap);
+                if (!n->stmts) ofort_error(I, "Out of memory");
+            }
+            n->stmts[n->n_stmts++] = rb;
+        } else {
+            advance(I);
+        }
+    }
+    consume_end(I, "SELECT");
     return n;
 }
 
@@ -4200,6 +4271,11 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
             decl->n_dims = 0;
             int dim_cap = 0;
             while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+                if (check(I, FTOK_USER_OP) && strcmp(peek(I)->str_val, "..") == 0) {
+                    advance(I);
+                    decl->n_dims = -1; /* assumed-rank dummy: x(..) */
+                    break;
+                } else
                 if (check(I, FTOK_COLON)) {
                     advance(I);
                     decl->dims[decl->n_dims++] = 0;
@@ -4772,8 +4848,12 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     /* DO */
     if (t->type == FTOK_DO) { leave_spec_section(I); return parse_do(I); }
 
-    /* SELECT CASE */
-    if (t->type == FTOK_SELECT) { leave_spec_section(I); return parse_select_case(I); }
+    /* SELECT CASE / SELECT RANK */
+    if (t->type == FTOK_SELECT) {
+        leave_spec_section(I);
+        if (token_ident_upper(peek_ahead(I, 1), "RANK")) return parse_select_rank(I);
+        return parse_select_case(I);
+    }
 
     /* PRINT */
     if (t->type == FTOK_PRINT) { leave_spec_section(I); return parse_print(I); }
@@ -10349,6 +10429,36 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     matched = 1;
                 }
             }
+        }
+        free_value(&sel);
+        break;
+    }
+
+    case FND_SELECT_RANK: {
+        OfortValue sel = eval_node(I, n->children[0]);
+        int rank = sel.type == FVAL_ARRAY ? sel.v.arr.n_dims : 0;
+        int default_idx = -1;
+        int matched = 0;
+        for (int i = 0; i < n->n_stmts; i++) {
+            OfortNode *rb = n->stmts[i];
+            if (rb->bool_val) {
+                default_idx = i;
+                continue;
+            }
+            if (rb->children[0]) {
+                OfortValue rv = eval_node(I, rb->children[0]);
+                int want = (int)val_to_int(rv);
+                free_value(&rv);
+                if (want == rank) {
+                    exec_node(I, rb->children[rb->n_children - 1]);
+                    matched = 1;
+                    break;
+                }
+            }
+        }
+        if (!matched && default_idx >= 0) {
+            OfortNode *rb = n->stmts[default_idx];
+            exec_node(I, rb->children[rb->n_children - 1]);
         }
         free_value(&sel);
         break;
