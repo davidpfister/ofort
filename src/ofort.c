@@ -10089,6 +10089,11 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             val.type = FVAL_ARRAY;
             memset(&val.v.arr, 0, sizeof(val.v.arr));
             val.v.arr.elem_type = n->val_type;
+            val.v.arr.n_dims = n->n_dims;
+            for (int i = 0; i < n->n_dims && i < 7; i++) {
+                val.v.arr.dims[i] = 0;
+                val.v.arr.lower_bounds[i] = n->has_lower_bound[i] ? n->lower_bounds[i] : 1;
+            }
             if (n->val_type == FVAL_DERIVED)
                 copy_cstr(val.v.arr.elem_type_name, sizeof(val.v.arr.elem_type_name), n->str_val);
             val.v.arr.allocated = 0;
@@ -11759,7 +11764,7 @@ static const char *intrinsic_names[] = {
     "LEN", "LEN_TRIM", "TRIM", "NEW_LINE", "ADJUSTL", "ADJUSTR", "INDEX", "SCAN", "VERIFY",
     "CHAR", "ICHAR", "ACHAR", "IACHAR", "REPEAT",
     /* Array */
-    "SIZE", "SHAPE", "PACK", "UNPACK", "MERGE", "SUM", "PRODUCT", "MAXVAL", "MINVAL", "MAXLOC", "MINLOC",
+    "SIZE", "SHAPE", "RANK", "PACK", "UNPACK", "MERGE", "SUM", "PRODUCT", "MAXVAL", "MINVAL", "MAXLOC", "MINLOC",
     "DOT_PRODUCT", "MATMUL", "TRANSPOSE", "RESHAPE", "SPREAD", "EOSHIFT", "CSHIFT",
     "COUNT", "ANY", "ALL", "ALLOCATED", "LBOUND", "UBOUND",
     /* Type conversion */
@@ -12961,6 +12966,10 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             result.v.arr.data[i] = make_integer(args[0].v.arr.dims[i]);
         }
         return result;
+    }
+    if (strcmp(upper, "RANK") == 0) {
+        if (nargs < 1) ofort_error(I, "RANK requires one argument");
+        return make_integer(args[0].type == FVAL_ARRAY ? args[0].v.arr.n_dims : 0);
     }
     if (strcmp(upper, "PACK") == 0) {
         OfortValue *array;
