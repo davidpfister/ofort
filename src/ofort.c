@@ -4336,47 +4336,14 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
 
 static OfortNode *parse_allocate(OfortInterpreter *I) {
     OfortToken *at = advance(I); /* ALLOCATE */
-    OfortNode *n = alloc_node(I, FND_ALLOCATE);
+    OfortNode *block = alloc_node(I, FND_BLOCK);
     OfortNode *source_expr = NULL;
     OfortNode *mold_expr = NULL;
-    n->line = at->line;
-    expect(I, FTOK_LPAREN);
-    /* parse: target or array_name(dim1, dim2, ...) */
-    OfortToken *name = expect(I, FTOK_IDENT);
-    copy_cstr(n->name, sizeof(n->name), name->str_val);
-    OfortNode *target = alloc_node(I, FND_IDENT);
-    copy_cstr(target->name, sizeof(target->name), name->str_val);
-    target->line = name->line;
-    target = parse_component_target_postfix(I, target);
-    if (target->type != FND_IDENT) n->children[OFORT_ALLOC_TARGET_CHILD] = target;
-    n->stmts = NULL; n->n_stmts = 0;
     int cap = 0;
-    if (check(I, FTOK_LPAREN)) {
-        advance(I);
-        while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
-            OfortNode *dim = parse_expr(I);
-            int dim_index = n->n_stmts;
-            if (check(I, FTOK_COLON)) {
-                advance(I);
-                n->has_lower_bound[dim_index] = 1;
-                if (dim->type == FND_INT_LIT) {
-                    n->lower_bounds[dim_index] = (int)dim->int_val;
-                } else {
-                    n->children[2 + dim_index] = dim;
-                }
-                dim = parse_expr(I);
-            }
-            if (n->n_stmts >= cap) {
-                cap = cap ? cap * 2 : 4;
-                n->stmts = (OfortNode **)realloc(n->stmts, sizeof(OfortNode *) * cap);
-            }
-            n->stmts[n->n_stmts++] = dim;
-            if (check(I, FTOK_COMMA)) advance(I);
-        }
-        expect(I, FTOK_RPAREN);
-    }
-    while (check(I, FTOK_COMMA)) {
-        advance(I);
+    block->line = at->line;
+    expect(I, FTOK_LPAREN);
+
+    while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
         if (check_keyword_arg(I)) {
             const char *arg_name = token_arg_name(advance(I));
             advance(I); /* = */
@@ -4388,30 +4355,101 @@ static OfortNode *parse_allocate(OfortInterpreter *I) {
                 parse_expr(I);
             }
         } else {
-            parse_expr(I);
+            OfortNode *n = alloc_node(I, FND_ALLOCATE);
+            int dcap = 0;
+            OfortToken *name = expect(I, FTOK_IDENT);
+            OfortNode *target = alloc_node(I, FND_IDENT);
+            n->line = name->line;
+            copy_cstr(n->name, sizeof(n->name), name->str_val);
+            copy_cstr(target->name, sizeof(target->name), name->str_val);
+            target->line = name->line;
+            target = parse_component_target_postfix(I, target);
+            if (target->type != FND_IDENT) n->children[OFORT_ALLOC_TARGET_CHILD] = target;
+            if (check(I, FTOK_LPAREN)) {
+                advance(I);
+                while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+                    OfortNode *dim = parse_expr(I);
+                    int dim_index = n->n_stmts;
+                    if (check(I, FTOK_COLON)) {
+                        advance(I);
+                        n->has_lower_bound[dim_index] = 1;
+                        if (dim->type == FND_INT_LIT) {
+                            n->lower_bounds[dim_index] = (int)dim->int_val;
+                        } else {
+                            n->children[2 + dim_index] = dim;
+                        }
+                        dim = parse_expr(I);
+                    }
+                    if (n->n_stmts >= dcap) {
+                        dcap = dcap ? dcap * 2 : 4;
+                        n->stmts = (OfortNode **)realloc(n->stmts, sizeof(OfortNode *) * dcap);
+                        if (!n->stmts) ofort_error(I, "Out of memory");
+                    }
+                    n->stmts[n->n_stmts++] = dim;
+                    if (check(I, FTOK_COMMA)) advance(I);
+                    else break;
+                }
+                expect(I, FTOK_RPAREN);
+            }
+            if (block->n_stmts >= cap) {
+                cap = cap ? cap * 2 : 4;
+                block->stmts = (OfortNode **)realloc(block->stmts, sizeof(OfortNode *) * cap);
+                if (!block->stmts) ofort_error(I, "Out of memory");
+            }
+            block->stmts[block->n_stmts++] = n;
+        }
+        if (check(I, FTOK_COMMA)) advance(I);
+        else break;
+    }
+    expect(I, FTOK_RPAREN);
+    if (source_expr || mold_expr) {
+        for (int i = 0; i < block->n_stmts; i++) {
+            OfortNode *n = block->stmts[i];
+            n->children[0] = source_expr;
+            n->children[1] = mold_expr;
+            n->n_children = 2;
         }
     }
-    n->children[0] = source_expr;
-    n->children[1] = mold_expr;
-    n->n_children = (source_expr || mold_expr) ? 2 : 0;
-    expect(I, FTOK_RPAREN);
-    return n;
+    return block;
 }
 
 static OfortNode *parse_deallocate(OfortInterpreter *I) {
     OfortToken *dt = advance(I); /* DEALLOCATE */
-    OfortNode *n = alloc_node(I, FND_DEALLOCATE);
-    n->line = dt->line;
+    OfortNode *block = alloc_node(I, FND_BLOCK);
+    int cap = 0;
+    block->line = dt->line;
     expect(I, FTOK_LPAREN);
-    OfortToken *name = expect(I, FTOK_IDENT);
-    copy_cstr(n->name, sizeof(n->name), name->str_val);
-    OfortNode *target = alloc_node(I, FND_IDENT);
-    copy_cstr(target->name, sizeof(target->name), name->str_val);
-    target->line = name->line;
-    target = parse_component_target_postfix(I, target);
-    if (target->type != FND_IDENT) n->children[OFORT_ALLOC_TARGET_CHILD] = target;
+    while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+        if (check_keyword_arg(I)) {
+            const char *name = token_arg_name(advance(I));
+            advance(I); /* = */
+            if (str_eq_nocase(name, "stat") || str_eq_nocase(name, "errmsg")) {
+                parse_expr(I);
+            } else {
+                parse_expr(I);
+            }
+        } else {
+            OfortToken *name = expect(I, FTOK_IDENT);
+            OfortNode *n = alloc_node(I, FND_DEALLOCATE);
+            OfortNode *target = alloc_node(I, FND_IDENT);
+            n->line = name->line;
+            copy_cstr(n->name, sizeof(n->name), name->str_val);
+            copy_cstr(target->name, sizeof(target->name), name->str_val);
+            target->line = name->line;
+            target = parse_component_target_postfix(I, target);
+            if (target->type != FND_IDENT) n->children[OFORT_ALLOC_TARGET_CHILD] = target;
+            if (block->n_stmts >= cap) {
+                cap = cap ? cap * 2 : 4;
+                block->stmts = (OfortNode **)realloc(block->stmts, sizeof(OfortNode *) * cap);
+                if (!block->stmts) ofort_error(I, "Out of memory");
+            }
+            block->stmts[block->n_stmts++] = n;
+        }
+        if (check(I, FTOK_COMMA)) advance(I);
+        else break;
+    }
     expect(I, FTOK_RPAREN);
-    return n;
+    return block;
 }
 
 static OfortNode *parse_inquire_stmt(OfortInterpreter *I) {
