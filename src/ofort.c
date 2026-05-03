@@ -6486,6 +6486,7 @@ static void format_descriptors(OfortInterpreter *I, const char *p, const char *e
         } else if (fc == 'F' || fc == 'E' || fc == 'D' || fc == 'G') {
             int width = 0, dec = 0;
             p++;
+            if (fc == 'E' && (*p == 'S' || *p == 's')) p++;
             while (isdigit((unsigned char)*p)) { width = width * 10 + (*p - '0'); p++; }
             if (*p == '.') { p++; while (isdigit((unsigned char)*p)) { dec = dec * 10 + (*p - '0'); p++; } }
             for (int r = 0; r < repeat && *vidx < nvals; r++, (*vidx)++) {
@@ -11205,6 +11206,7 @@ static const char *intrinsic_names[] = {
     /* Math */
     "ABS", "SQRT", "HYPOT", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2",
     "SIND", "COSD", "TAND", "ASIND", "ACOSD", "ATAND", "ATAN2D",
+    "BESSEL_J0", "BESSEL_J1", "BESSEL_Y0", "BESSEL_Y1", "BESSEL_JN", "BESSEL_YN",
     "SINH", "COSH", "TANH",
     "EXP", "LOG", "LOG10", "GAMMA", "LOG_GAMMA", "MOD", "MODULO", "DIM", "MAX", "MIN", "FLOOR", "CEILING", "AINT", "NINT",
     "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND", "TRANSFER",
@@ -11244,6 +11246,10 @@ static int is_elemental_unary_intrinsic(const char *upper) {
            strcmp(upper, "COSD") == 0 ||
            strcmp(upper, "TAND") == 0 ||
            strcmp(upper, "TAN") == 0 ||
+           strcmp(upper, "BESSEL_J0") == 0 ||
+           strcmp(upper, "BESSEL_J1") == 0 ||
+           strcmp(upper, "BESSEL_Y0") == 0 ||
+           strcmp(upper, "BESSEL_Y1") == 0 ||
            strcmp(upper, "ASIND") == 0 ||
            strcmp(upper, "ACOSD") == 0 ||
            strcmp(upper, "ATAND") == 0 ||
@@ -11624,6 +11630,109 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (nargs < 2) ofort_error(I, "ATAN2D requires 2 arguments");
         return make_real(ofort_rad_to_deg(atan2(val_to_real(args[0]), val_to_real(args[1]))));
     }
+    if (strcmp(upper, "BESSEL_J0") == 0) {
+        if (nargs < 1) ofort_error(I, "BESSEL_J0 requires 1 argument");
+        return make_real(j0(val_to_real(args[0])));
+    }
+    if (strcmp(upper, "BESSEL_J1") == 0) {
+        if (nargs < 1) ofort_error(I, "BESSEL_J1 requires 1 argument");
+        return make_real(j1(val_to_real(args[0])));
+    }
+    if (strcmp(upper, "BESSEL_Y0") == 0) {
+        if (nargs < 1) ofort_error(I, "BESSEL_Y0 requires 1 argument");
+        return make_real(y0(val_to_real(args[0])));
+    }
+    if (strcmp(upper, "BESSEL_Y1") == 0) {
+        if (nargs < 1) ofort_error(I, "BESSEL_Y1 requires 1 argument");
+        return make_real(y1(val_to_real(args[0])));
+    }
+    if (strcmp(upper, "BESSEL_JN") == 0) {
+        if (nargs >= 3) {
+            int n1;
+            int n2;
+            int len;
+            int dims[1];
+            double x;
+            OfortValue result;
+            int idx = 0;
+            if (nargs < 3) ofort_error(I, "BESSEL_JN requires 2 or 3 arguments");
+            if (nargs > 3) ofort_error(I, "BESSEL_JN takes at most 3 arguments");
+            n1 = (int)val_to_int(args[0]);
+            n2 = (int)val_to_int(args[1]);
+            x = val_to_real(args[2]);
+            len = n2 - n1 + 1;
+            if (len < 0) ofort_error(I, "BESSEL_JN requires n2 >= n1");
+            dims[0] = len;
+            result = make_array(FVAL_REAL, dims, 1);
+            for (int n = n1; n <= n2; n++) {
+                free_value(&result.v.arr.data[idx]);
+                result.v.arr.data[idx++] = make_real(jn(n, x));
+            }
+            return result;
+        }
+        if (nargs < 2) ofort_error(I, "BESSEL_JN requires 2 arguments");
+        if (args[0].type == FVAL_ARRAY && args[1].type == FVAL_ARRAY && args[0].v.arr.len != args[1].v.arr.len) {
+            ofort_error(I, "BESSEL_JN array arguments have different sizes");
+        }
+        if (args[0].type == FVAL_ARRAY || args[1].type == FVAL_ARRAY) {
+            OfortValue *shape_arg = args[0].type == FVAL_ARRAY ? &args[0] : &args[1];
+            OfortValue result = make_array(FVAL_REAL, shape_arg->v.arr.dims, shape_arg->v.arr.n_dims);
+            for (int i = 0; i < result.v.arr.len; i++) {
+                OfortValue elem_result;
+                int n_val = (int)val_to_int(args[0].type == FVAL_ARRAY ? args[0].v.arr.data[i] : args[0]);
+                double x = val_to_real(args[1].type == FVAL_ARRAY ? args[1].v.arr.data[i] : args[1]);
+                elem_result = make_real(jn(n_val, x));
+                free_value(&result.v.arr.data[i]);
+                result.v.arr.data[i] = elem_result;
+            }
+            return result;
+        }
+        return make_real(jn((int)val_to_int(args[0]), val_to_real(args[1])));
+    }
+    if (strcmp(upper, "BESSEL_YN") == 0) {
+        if (nargs >= 3) {
+            int n1;
+            int n2;
+            int len;
+            int dims[1];
+            double x;
+            OfortValue result;
+            int idx = 0;
+            if (nargs < 3) ofort_error(I, "BESSEL_YN requires 2 or 3 arguments");
+            if (nargs > 3) ofort_error(I, "BESSEL_YN takes at most 3 arguments");
+            n1 = (int)val_to_int(args[0]);
+            n2 = (int)val_to_int(args[1]);
+            x = val_to_real(args[2]);
+            len = n2 - n1 + 1;
+            if (len < 0) ofort_error(I, "BESSEL_YN requires n2 >= n1");
+            dims[0] = len;
+            result = make_array(FVAL_REAL, dims, 1);
+            for (int n = n1; n <= n2; n++) {
+                free_value(&result.v.arr.data[idx]);
+                result.v.arr.data[idx++] = make_real(yn(n, x));
+            }
+            return result;
+        }
+        if (nargs < 2) ofort_error(I, "BESSEL_YN requires 2 arguments");
+        if (args[0].type == FVAL_ARRAY && args[1].type == FVAL_ARRAY && args[0].v.arr.len != args[1].v.arr.len) {
+            ofort_error(I, "BESSEL_YN array arguments have different sizes");
+        }
+        if (args[0].type == FVAL_ARRAY || args[1].type == FVAL_ARRAY) {
+            OfortValue *shape_arg = args[0].type == FVAL_ARRAY ? &args[0] : &args[1];
+            OfortValue result = make_array(FVAL_REAL, shape_arg->v.arr.dims, shape_arg->v.arr.n_dims);
+            for (int i = 0; i < result.v.arr.len; i++) {
+                OfortValue elem_result;
+                int n_val = (int)val_to_int(args[0].type == FVAL_ARRAY ? args[0].v.arr.data[i] : args[0]);
+                double x = val_to_real(args[1].type == FVAL_ARRAY ? args[1].v.arr.data[i] : args[1]);
+                elem_result = make_real(yn(n_val, x));
+                free_value(&result.v.arr.data[i]);
+                result.v.arr.data[i] = elem_result;
+            }
+            return result;
+        }
+        return make_real(yn((int)val_to_int(args[0]), val_to_real(args[1])));
+    }
+
     if (strcmp(upper, "EXP") == 0) {
         return make_real(exp(val_to_real(args[0])));
     }
