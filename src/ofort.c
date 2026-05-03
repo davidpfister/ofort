@@ -212,6 +212,7 @@ static void write_direct_record_from_node(OfortInterpreter *I, OfortUnitFile *en
                                          OfortValue *vals, int nvals, int *status_ptr);
 static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortValue *args, int nargs,
                                 char arg_names[OFORT_MAX_PARAMS][256]);
+static int storage_size_bits(OfortValue *v);
 static int is_intrinsic(const char *name);
 static void value_to_string(OfortInterpreter *I, OfortValue v, char *buf, int bufsize);
 static int assign_token_to_read_target(OfortInterpreter *I, OfortNode *target, const char *tok);
@@ -1065,7 +1066,16 @@ static OfortFunc *find_matching_generic_proc(OfortInterpreter *I, const char *na
         if (!ok) continue;
         for (int j = 0; j < nargs && j < fn->n_params; j++) {
             OfortValType actual_type = args[j].type == FVAL_ARRAY ? args[j].v.arr.elem_type : args[j].type;
+            int actual_rank = args[j].type == FVAL_ARRAY ? args[j].v.arr.n_dims : 0;
             if (args[j].type == FVAL_VOID && fn->param_optional[j]) continue;
+            if (fn->param_n_dims[j] != actual_rank &&
+                fn->param_n_dims[j] != -1 &&
+                !(fn->is_elemental && fn->param_n_dims[j] == 0 && actual_rank > 0) &&
+                !(args[j].type == FVAL_ARRAY && !args[j].v.arr.allocated &&
+                  actual_rank == 0 && fn->param_n_dims[j] > 0)) {
+                ok = 0;
+                break;
+            }
             if (fn->param_types[j] == FVAL_VOID || fn->param_types[j] == actual_type) continue;
             if (is_numeric_type(fn->param_types[j]) && is_numeric_type(actual_type)) {
                 score += 1;
@@ -1453,6 +1463,8 @@ static void tokenize(OfortInterpreter *I, const char *src) {
                     kindbuf[kind_len] = '\0';
                     if (isdigit((unsigned char)kindbuf[0])) {
                         literal_kind = atoi(kindbuf);
+                    } else {
+                        copy_cstr(t->str_val, sizeof(t->str_val), kindbuf);
                     }
                 }
             }
@@ -1555,6 +1567,8 @@ static void tokenize(OfortInterpreter *I, const char *src) {
                     kindbuf[kind_len] = '\0';
                     if (isdigit((unsigned char)kindbuf[0])) {
                         literal_kind = atoi(kindbuf);
+                    } else {
+                        copy_cstr(t->str_val, sizeof(t->str_val), kindbuf);
                     }
                 }
             }
@@ -2457,6 +2471,12 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
                 break;
             }
         }
+        if (t->str_val[0]) {
+            OfortNode *ke = alloc_node(I, FND_IDENT);
+            copy_cstr(ke->name, sizeof(ke->name), t->str_val);
+            ke->line = t->line;
+            n->kind_expr = ke;
+        }
         n->line = t->line;
         return n;
     }
@@ -2843,7 +2863,7 @@ static OfortValType token_to_valtype(OfortTokenType t) {
     }
 }
 
-static int parse_kind_selector(OfortInterpreter *I) {
+static int parse_kind_selector_ex(OfortInterpreter *I, OfortNode **kind_expr_out) {
     int kind = 0;
     expect(I, FTOK_LPAREN);
     if (check_ident_upper(I, "KIND")) {
@@ -2852,12 +2872,17 @@ static int parse_kind_selector(OfortInterpreter *I) {
     }
     if (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
         OfortNode *expr = parse_expr(I);
-        if (expr && expr->type == FND_INT_LIT) kind = (int)expr->int_val;
+        if (expr && expr->type == FND_INT_LIT) {
+            kind = (int)expr->int_val;
+        } else if (expr && kind_expr_out) {
+            *kind_expr_out = expr;
+        }
     }
     while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) advance(I);
     expect(I, FTOK_RPAREN);
     return kind;
 }
+
 
 /* ── Declaration parsing ────────────────────── */
 static int int_constant_node(OfortNode *n, int *value) {
@@ -2893,6 +2918,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
     int decl_kind = 0;
     int char_len = 1;
     OfortNode *char_len_expr = NULL;
+    OfortNode *kind_expr = NULL;
     int is_allocatable = 0;
     int is_pointer = 0;
     int is_target = 0;
@@ -2977,7 +3003,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
     /* optional KIND for numeric types: INTEGER(KIND=4), REAL(8), COMPLEX(8) */
     if ((vtype == FVAL_INTEGER || vtype == FVAL_REAL || vtype == FVAL_DOUBLE ||
          vtype == FVAL_COMPLEX) && check(I, FTOK_LPAREN)) {
-        decl_kind = parse_kind_selector(I);
+        decl_kind = parse_kind_selector_ex(I, &kind_expr);
         if (vtype == FVAL_REAL && decl_kind == 8) {
             vtype = FVAL_DOUBLE;
         } else if (vtype == FVAL_DOUBLE && decl_kind == 0) {
@@ -3074,6 +3100,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
         copy_cstr(decl->name, sizeof(decl->name), token_name_text(name_tok));
         decl->val_type = vtype;
         decl->kind = decl_kind;
+        decl->kind_expr = kind_expr;
         decl->char_len = char_len;
         decl->char_len_expr = char_len_expr;
         decl->is_allocatable = is_allocatable;
@@ -6700,9 +6727,11 @@ static void format_descriptors(OfortInterpreter *I, const char *p, const char *e
         int repeat = 1;
         char fc;
 
-        if (nvals > 0 && *vidx >= nvals) break;
-
         while (*p == ' ' || *p == ',') p++;
+        if (nvals > 0 && *vidx >= nvals) {
+            while (*p == ' ' || *p == ',') p++;
+            if (*p != '\'' && *p != '"') return;
+        }
         if (!*p || (end && p >= end) || *p == ')') break;
 
         if (*p == '*') {
@@ -6755,6 +6784,7 @@ static void format_descriptors(OfortInterpreter *I, const char *p, const char *e
             if (depth == 0) {
                 const char *group_end = q - 1;
                 for (int r = 0; r < repeat; r++) {
+                    if (nvals > 0 && *vidx >= nvals) break;
                     format_descriptors(I, group_start, group_end, vals, nvals, vidx);
                 }
                 p = q;
@@ -6768,6 +6798,7 @@ static void format_descriptors(OfortInterpreter *I, const char *p, const char *e
             int width = 0;
             p++;
             while (isdigit((unsigned char)*p)) { width = width * 10 + (*p - '0'); p++; }
+            if (*vidx >= nvals) break;
             for (int r = 0; r < repeat && *vidx < nvals; r++, (*vidx)++) {
                 char buf[1024];
                 value_to_string(I, vals[*vidx], buf, sizeof(buf));
@@ -6792,6 +6823,7 @@ static void format_descriptors(OfortInterpreter *I, const char *p, const char *e
             p++;
             while (isdigit((unsigned char)*p)) { width = width * 10 + (*p - '0'); p++; }
             if (*p == '.') { p++; while (isdigit((unsigned char)*p)) { min_digits = min_digits * 10 + (*p - '0'); p++; } }
+            if (*vidx >= nvals) break;
             for (int r = 0; r < repeat && *vidx < nvals; r++, (*vidx)++) {
                 char buf[64];
                 long long iv = val_to_int(vals[*vidx]);
@@ -6825,6 +6857,7 @@ static void format_descriptors(OfortInterpreter *I, const char *p, const char *e
             if (fc == 'E' && (*p == 'S' || *p == 's')) p++;
             while (isdigit((unsigned char)*p)) { width = width * 10 + (*p - '0'); p++; }
             if (*p == '.') { p++; while (isdigit((unsigned char)*p)) { dec = dec * 10 + (*p - '0'); p++; } }
+            if (*vidx >= nvals) break;
             for (int r = 0; r < repeat && *vidx < nvals; r++, (*vidx)++) {
                 double rv = val_to_real(vals[*vidx]);
                 char buf[128];
@@ -6845,6 +6878,7 @@ static void format_descriptors(OfortInterpreter *I, const char *p, const char *e
             int width = 0;
             p++;
             while (isdigit((unsigned char)*p)) { width = width * 10 + (*p - '0'); p++; }
+            if (*vidx >= nvals) break;
             for (int r = 0; r < repeat && *vidx < nvals; r++, (*vidx)++) {
                 int bv = val_to_logical(vals[*vidx]);
                 char buf[64];
@@ -7247,6 +7281,15 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         return make_integer_kind(n->int_val, n->kind);
 
     case FND_REAL_LIT:
+        if (n->kind_expr) {
+            OfortValue kv = eval_node(I, n->kind_expr);
+            int runtime_kind = (int)val_to_int(kv);
+            free_value(&kv);
+            if (runtime_kind == 8) return make_double(n->num_val);
+            OfortValue r = make_real(n->num_val);
+            r.kind = runtime_kind;
+            return r;
+        }
         if (n->val_type == FVAL_DOUBLE) return make_double(n->num_val);
         return make_real(n->num_val);
 
@@ -7937,6 +7980,14 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         /* Check for intrinsic after user/module procedures so names such as RANGE can be overridden. */
         if (is_intrinsic(n->name)) {
             OfortValue result = call_intrinsic(I, n->name, args, nargs, n->param_names);
+            for (int i = 0; i < nargs; i++) free_value(&args[i]);
+            return result;
+        }
+
+        if (str_eq_nocase(n->name, "storage_size")) {
+            OfortValue result;
+            if (nargs < 1) ofort_error(I, "STORAGE_SIZE requires 1 argument");
+            result = make_integer(storage_size_bits(&args[0]));
             for (int i = 0; i < nargs; i++) free_value(&args[i]);
             return result;
         }
@@ -9930,8 +9981,17 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 for (int j = 0; j < s->n_stmts; j++) {
                     OfortNode *d = s->stmts[j];
                     if ((d->type == FND_VARDECL || d->type == FND_PARAMDECL) && td->n_fields < OFORT_MAX_FIELDS) {
+                        OfortValType field_type = d->val_type;
+                        if (d->kind_expr && d->kind == 0) {
+                            OfortValue kv = eval_node(I, d->kind_expr);
+                            int rk = (int)val_to_int(kv);
+                            free_value(&kv);
+                            if (field_type == FVAL_REAL && rk == 8) field_type = FVAL_DOUBLE;
+                            d->val_type = field_type;
+                            d->kind = rk;
+                        }
                         copy_cstr(td->field_names[td->n_fields], sizeof(td->field_names[td->n_fields]), d->name);
-                        td->field_types[td->n_fields] = d->val_type;
+                        td->field_types[td->n_fields] = field_type;
                         if (d->val_type == FVAL_DERIVED)
                             copy_cstr(td->field_type_names[td->n_fields],
                                       sizeof(td->field_type_names[td->n_fields]), d->str_val);
@@ -9942,8 +10002,17 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     }
                 }
             } else if ((s->type == FND_VARDECL || s->type == FND_PARAMDECL) && td->n_fields < OFORT_MAX_FIELDS) {
+                OfortValType field_type = s->val_type;
+                if (s->kind_expr && s->kind == 0) {
+                    OfortValue kv = eval_node(I, s->kind_expr);
+                    int rk = (int)val_to_int(kv);
+                    free_value(&kv);
+                    if (field_type == FVAL_REAL && rk == 8) field_type = FVAL_DOUBLE;
+                    s->val_type = field_type;
+                    s->kind = rk;
+                }
                 copy_cstr(td->field_names[td->n_fields], sizeof(td->field_names[td->n_fields]), s->name);
-                td->field_types[td->n_fields] = s->val_type;
+                td->field_types[td->n_fields] = field_type;
                 if (s->val_type == FVAL_DERIVED)
                     copy_cstr(td->field_type_names[td->n_fields],
                               sizeof(td->field_type_names[td->n_fields]), s->str_val);
@@ -9974,6 +10043,16 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
     case FND_PARAMDECL: {
         OfortValue val;
         int val_is_alias = 0;
+        /* Resolve runtime kind expression (e.g., real(kind=dp) where dp is a parameter) */
+        OfortValType effective_type = n->val_type;
+        int effective_kind = n->kind;
+        if (n->kind_expr && effective_kind == 0) {
+            OfortValue kv = eval_node(I, n->kind_expr);
+            effective_kind = (int)val_to_int(kv);
+            free_value(&kv);
+        }
+        n->val_type = effective_type;
+        n->kind = effective_kind;
         int decl_char_len = n->val_type == FVAL_CHARACTER ? eval_character_length(I, n) : 0;
         OfortVar *existing = find_var(I, n->name);
         OfortVar *existing_current = find_var_in_current_scope(I, n->name);
@@ -11758,7 +11837,7 @@ static const char *intrinsic_names[] = {
     "SINH", "COSH", "TANH",
     "EXP", "LOG", "LOG10", "GAMMA", "LOG_GAMMA", "MOD", "MODULO", "DIM", "MAX", "MIN", "FLOOR", "CEILING", "AINT", "NINT",
     "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND", "TRANSFER",
-    "BIT_SIZE", "BTEST", "IAND", "IEOR", "IOR", "IBCLR", "IBITS", "IBSET", "ISHFT", "ISHFTC", "MASKL", "MASKR",
+    "BIT_SIZE", "STORAGE_SIZE", "BTEST", "IAND", "IEOR", "IOR", "IBCLR", "IBITS", "IBSET", "ISHFT", "ISHFTC", "MASKL", "MASKR",
     "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE", "TINY", "NEAREST", "PRECISION", "RANGE", "RRSPACING", "SPACING", "SCALE",
     "SET_EXPONENT",
     "SELECTED_INT_KIND", "SELECTED_REAL_KIND",
@@ -11779,6 +11858,7 @@ static const char *intrinsic_names[] = {
 static int is_intrinsic(const char *name) {
     char upper[256];
     str_upper(upper, name, 256);
+    if (strcmp(upper, "STORAGE_SIZE") == 0) return 1;
     for (int i = 0; intrinsic_names[i]; i++) {
         if (strcmp(upper, intrinsic_names[i]) == 0) return 1;
     }
@@ -11862,6 +11942,55 @@ static int integer_kind_bits(int kind) {
     if (kind == 2) return 16;
     if (kind == 8) return 64;
     return 32;
+}
+
+static int storage_size_bits(OfortValue *v) {
+    int kind, fbits, fbytes, align, total, max_align;
+    if (!v) return 0;
+    switch (v->type) {
+    case FVAL_INTEGER:
+        return integer_kind_bits(v->kind ? v->kind : 4);
+    case FVAL_REAL:
+        kind = v->kind ? v->kind : 4;
+        return kind * 8;
+    case FVAL_DOUBLE:
+        return 64;
+    case FVAL_COMPLEX:
+        kind = v->kind ? v->kind : 4;
+        return kind * 16;
+    case FVAL_LOGICAL:
+        kind = v->kind ? v->kind : 4;
+        return kind * 8;
+    case FVAL_CHARACTER:
+        return v->v.s ? (int)strlen(v->v.s) * 8 : 0;
+    case FVAL_ARRAY:
+        if (v->v.arr.real_data)
+            return v->v.arr.elem_type == FVAL_DOUBLE ? 64 : 32;
+        if (v->v.arr.int_data)
+            return 32;
+        if (v->v.arr.data && v->v.arr.len > 0)
+            return storage_size_bits(&v->v.arr.data[0]);
+        switch (v->v.arr.elem_type) {
+        case FVAL_DOUBLE:  return 64;
+        case FVAL_REAL:    return 32;
+        case FVAL_INTEGER: return 32;
+        case FVAL_LOGICAL: return 32;
+        default:           return 0;
+        }
+    case FVAL_DERIVED:
+        total = 0; max_align = 1;
+        for (int i = 0; i < v->v.dt.n_fields; i++) {
+            fbits  = storage_size_bits(&v->v.dt.fields[i]);
+            fbytes = (fbits + 7) / 8;
+            align  = fbytes > 0 ? (fbytes < 8 ? fbytes : 8) : 1;
+            total  = ((total + align - 1) / align) * align;
+            total += fbytes;
+            if (align > max_align) max_align = align;
+        }
+        return ((total + max_align - 1) / max_align) * max_align * 8;
+    default:
+        return 0;
+    }
 }
 
 static long long signed_mask_value(unsigned long long value, int bits) {
@@ -12390,6 +12519,10 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (args[0].type != FVAL_INTEGER) ofort_error(I, "BIT_SIZE requires an integer argument");
         kind = args[0].kind ? args[0].kind : 4;
         return make_integer(integer_kind_bits(kind));
+    }
+    if (strcmp(upper, "STORAGE_SIZE") == 0) {
+        if (nargs < 1) ofort_error(I, "STORAGE_SIZE requires 1 argument");
+        return make_integer(storage_size_bits(&args[0]));
     }
     if (strcmp(upper, "BTEST") == 0) {
         int kind, bits;
