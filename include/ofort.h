@@ -52,7 +52,7 @@ typedef enum {
     FTOK_PARAMETER, FTOK_INTENT, FTOK_IN, FTOK_OUT, FTOK_INOUT,
     FTOK_RESULT, FTOK_SAVE, FTOK_DATA,
     /* I/O keywords */
-    FTOK_PRINT, FTOK_WRITE, FTOK_READ, FTOK_OPEN, FTOK_CLOSE, FTOK_REWIND,
+    FTOK_PRINT, FTOK_WRITE, FTOK_READ, FTOK_OPEN, FTOK_CLOSE, FTOK_REWIND, FTOK_INQUIRE,
     /* logical literal keywords */
     FTOK_TRUE, FTOK_FALSE,
     /* operators */
@@ -142,11 +142,12 @@ typedef enum {
     FND_VARDECL, FND_PARAMDECL,
     FND_SUBROUTINE, FND_FUNCTION, FND_MODULE,
     FND_TYPE_DEF,
-    FND_IF, FND_DO_LOOP, FND_DO_WHILE, FND_DO_FOREVER, FND_FORALL, FND_SELECT_CASE, FND_CASE_BLOCK,
+    FND_IF, FND_DO_LOOP, FND_DO_WHILE, FND_DO_FOREVER, FND_FORALL, FND_SELECT_CASE, FND_SELECT_RANK, FND_CASE_BLOCK,
     FND_RETURN, FND_EXIT, FND_CYCLE, FND_STOP, FND_GOTO, FND_CONTINUE,
-    FND_CALL, FND_PRINT, FND_WRITE, FND_READ_STMT, FND_OPEN, FND_CLOSE, FND_REWIND,
+    FND_CALL, FND_PRINT, FND_WRITE, FND_READ_STMT, FND_OPEN, FND_CLOSE, FND_REWIND, FND_INQUIRE,
     FND_ALLOCATE, FND_DEALLOCATE, FND_USE, FND_ACCESS, FND_INTERFACE,
     FND_EXPR_STMT,
+    FND_STMT_FUNCTION,
     /* expressions */
     FND_ASSIGN,
     FND_POINTER_ASSIGN,
@@ -260,6 +261,9 @@ void ofort_set_specialized_fast_paths(OfortInterpreter *interp, int enabled);
 
 /* If enabled, accumulate elapsed execution time by source line. */
 void ofort_set_line_profile_enabled(OfortInterpreter *interp, int enabled);
+
+/* If enabled, PRINT/WRITE output to unit 6 is emitted as it is produced. */
+void ofort_set_live_stdout(OfortInterpreter *interp, int enabled);
 
 /* Set command-line arguments visible to COMMAND_ARGUMENT_COUNT/GET_COMMAND_ARGUMENT. */
 void ofort_set_command_args(OfortInterpreter *interp, int argc, const char *const *argv);
