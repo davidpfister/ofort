@@ -6491,9 +6491,17 @@ static void format_descriptors(OfortInterpreter *I, const char *p, const char *e
             for (int r = 0; r < repeat && *vidx < nvals; r++, (*vidx)++) {
                 double rv = val_to_real(vals[*vidx]);
                 char buf[128];
-                if (fc == 'F') snprintf(buf, sizeof(buf), "%*.*f", width, dec, rv);
-                else if (fc == 'G') snprintf(buf, sizeof(buf), "%*.*g", width, dec, rv);
-                else snprintf(buf, sizeof(buf), "%*.*E", width, dec, rv);
+                if (!isfinite(rv)) {
+                    const char *inf = (rv < 0.0) ? "-Infinity" : "Infinity";
+                    if (width > 0) snprintf(buf, sizeof(buf), "%*s", width, inf);
+                    else snprintf(buf, sizeof(buf), "%s", inf);
+                } else if (fc == 'F') {
+                    snprintf(buf, sizeof(buf), "%*.*f", width, dec, rv);
+                } else if (fc == 'G') {
+                    snprintf(buf, sizeof(buf), "%*.*g", width, dec, rv);
+                } else {
+                    snprintf(buf, sizeof(buf), "%*.*E", width, dec, rv);
+                }
                 out_append(I, buf);
             }
         } else if (fc == 'L') {
@@ -11196,6 +11204,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 static const char *intrinsic_names[] = {
     /* Math */
     "ABS", "SQRT", "HYPOT", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2",
+    "SIND", "COSD", "TAND", "ASIND", "ACOSD", "ATAND", "ATAN2D",
     "SINH", "COSH", "TANH",
     "EXP", "LOG", "LOG10", "GAMMA", "LOG_GAMMA", "MOD", "MODULO", "DIM", "MAX", "MIN", "FLOOR", "CEILING", "AINT", "NINT",
     "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND", "TRANSFER",
@@ -11231,7 +11240,13 @@ static int is_elemental_unary_intrinsic(const char *upper) {
            strcmp(upper, "SQRT") == 0 ||
            strcmp(upper, "SIN") == 0 ||
            strcmp(upper, "COS") == 0 ||
+           strcmp(upper, "SIND") == 0 ||
+           strcmp(upper, "COSD") == 0 ||
+           strcmp(upper, "TAND") == 0 ||
            strcmp(upper, "TAN") == 0 ||
+           strcmp(upper, "ASIND") == 0 ||
+           strcmp(upper, "ACOSD") == 0 ||
+           strcmp(upper, "ATAND") == 0 ||
            strcmp(upper, "SINH") == 0 ||
            strcmp(upper, "COSH") == 0 ||
            strcmp(upper, "TANH") == 0 ||
@@ -11256,6 +11271,14 @@ static int is_elemental_unary_intrinsic(const char *upper) {
            strcmp(upper, "AIMAG") == 0 ||
            strcmp(upper, "CONJG") == 0 ||
            strcmp(upper, "LOGICAL") == 0;
+}
+
+static double ofort_deg_to_rad(double angle_deg) {
+    return angle_deg * (acos(-1.0) / 180.0);
+}
+
+static double ofort_rad_to_deg(double angle_rad) {
+    return angle_rad * (180.0 / acos(-1.0));
 }
 
 static int intrinsic_arg_index(char arg_names[OFORT_MAX_PARAMS][256], int nargs, const char *name) {
@@ -11558,6 +11581,48 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     if (strcmp(upper, "ATAN2") == 0) {
         if (nargs < 2) ofort_error(I, "ATAN2 requires 2 arguments");
         return make_real(atan2(val_to_real(args[0]), val_to_real(args[1])));
+    }
+    if (strcmp(upper, "SIND") == 0) {
+        if (nargs < 1) ofort_error(I, "SIND requires 1 argument");
+        {
+            double result = sin(ofort_deg_to_rad(val_to_real(args[0])));
+            return make_real(fabs(result) < 1e-15 ? 0.0 : result);
+        }
+    }
+    if (strcmp(upper, "COSD") == 0) {
+        if (nargs < 1) ofort_error(I, "COSD requires 1 argument");
+        {
+            double result = cos(ofort_deg_to_rad(val_to_real(args[0])));
+            return make_real(fabs(result) < 1e-15 ? 0.0 : result);
+        }
+    }
+    if (strcmp(upper, "TAND") == 0) {
+        if (nargs < 1) ofort_error(I, "TAND requires 1 argument");
+        {
+            double radians = ofort_deg_to_rad(val_to_real(args[0]));
+            double cos_value = cos(radians);
+            if (fabs(cos_value) < 1e-15) {
+                double sin_value = sin(radians);
+                return make_real(sin_value >= 0.0 ? (1.0 / 0.0) : (-1.0 / 0.0));
+            }
+            return make_real(tan(radians));
+        }
+    }
+    if (strcmp(upper, "ASIND") == 0) {
+        if (nargs < 1) ofort_error(I, "ASIND requires 1 argument");
+        return make_real(ofort_rad_to_deg(asin(val_to_real(args[0]))));
+    }
+    if (strcmp(upper, "ACOSD") == 0) {
+        if (nargs < 1) ofort_error(I, "ACOSD requires 1 argument");
+        return make_real(ofort_rad_to_deg(acos(val_to_real(args[0]))));
+    }
+    if (strcmp(upper, "ATAND") == 0) {
+        if (nargs < 1) ofort_error(I, "ATAND requires 1 argument");
+        return make_real(ofort_rad_to_deg(atan(val_to_real(args[0]))));
+    }
+    if (strcmp(upper, "ATAN2D") == 0) {
+        if (nargs < 2) ofort_error(I, "ATAN2D requires 2 arguments");
+        return make_real(ofort_rad_to_deg(atan2(val_to_real(args[0]), val_to_real(args[1]))));
     }
     if (strcmp(upper, "EXP") == 0) {
         return make_real(exp(val_to_real(args[0])));
