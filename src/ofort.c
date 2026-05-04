@@ -149,6 +149,9 @@ struct OfortInterpreter {
     OfortGeneric *generics;
     int n_generics;
     int generic_cap;
+    char module_proc_spec_names[OFORT_MAX_FUNCS][256];
+    OfortNode *module_proc_specs[OFORT_MAX_FUNCS];
+    int n_module_proc_specs;
     /* modules */
     OfortModule modules[OFORT_MAX_MODULES];
     int n_modules;
@@ -225,6 +228,9 @@ static OfortNode *parse_data_value_list(OfortInterpreter *I);
 static OfortNode *parse_implied_do(OfortInterpreter *I);
 static OfortNode *parse_expr(OfortInterpreter *I);
 static OfortNode *parse_statement(OfortInterpreter *I);
+static int is_procedure_prefix_token(OfortToken *t);
+static OfortNode *parse_module_procedure_body(OfortInterpreter *I);
+static OfortNode *parse_submodule(OfortInterpreter *I);
 static void skip_balanced_parens(OfortInterpreter *I);
 static int execute_elemental_function_call(OfortInterpreter *I, OfortNode *call,
                                            OfortFunc *func, OfortNode *fn,
@@ -1229,6 +1235,13 @@ static void register_generic(OfortInterpreter *I, OfortNode *node) {
 }
 
 static OfortFunc *register_func(OfortInterpreter *I, const char *name, OfortNode *node, int is_function) {
+    for (int i = 0; i < I->n_funcs; i++) {
+        if (str_eq_nocase(I->funcs[i].name, name)) {
+            I->funcs[i].node = node;
+            I->funcs[i].is_function = is_function;
+            return &I->funcs[i];
+        }
+    }
     ensure_func_capacity(I, 1);
     OfortFunc *f = &I->funcs[I->n_funcs++];
     copy_cstr(f->name, sizeof(f->name), name);
@@ -1237,6 +1250,27 @@ static OfortFunc *register_func(OfortInterpreter *I, const char *name, OfortNode
     f->module_name[0] = '\0';
     f->n_saved_vars = 0;
     return f;
+}
+
+static void remember_module_proc_spec(OfortInterpreter *I, OfortNode *node) {
+    if (!node || (node->type != FND_FUNCTION && node->type != FND_SUBROUTINE)) return;
+    for (int i = 0; i < I->n_module_proc_specs; i++) {
+        if (str_eq_nocase(I->module_proc_spec_names[i], node->name)) {
+            I->module_proc_specs[i] = node;
+            return;
+        }
+    }
+    if (I->n_module_proc_specs >= OFORT_MAX_FUNCS) ofort_error(I, "Too many module procedure interfaces");
+    copy_cstr(I->module_proc_spec_names[I->n_module_proc_specs],
+              sizeof(I->module_proc_spec_names[0]), node->name);
+    I->module_proc_specs[I->n_module_proc_specs++] = node;
+}
+
+static OfortNode *find_module_proc_spec(OfortInterpreter *I, const char *name) {
+    for (int i = I->n_module_proc_specs - 1; i >= 0; i--) {
+        if (str_eq_nocase(I->module_proc_spec_names[i], name)) return I->module_proc_specs[i];
+    }
+    return NULL;
 }
 
 static OfortVar *find_saved_var(OfortFunc *func, const char *name) {
@@ -2028,11 +2062,23 @@ static const char *find_type_binding_proc(OfortInterpreter *I, const char *type_
 }
 
 static int parse_operator_designator(OfortInterpreter *I, char *name, size_t name_size) {
-    if (!token_ident_upper(peek(I), "OPERATOR") || peek_ahead(I, 1)->type != FTOK_LPAREN) {
+    int pos = I->tok_pos;
+    if (!token_ident_upper(peek(I), "OPERATOR")) {
         return 0;
     }
     advance(I); /* OPERATOR */
-    advance(I); /* ( */
+    if (check(I, FTOK_LBRACKET)) {
+        advance(I); /* (/ */
+        if (check(I, FTOK_RBRACKET)) {
+            advance(I); /* /) */
+            copy_cstr(name, name_size, "//");
+        } else {
+            if (check(I, FTOK_RPAREN)) advance(I);
+            copy_cstr(name, name_size, "/");
+        }
+        return 1;
+    }
+    if (check(I, FTOK_LPAREN)) advance(I); /* ( */
     if (check(I, FTOK_USER_OP)) {
         OfortToken *op = advance(I);
         copy_cstr(name, name_size, op->str_val);
@@ -2073,11 +2119,10 @@ static int parse_operator_designator(OfortInterpreter *I, char *name, size_t nam
         advance(I);
         copy_cstr(name, name_size, ">=");
     } else {
-        OfortToken *t = peek(I);
-        ofort_error(I, "Syntax error at line %d: expected operator designator in OPERATOR(...)",
-                    t->line);
+        I->tok_pos = pos;
+        return 0;
     }
-    expect(I, FTOK_RPAREN);
+    if (check(I, FTOK_RPAREN)) advance(I);
     return 1;
 }
 
@@ -2206,16 +2251,27 @@ static OfortNode *parse_interface_block(OfortInterpreter *I) {
             skip_newlines(I);
             return n;
         }
-        if (check(I, FTOK_MODULE) && token_ident_upper(peek_ahead(I, 1), "PROCEDURE")) {
+        if (is_procedure_prefix_token(peek(I)) ||
+            (check(I, FTOK_MODULE) &&
+             (peek_ahead(I, 1)->type == FTOK_FUNCTION || peek_ahead(I, 1)->type == FTOK_SUBROUTINE))) {
+            OfortNode *spec = parse_statement(I);
+            if (spec && (spec->type == FND_FUNCTION || spec->type == FND_SUBROUTINE)) {
+                remember_module_proc_spec(I, spec);
+                if (n->n_params < OFORT_MAX_PARAMS) {
+                    copy_cstr(n->param_names[n->n_params++],
+                              sizeof(n->param_names[0]), spec->name);
+                }
+            }
+        } else if (check(I, FTOK_MODULE) && token_ident_upper(peek_ahead(I, 1), "PROCEDURE")) {
             advance(I); /* MODULE */
             advance(I); /* PROCEDURE */
             while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
                 if (check(I, FTOK_COMMA)) {
                     advance(I);
-                } else if (check(I, FTOK_IDENT) && n->n_params < OFORT_MAX_PARAMS) {
+                } else if (token_can_be_name(peek(I)) && n->n_params < OFORT_MAX_PARAMS) {
                     OfortToken *proc = advance(I);
                     copy_cstr(n->param_names[n->n_params++],
-                              sizeof(n->param_names[0]), proc->str_val);
+                              sizeof(n->param_names[0]), token_name_text(proc));
                 } else {
                     advance(I);
                 }
@@ -4369,6 +4425,86 @@ static OfortNode *parse_module(OfortInterpreter *I) {
     return n;
 }
 
+static OfortNode *parse_submodule(OfortInterpreter *I) {
+    OfortToken *st = advance(I); /* SUBMODULE */
+    OfortToken *name;
+
+    if (check(I, FTOK_LPAREN)) {
+        skip_balanced_parens(I);
+    }
+    name = expect(I, FTOK_IDENT);
+
+    OfortNode *n = alloc_node(I, FND_MODULE);
+    copy_cstr(n->name, sizeof(n->name), name->str_val);
+    n->line = st->line;
+    skip_newlines(I);
+
+    {
+        int prev_spec_section = I->in_spec_section;
+        I->in_spec_section = 1;
+        n->children[0] = parse_block_until_end(I, "SUBMODULE");
+        I->in_spec_section = prev_spec_section;
+        n->n_children = 1;
+        consume_end(I, "SUBMODULE");
+    }
+    return n;
+}
+
+static OfortNode *parse_module_procedure_body(OfortInterpreter *I) {
+    OfortToken *mt = advance(I); /* MODULE */
+    advance(I); /* PROCEDURE */
+    if (check(I, FTOK_DCOLON)) advance(I);
+    if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+    OfortToken *name = advance(I);
+    const char *proc_name = token_name_text(name);
+    OfortNode *spec = find_module_proc_spec(I, proc_name);
+    OfortNode *n = alloc_node(I, (spec && spec->type == FND_SUBROUTINE) ? FND_SUBROUTINE : FND_FUNCTION);
+
+    copy_cstr(n->name, sizeof(n->name), proc_name);
+    n->line = mt->line;
+    if (spec) {
+        n->val_type = spec->val_type;
+        copy_cstr(n->str_val, sizeof(n->str_val), spec->str_val);
+        copy_cstr(n->result_name, sizeof(n->result_name), spec->result_name);
+        n->n_params = spec->n_params;
+        for (int i = 0; i < spec->n_params; i++) {
+            copy_cstr(n->param_names[i], sizeof(n->param_names[i]), spec->param_names[i]);
+            n->param_types[i] = spec->param_types[i];
+            n->param_intents[i] = spec->param_intents[i];
+            n->param_optional[i] = spec->param_optional[i];
+            n->param_n_dims[i] = spec->param_n_dims[i];
+        }
+    }
+    skip_to_next_line(I);
+
+    {
+        int prev_spec_section = I->in_spec_section;
+        I->in_spec_section = 1;
+        OfortNode *impl_body = parse_block_until_end(I, "PROCEDURE");
+        I->in_spec_section = prev_spec_section;
+        if (spec && spec->children[0] && spec->children[0]->type == FND_BLOCK &&
+            impl_body && impl_body->type == FND_BLOCK) {
+            OfortNode *merged = alloc_node(I, FND_BLOCK);
+            int n_spec = spec->children[0]->n_stmts;
+            int n_impl = impl_body->n_stmts;
+            merged->line = impl_body->line;
+            merged->n_stmts = n_spec + n_impl;
+            if (merged->n_stmts > 0) {
+                merged->stmts = (OfortNode **)calloc((size_t)merged->n_stmts, sizeof(OfortNode *));
+                if (!merged->stmts) ofort_error(I, "Out of memory");
+                for (int i = 0; i < n_spec; i++) merged->stmts[i] = spec->children[0]->stmts[i];
+                for (int i = 0; i < n_impl; i++) merged->stmts[n_spec + i] = impl_body->stmts[i];
+            }
+            n->children[0] = merged;
+        } else {
+            n->children[0] = impl_body;
+        }
+        n->n_children = 1;
+        consume_end(I, "PROCEDURE");
+    }
+    return n;
+}
+
 static OfortNode *parse_type_def(OfortInterpreter *I) {
     OfortToken *tt = advance(I); /* TYPE */
     /* TYPE :: name */
@@ -5089,8 +5225,23 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         return parse_interface_block(I);
     }
 
+    if (token_ident_upper(t, "SUBMODULE")) {
+        return parse_submodule(I);
+    }
+
     if (token_ident_upper(t, "PROCEDURE")) {
         return parse_procedure_declaration(I);
+    }
+
+    if (t->type == FTOK_MODULE && token_ident_upper(peek_ahead(I, 1), "PROCEDURE")) {
+        return parse_module_procedure_body(I);
+    }
+
+    if (t->type == FTOK_MODULE &&
+        (peek_ahead(I, 1)->type == FTOK_FUNCTION || peek_ahead(I, 1)->type == FTOK_SUBROUTINE)) {
+        advance(I);
+        if (check(I, FTOK_FUNCTION)) return parse_function(I);
+        return parse_subroutine(I);
     }
 
     if (t->type == FTOK_INT_LIT) {
@@ -5121,6 +5272,10 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         int is_elemental = 0;
         while (is_procedure_prefix_token(peek(I))) {
             if (token_ident_upper(peek(I), "ELEMENTAL")) is_elemental = 1;
+            advance(I);
+        }
+        if (check(I, FTOK_MODULE) &&
+            (peek_ahead(I, 1)->type == FTOK_FUNCTION || peek_ahead(I, 1)->type == FTOK_SUBROUTINE)) {
             advance(I);
         }
         t = peek(I);
@@ -8217,6 +8372,24 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
     case FND_CONCAT: {
         OfortValue left = eval_node(I, n->children[0]);
         OfortValue right = eval_node(I, n->children[1]);
+        OfortValue args[2];
+        OfortFunc *func;
+        args[0] = left;
+        args[1] = right;
+        func = find_matching_generic_func(I, "//", args, 2);
+        if (func) {
+            OfortValue elemental_result;
+            OfortNode *fn = func->node;
+            if (execute_elemental_function_call(I, n, func, fn, args, 2, &elemental_result)) {
+                free_value(&left);
+                free_value(&right);
+                return elemental_result;
+            }
+            OfortValue result = execute_user_function_with_args(I, func, args, 2);
+            free_value(&left);
+            free_value(&right);
+            return result;
+        }
         char buf[OFORT_MAX_STRLEN * 2];
         char lbuf[OFORT_MAX_STRLEN], rbuf[OFORT_MAX_STRLEN];
         value_to_string(I, left, lbuf, sizeof(lbuf));
@@ -8424,8 +8597,17 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
 
         if (str_eq_nocase(n->name, "allocated")) {
             OfortVar *alloc_var;
-            if (nargs != 1 || n->stmts[0]->type != FND_IDENT)
+            if (nargs != 1)
                 ofort_error(I, "ALLOCATED requires one allocatable variable argument");
+            if (n->stmts[0]->type != FND_IDENT) {
+                OfortValue av = eval_node(I, n->stmts[0]);
+                int is_alloc = 0;
+                if (av.type == FVAL_ARRAY) is_alloc = av.v.arr.allocated;
+                else if (av.type == FVAL_CHARACTER) is_alloc = av.v.s && av.v.s[0] != '\0';
+                else if (av.type == FVAL_DERIVED) is_alloc = av.v.dt.fields != NULL;
+                free_value(&av);
+                return make_logical(is_alloc);
+            }
             alloc_var = find_var(I, n->stmts[0]->name);
             if (!alloc_var || !alloc_var->is_allocatable) return make_logical(0);
             if (alloc_var->val.type == FVAL_ARRAY)
