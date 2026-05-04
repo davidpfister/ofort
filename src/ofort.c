@@ -12296,7 +12296,7 @@ static const char *intrinsic_names[] = {
     "LEN", "LEN_TRIM", "TRIM", "NEW_LINE", "ADJUSTL", "ADJUSTR", "INDEX", "SCAN", "VERIFY",
     "CHAR", "ICHAR", "ACHAR", "IACHAR", "REPEAT",
     /* Array */
-    "SIZE", "SHAPE", "RANK", "PACK", "UNPACK", "MERGE", "SUM", "PRODUCT", "MAXVAL", "MINVAL", "MAXLOC", "MINLOC",
+    "SIZE", "SHAPE", "RANK", "PACK", "UNPACK", "MERGE", "SUM", "PRODUCT", "REDUCE", "MAXVAL", "MINVAL", "MAXLOC", "MINLOC",
     "DOT_PRODUCT", "MATMUL", "TRANSPOSE", "RESHAPE", "SPREAD", "EOSHIFT", "CSHIFT",
     "COUNT", "ANY", "ALL", "ALLOCATED", "LBOUND", "UBOUND",
     /* Type conversion */
@@ -13710,6 +13710,111 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             prod *= val_to_real(args[0].v.arr.data[i]);
         if (args[0].v.arr.elem_type == FVAL_INTEGER) return make_integer((long long)prod);
         return make_real(prod);
+    }
+    if (strcmp(upper, "REDUCE") == 0) {
+        if (nargs < 2) ofort_error(I, "REDUCE requires array and operation arguments");
+        int array_idx = intrinsic_arg_index(arg_names, nargs, "array");
+        int op_idx = intrinsic_arg_index(arg_names, nargs, "operator");
+        int op2_idx = intrinsic_arg_index(arg_names, nargs, "reduce_op");
+        int op3_idx = intrinsic_arg_index(arg_names, nargs, "operation");
+        int identity_idx = intrinsic_arg_index(arg_names, nargs, "identity");
+        int mask_idx = intrinsic_arg_index(arg_names, nargs, "mask");
+        OfortFunc *op_func = NULL;
+        const char *op_name = NULL;
+
+        if (op2_idx >= 0) op_idx = op2_idx;
+        if (op3_idx >= 0) op_idx = op3_idx;
+        if (array_idx < 0) array_idx = 0;
+        if (op_idx < 0) op_idx = 1;
+
+        if (identity_idx < 0 && mask_idx < 0) {
+            if (nargs >= 2 && array_idx == 0 && op_idx == 1) {
+                if (nargs >= 3) identity_idx = 2;
+                if (nargs >= 4) mask_idx = 3;
+            }
+        }
+
+        if (array_idx < 0 || array_idx >= nargs)
+            ofort_error(I, "REDUCE requires an array argument");
+        if (op_idx < 0 || op_idx >= nargs)
+            ofort_error(I, "REDUCE requires a reduction operation argument");
+        if (identity_idx >= 0 && identity_idx >= nargs)
+            ofort_error(I, "REDUCE has invalid identity argument index");
+        if (mask_idx >= 0 && mask_idx >= nargs)
+            ofort_error(I, "REDUCE has invalid mask argument index");
+
+        if (args[array_idx].type != FVAL_ARRAY)
+            ofort_error(I, "REDUCE requires an array argument");
+
+        op_name = procedure_ref_name(&args[op_idx]);
+        if (!op_name) ofort_error(I, "REDUCE expects a procedure argument as the second parameter");
+        if (nargs > 2 && identity_idx >= 0 && identity_idx == op_idx)
+            ofort_error(I, "REDUCE identity argument cannot be the same as operation argument");
+        if (nargs > 2 && mask_idx >= 0 && (mask_idx == array_idx || mask_idx == op_idx ||
+                                           (identity_idx >= 0 && mask_idx == identity_idx)))
+            ofort_error(I, "REDUCE has overlapping arguments");
+
+        {
+            OfortValue *array = &args[array_idx];
+            OfortValue *identity = identity_idx >= 0 ? &args[identity_idx] : NULL;
+            OfortValue *mask = mask_idx >= 0 ? &args[mask_idx] : NULL;
+            OfortValue result = make_void_val();
+            int started = 0;
+            int identity_mode = identity != NULL;
+
+            if (identity_mode) {
+                result = copy_value(*identity);
+                started = 1;
+            }
+
+            for (int i = 0; i < array->v.arr.len; i++) {
+                int include = 1;
+                if (mask) {
+                    if (mask->type == FVAL_ARRAY) {
+                        OfortValue mask_elem;
+                        if (mask->v.arr.len != array->v.arr.len)
+                            ofort_error(I, "REDUCE MASK must match array shape");
+                        mask_elem = array_element_value(mask, i);
+                        include = val_to_logical(mask_elem);
+                        free_value(&mask_elem);
+                    } else {
+                        include = val_to_logical(*mask);
+                    }
+                }
+                if (!include) continue;
+
+                {
+                    OfortValue elem = array_element_value(array, i);
+                    OfortValue apply_args[2];
+                    OfortValue combined;
+                    if (!started && !identity_mode) {
+                        free_value(&result);
+                        result = copy_value(elem);
+                        started = 1;
+                        free_value(&elem);
+                        continue;
+                    }
+                    apply_args[0] = copy_value(result);
+                    apply_args[1] = copy_value(elem);
+                    if (!op_func) {
+                        op_func = find_matching_generic_func(I, op_name, apply_args, 2);
+                        if (!op_func) op_func = find_func(I, op_name);
+                    }
+                    if (!op_func || !op_func->is_function)
+                        ofort_error(I, "REDUCE operation '%s' is not a function", op_name);
+                    combined = execute_user_function_with_args(I, op_func, apply_args, 2);
+                    free_value(&apply_args[0]);
+                    free_value(&apply_args[1]);
+                    free_value(&elem);
+                    free_value(&result);
+                    result = combined;
+                }
+            }
+
+            if (!started)
+                ofort_error(I, "REDUCE requires a non-empty array or an identity argument");
+            return result;
+        }
     }
     if (strcmp(upper, "MAXVAL") == 0) {
         if (args[0].type != FVAL_ARRAY || args[0].v.arr.len == 0)
