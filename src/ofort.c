@@ -1970,7 +1970,8 @@ static int token_ident_upper(OfortToken *t, const char *name) {
 static int token_can_be_name(OfortToken *t) {
     return t && (t->type == FTOK_IDENT || t->type == FTOK_IN ||
                  t->type == FTOK_OUT || t->type == FTOK_INOUT ||
-                 t->type == FTOK_CALL || t->type == FTOK_DEFAULT);
+                 t->type == FTOK_CALL || t->type == FTOK_DEFAULT ||
+                 t->type == FTOK_SELECT);
 }
 
 static const char *token_name_text(OfortToken *t) {
@@ -1980,6 +1981,7 @@ static const char *token_name_text(OfortToken *t) {
     if (t->type == FTOK_INOUT) return "inout";
     if (t->type == FTOK_CALL) return "call";
     if (t->type == FTOK_DEFAULT) return "default";
+    if (t->type == FTOK_SELECT) return "select";
     return t->str_val;
 }
 
@@ -2354,7 +2356,7 @@ static void consume_end(OfortInterpreter *I, const char *what) {
         if (t->type != FTOK_NEWLINE && t->type != FTOK_EOF) {
             advance(I); /* skip PROGRAM/DO/IF/etc. */
             /* optionally skip name after END PROGRAM name */
-            if (peek(I)->type == FTOK_IDENT) advance(I);
+            if (token_can_be_name(peek(I))) advance(I);
         }
     }
 }
@@ -2475,11 +2477,12 @@ static OfortNode *parse_component_target_postfix(OfortInterpreter *I, OfortNode 
     for (;;) {
         if (check(I, FTOK_PERCENT)) {
             advance(I);
-            OfortToken *mt = expect(I, FTOK_IDENT);
+            if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+            OfortToken *mt = advance(I);
             OfortNode *mem = alloc_node(I, FND_MEMBER);
             mem->children[0] = target;
             mem->n_children = 1;
-            copy_cstr(mem->name, sizeof(mem->name), mt->str_val);
+            copy_cstr(mem->name, sizeof(mem->name), token_name_text(mt));
             mem->line = mt->line;
             target = mem;
         } else if (check(I, FTOK_LPAREN) && current_paren_followed_by_percent(I)) {
@@ -2714,10 +2717,11 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
         for (;;) {
             if (check(I, FTOK_PERCENT)) {
                 advance(I);
-                OfortToken *mt = expect(I, FTOK_IDENT);
+                if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+                OfortToken *mt = advance(I);
                 OfortNode *mem = alloc_node(I, FND_MEMBER);
                 mem->children[0] = n;
-                copy_cstr(mem->name, sizeof(mem->name), mt->str_val);
+                copy_cstr(mem->name, sizeof(mem->name), token_name_text(mt));
                 mem->n_children = 1;
                 mem->line = mt->line;
                 n = mem;
@@ -4263,10 +4267,11 @@ static OfortNode *parse_subroutine(OfortInterpreter *I) {
 
 static OfortNode *parse_function_with_type(OfortInterpreter *I, OfortValType result_type) {
     OfortToken *ft = advance(I); /* FUNCTION */
-    OfortToken *name = expect(I, FTOK_IDENT);
+    if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+    OfortToken *name = advance(I);
 
     OfortNode *n = alloc_node(I, FND_FUNCTION);
-    copy_cstr(n->name, sizeof(n->name), name->str_val);
+    copy_cstr(n->name, sizeof(n->name), token_name_text(name));
     n->line = ft->line;
     n->val_type = result_type;
     n->n_params = 0;
@@ -4403,19 +4408,21 @@ static OfortNode *parse_type_def(OfortInterpreter *I) {
                     }
                     if (check(I, FTOK_DCOLON)) advance(I);
                     while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
-                        OfortToken *binding = expect(I, FTOK_IDENT);
+                        if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+                        OfortToken *binding = advance(I);
                         OfortToken *target = binding;
                         if (check(I, FTOK_POINTER_ASSIGN)) {
                             advance(I);
-                            target = expect(I, FTOK_IDENT);
+                            if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+                            target = advance(I);
                         }
                         if (n->n_params < OFORT_MAX_PARAMS) {
                             copy_cstr(n->param_names[n->n_params],
                                       sizeof(n->param_names[n->n_params]),
-                                      binding->str_val);
+                                      token_name_text(binding));
                             copy_cstr(n->binding_proc_names[n->n_params],
                                       sizeof(n->binding_proc_names[n->n_params]),
-                                      target->str_val);
+                                      token_name_text(target));
                             n->n_params++;
                         }
                         if (check(I, FTOK_COMMA)) advance(I);
@@ -5344,11 +5351,12 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
             OfortToken *mt;
             OfortNode *mem;
             advance(I);
-            mt = expect(I, FTOK_IDENT);
+            if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+            mt = advance(I);
             mem = alloc_node(I, FND_MEMBER);
             mem->children[0] = callee;
             mem->n_children = 1;
-            copy_cstr(mem->name, sizeof(mem->name), mt->str_val);
+            copy_cstr(mem->name, sizeof(mem->name), token_name_text(mt));
             mem->line = mt->line;
             callee = mem;
         }
