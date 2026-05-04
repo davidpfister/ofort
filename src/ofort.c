@@ -180,6 +180,7 @@ struct OfortInterpreter {
     int procedure_depth;
     int consumed_bare_end;
     int in_spec_section;
+    int stop_expr_at_slash;
     /* node pool for memory management */
     OfortNode **node_pool;
     int node_pool_len;
@@ -218,6 +219,9 @@ static void value_to_string(OfortInterpreter *I, OfortValue v, char *buf, int bu
 static int assign_token_to_read_target(OfortInterpreter *I, OfortNode *target, const char *tok);
 static int paren_item_is_implied_do(OfortInterpreter *I);
 static int procedure_body_declares_name(OfortNode *body, const char *name);
+static OfortNode *parse_data_statement(OfortInterpreter *I);
+static OfortNode *parse_data_target_list(OfortInterpreter *I);
+static OfortNode *parse_data_value_list(OfortInterpreter *I);
 static OfortNode *parse_implied_do(OfortInterpreter *I);
 static OfortNode *parse_expr(OfortInterpreter *I);
 static OfortNode *parse_statement(OfortInterpreter *I);
@@ -298,6 +302,7 @@ static int node_is_profiled_statement(const OfortNode *n) {
     case FND_ALLOCATE:
     case FND_DEALLOCATE:
     case FND_RETURN:
+    case FND_DATA:
     case FND_EXIT:
     case FND_CYCLE:
     case FND_STOP:
@@ -2744,7 +2749,7 @@ static OfortNode *parse_unary(OfortInterpreter *I) {
 
 static OfortNode *parse_mul(OfortInterpreter *I) {
     OfortNode *left = parse_unary(I);
-    while (check(I, FTOK_STAR) || check(I, FTOK_SLASH)) {
+    while (check(I, FTOK_STAR) || (check(I, FTOK_SLASH) && !I->stop_expr_at_slash)) {
         OfortTokenType op = advance(I)->type;
         OfortNode *right = parse_unary(I);
         OfortNode *n = alloc_node(I, op == FTOK_STAR ? FND_MUL : FND_DIV);
@@ -3441,6 +3446,24 @@ static OfortNode *parse_select_case(OfortInterpreter *I) {
                     cb->n_children = 2;
                 } else {
                     cb->children[0] = parse_expr(I);
+                    if (check(I, FTOK_COMMA)) {
+                        OfortNode *items = alloc_node(I, FND_ARRAY_CONSTRUCTOR);
+                        int item_cap = 0;
+                        items->line = cb->children[0] ? cb->children[0]->line : cb->line;
+                        items->stmts = NULL;
+                        items->n_stmts = 0;
+                        while (1) {
+                            if (items->n_stmts >= item_cap) {
+                                item_cap = item_cap ? item_cap * 2 : 4;
+                                items->stmts = (OfortNode **)realloc(items->stmts, sizeof(OfortNode *) * item_cap);
+                            }
+                            items->stmts[items->n_stmts++] = cb->children[0];
+                            if (!check(I, FTOK_COMMA)) break;
+                            advance(I);
+                            cb->children[0] = parse_expr(I);
+                        }
+                        cb->children[0] = items;
+                    }
                     /* check for range: case (lo:hi) or case (lo:) */
                     if (check(I, FTOK_COLON)) {
                         advance(I);
@@ -3621,6 +3644,129 @@ static OfortNode *parse_implied_do(OfortInterpreter *I) {
 
     ofort_error(I, "Expected implied DO control");
     return n;
+}
+
+static OfortNode *parse_data_target_list(OfortInterpreter *I) {
+    OfortNode *list = alloc_node(I, FND_ARRAY_CONSTRUCTOR);
+    list->line = peek(I)->line;
+    list->stmts = NULL;
+    list->n_stmts = 0;
+    int cap = 0;
+    int prev_stop = I->stop_expr_at_slash;
+    OfortToken *t = peek(I);
+    I->stop_expr_at_slash = 1;
+
+    while (!check(I, FTOK_SLASH) && !check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
+        OfortNode *item;
+        if (check(I, FTOK_LPAREN) && paren_item_is_implied_do(I)) {
+            item = parse_implied_do(I);
+        } else {
+            item = parse_expr(I);
+        }
+        if (cap <= list->n_stmts) {
+            cap = cap ? cap * 2 : 4;
+            list->stmts = (OfortNode **)realloc(list->stmts, sizeof(OfortNode *) * cap);
+        }
+        list->stmts[list->n_stmts++] = item;
+        if (check(I, FTOK_COMMA)) {
+            advance(I);
+            if (check(I, FTOK_SLASH) || check(I, FTOK_NEWLINE) || check(I, FTOK_EOF)) {
+                ofort_error(I, "Expected data object after comma at line %d", t->line);
+            }
+            continue;
+        }
+        break;
+    }
+
+    if (list->n_stmts == 0) {
+        I->stop_expr_at_slash = prev_stop;
+        ofort_error(I, "Expected data object list at line %d", t->line);
+    }
+    I->stop_expr_at_slash = prev_stop;
+    return list;
+}
+
+static OfortNode *parse_data_value_list(OfortInterpreter *I) {
+    OfortNode *list = alloc_node(I, FND_ARRAY_CONSTRUCTOR);
+    list->line = peek(I)->line;
+    list->stmts = NULL;
+    list->n_stmts = 0;
+    int cap = 0;
+    int prev_stop = I->stop_expr_at_slash;
+    OfortToken *t = peek(I);
+    I->stop_expr_at_slash = 1;
+
+    while (!check(I, FTOK_SLASH) && !check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
+        OfortNode *item;
+        if (check(I, FTOK_LPAREN) && paren_item_is_implied_do(I)) {
+            item = parse_implied_do(I);
+        } else {
+            item = parse_io_item(I);
+        }
+        if (cap <= list->n_stmts) {
+            cap = cap ? cap * 2 : 4;
+            list->stmts = (OfortNode **)realloc(list->stmts, sizeof(OfortNode *) * cap);
+        }
+        list->stmts[list->n_stmts++] = item;
+        if (check(I, FTOK_COMMA)) {
+            advance(I);
+            if (check(I, FTOK_SLASH) || check(I, FTOK_NEWLINE) || check(I, FTOK_EOF)) {
+                ofort_error(I, "Expected data value after comma at line %d", t->line);
+            }
+            continue;
+        }
+        break;
+    }
+
+    if (list->n_stmts == 0) {
+        I->stop_expr_at_slash = prev_stop;
+        ofort_error(I, "Expected data value list at line %d", t->line);
+    }
+    I->stop_expr_at_slash = prev_stop;
+    return list;
+}
+
+static OfortNode *parse_data_statement(OfortInterpreter *I) {
+    OfortToken *data_tok = advance(I);
+    OfortNode *stmt = alloc_node(I, FND_DATA);
+    OfortNode *pair;
+    stmt->line = data_tok->line;
+    stmt->stmts = NULL;
+    stmt->n_stmts = 0;
+    int cap = 0;
+
+    for (;;) {
+        OfortToken *pair_start;
+        OfortNode *targets = parse_data_target_list(I);
+        pair_start = peek(I);
+        expect(I, FTOK_SLASH);
+        OfortNode *values = parse_data_value_list(I);
+        expect(I, FTOK_SLASH);
+
+        pair = alloc_node(I, FND_ASSIGN);
+        pair->children[0] = targets;
+        pair->children[1] = values;
+        pair->n_children = 2;
+        pair->line = pair_start->line;
+
+        if (cap <= stmt->n_stmts) {
+            cap = cap ? cap * 2 : 4;
+            stmt->stmts = (OfortNode **)realloc(stmt->stmts, sizeof(OfortNode *) * cap);
+        }
+        stmt->stmts[stmt->n_stmts++] = pair;
+
+        if (check(I, FTOK_COMMA)) {
+            advance(I);
+            if (check(I, FTOK_NEWLINE) || check(I, FTOK_EOF)) {
+                ofort_error(I, "Expected next DATA pair after comma at line %d", data_tok->line);
+            }
+            continue;
+        }
+        break;
+    }
+
+    leave_spec_section(I);
+    return stmt;
 }
 
 static OfortNode *parse_io_item(OfortInterpreter *I) {
@@ -4150,9 +4296,15 @@ static OfortNode *parse_function(OfortInterpreter *I) {
 static OfortNode *parse_typed_function(OfortInterpreter *I) {
     OfortToken *type_tok = advance(I);
     OfortValType result_type = token_to_valtype(type_tok->type);
+    char derived_type_name[256];
+    derived_type_name[0] = '\0';
 
     if (check(I, FTOK_LPAREN)) {
         int depth = 0;
+        if (type_tok->type == FTOK_TYPE && peek_ahead(I, 1)->type == FTOK_IDENT) {
+            copy_cstr(derived_type_name, sizeof(derived_type_name), peek_ahead(I, 1)->str_val);
+            result_type = FVAL_DERIVED;
+        }
         do {
             if (check(I, FTOK_LPAREN)) depth++;
             else if (check(I, FTOK_RPAREN)) depth--;
@@ -4160,7 +4312,9 @@ static OfortNode *parse_typed_function(OfortInterpreter *I) {
         } while (depth > 0 && !check(I, FTOK_EOF));
     }
 
-    return parse_function_with_type(I, result_type);
+    OfortNode *fn = parse_function_with_type(I, result_type);
+    if (derived_type_name[0]) copy_cstr(fn->str_val, sizeof(fn->str_val), derived_type_name);
+    return fn;
 }
 
 static OfortNode *parse_module(OfortInterpreter *I) {
@@ -4247,6 +4401,7 @@ static OfortNode *parse_type_def(OfortInterpreter *I) {
             }
             break;
         }
+        int before_pos = I->tok_pos;
         OfortNode *s = parse_statement(I);
         if (s) {
             if (n->n_stmts >= cap) {
@@ -4254,6 +4409,9 @@ static OfortNode *parse_type_def(OfortInterpreter *I) {
                 n->stmts = (OfortNode **)realloc(n->stmts, sizeof(OfortNode *) * cap);
             }
             n->stmts[n->n_stmts++] = s;
+        }
+        if (I->tok_pos == before_pos && !check(I, FTOK_EOF) && !check_end(I, "TYPE")) {
+            skip_to_next_line(I);
         }
         skip_newlines(I);
     }
@@ -4863,13 +5021,15 @@ static OfortNode *parse_access_stmt(OfortInterpreter *I) {
             advance(I);
             continue;
         }
-        if (token_ident_upper(peek(I), "OPERATOR")) {
-            char op_name[256];
-            if (parse_operator_designator(I, op_name, sizeof(op_name)) && n->n_params < OFORT_MAX_PARAMS) {
-                copy_cstr(n->param_names[n->n_params++], sizeof(n->param_names[0]), op_name);
-            }
-            continue;
+    if (token_ident_upper(peek(I), "OPERATOR")) {
+        char op_name[256];
+        if (parse_operator_designator(I, op_name, sizeof(op_name)) && n->n_params < OFORT_MAX_PARAMS) {
+            copy_cstr(n->param_names[n->n_params++], sizeof(n->param_names[0]), op_name);
+        } else {
+            advance(I);
         }
+        continue;
+    }
         if (check(I, FTOK_IDENT) && n->n_params < OFORT_MAX_PARAMS) {
             OfortToken *name = advance(I);
             copy_cstr(n->param_names[n->n_params++], sizeof(n->param_names[0]), name->str_val);
@@ -4936,7 +5096,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
             n->is_elemental = is_elemental;
             return n;
         }
-        if (is_type_keyword(t->type) && typed_function_follows_type_prefix(I)) {
+        if ((is_type_keyword(t->type) || t->type == FTOK_TYPE) && typed_function_follows_type_prefix(I)) {
             OfortNode *n = parse_typed_function(I);
             n->is_elemental = is_elemental;
             return n;
@@ -5068,6 +5228,11 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
 
     /* TYPE definition (derived type) */
     if (t->type == FTOK_TYPE) {
+        if (typed_function_follows_type_prefix(I)) {
+            OfortNode *n = parse_typed_function(I);
+            if (n && stmt_label) n->int_val = stmt_label;
+            return n;
+        }
         /* Distinguish between TYPE :: typename (definition) and TYPE(typename) :: var (declaration) */
         OfortToken *next = peek_ahead(I, 1);
         if (next->type == FTOK_DCOLON || next->type == FTOK_IDENT) {
@@ -5266,11 +5431,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
 
     /* DATA statement: DATA var /value/ — simplified */
     if (t->type == FTOK_DATA) {
-        advance(I);
-        leave_spec_section(I);
-        /* skip until newline */
-        while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) advance(I);
-        return NULL;
+        return parse_data_statement(I);
     }
 
     /* Expression statement or assignment: ident = expr, ident(args) = expr, or bare expr */
@@ -5342,6 +5503,7 @@ static OfortNode *parse_block_until_end(OfortInterpreter *I, const char *end_key
             while (!check_end(I, end_keyword) && peek(I)->type != FTOK_EOF) {
                 skip_newlines(I);
                 if (check_end(I, end_keyword)) break;
+                int before_pos = I->tok_pos;
                 OfortNode *s = parse_statement(I);
                 if (s) {
                     if (block->n_stmts >= cap) {
@@ -5350,6 +5512,9 @@ static OfortNode *parse_block_until_end(OfortInterpreter *I, const char *end_key
                     }
                     block->stmts[block->n_stmts++] = s;
                 }
+                if (I->tok_pos == before_pos && !check(I, FTOK_EOF) && !check_end(I, end_keyword)) {
+                    skip_to_next_line(I);
+                }
                 skip_newlines(I);
             }
             break;
@@ -5357,6 +5522,7 @@ static OfortNode *parse_block_until_end(OfortInterpreter *I, const char *end_key
         skip_newlines(I);
         if (check_end(I, end_keyword)) break;
         I->consumed_bare_end = 0;
+        int before_pos = I->tok_pos;
         OfortNode *s = parse_statement(I);
         if (I->consumed_bare_end) break;
         if (s) {
@@ -5365,6 +5531,9 @@ static OfortNode *parse_block_until_end(OfortInterpreter *I, const char *end_key
                 block->stmts = (OfortNode **)realloc(block->stmts, sizeof(OfortNode *) * cap);
             }
             block->stmts[block->n_stmts++] = s;
+        }
+        if (I->tok_pos == before_pos && !check(I, FTOK_EOF) && !check_end(I, end_keyword)) {
+            skip_to_next_line(I);
         }
         skip_newlines(I);
     }
@@ -5388,6 +5557,7 @@ static OfortNode *parse_program(OfortInterpreter *I) {
             continue;
         }
         I->consumed_bare_end = 0;
+        int before_pos = I->tok_pos;
         OfortNode *s = parse_statement(I);
         I->consumed_bare_end = 0;
         if (s) {
@@ -5396,6 +5566,9 @@ static OfortNode *parse_program(OfortInterpreter *I) {
                 prog->stmts = (OfortNode **)realloc(prog->stmts, sizeof(OfortNode *) * cap);
             }
             prog->stmts[prog->n_stmts++] = s;
+        }
+        if (I->tok_pos == before_pos && !check(I, FTOK_EOF)) {
+            skip_to_next_line(I);
         }
         skip_newlines(I);
     }
@@ -6192,6 +6365,217 @@ static void assign_array_ref(OfortInterpreter *I, OfortVar *var, OfortNode *lhs,
     int rhs_index = 0;
     assign_subscripted_recursive(I, &var->val, rhs, specs, nargs, nargs - 1, subscripts, &rhs_index);
     free_subscript_specs(specs, nargs);
+}
+
+typedef struct {
+    OfortNode *target;
+    int count;
+} OfortDataTarget;
+
+static int data_target_count_node(OfortInterpreter *I, OfortNode *target);
+static int append_data_targets(OfortInterpreter *I, OfortNode *target,
+                              OfortDataTarget **targets, int *n_targets, int *cap);
+static OfortNode *data_node_from_value(OfortInterpreter *I, OfortValue *value);
+static OfortNode *clone_data_expr_with_loop_values(OfortInterpreter *I, OfortNode *node);
+static OfortNode *clone_data_target_with_loop_values(OfortInterpreter *I, OfortNode *node);
+
+static int data_target_count_node(OfortInterpreter *I, OfortNode *target) {
+    if (!target) return 0;
+
+    if (target->type == FND_ARRAY_CONSTRUCTOR) {
+        int total = 0;
+        for (int i = 0; i < target->n_stmts; i++) {
+            total += data_target_count_node(I, target->stmts[i]);
+        }
+        return total;
+    }
+
+    if (target->type == FND_IMPLIED_DO) {
+        OfortValue start_v = eval_node(I, target->children[0]);
+        OfortValue end_v = eval_node(I, target->children[1]);
+        OfortValue step_v = eval_node(I, target->children[2]);
+        long long start = val_to_int(start_v);
+        long long end = val_to_int(end_v);
+        long long step = val_to_int(step_v);
+        free_value(&start_v);
+        free_value(&end_v);
+        free_value(&step_v);
+        if (step == 0) ofort_error(I, "Implied DO step cannot be zero");
+        if ((step > 0 && end < start) || (step < 0 && end > start)) return 0;
+        if (step > 0 && start > end) return 0;
+        if (step < 0 && start < end) return 0;
+
+        int count = 0;
+        for (long long iter = start; step > 0 ? iter <= end : iter >= end; iter += step) {
+            set_var(I, target->name, make_integer(iter));
+            for (int i = 0; i < target->n_stmts; i++) {
+                count += data_target_count_node(I, target->stmts[i]);
+            }
+        }
+        return count;
+    }
+
+    {
+        OfortValue value = eval_node(I, target);
+        int count = (value.type == FVAL_ARRAY) ? value.v.arr.len : 1;
+        free_value(&value);
+        return count;
+    }
+}
+
+static int append_data_targets(OfortInterpreter *I, OfortNode *target,
+                              OfortDataTarget **targets, int *n_targets, int *cap) {
+    if (!target || !targets || !n_targets || !cap) return 0;
+    if (target->type == FND_ARRAY_CONSTRUCTOR) {
+        for (int i = 0; i < target->n_stmts; i++) {
+            append_data_targets(I, target->stmts[i], targets, n_targets, cap);
+        }
+        return 1;
+    }
+
+    if (target->type == FND_IMPLIED_DO) {
+        OfortValue start_v = eval_node(I, target->children[0]);
+        OfortValue end_v = eval_node(I, target->children[1]);
+        OfortValue step_v = eval_node(I, target->children[2]);
+        long long start = val_to_int(start_v);
+        long long end = val_to_int(end_v);
+        long long step = val_to_int(step_v);
+        free_value(&start_v);
+        free_value(&end_v);
+        free_value(&step_v);
+        if (step == 0) ofort_error(I, "Implied DO step cannot be zero");
+        for (long long iter = start; step > 0 ? iter <= end : iter >= end; iter += step) {
+            set_var(I, target->name, make_integer(iter));
+            for (int i = 0; i < target->n_stmts; i++) {
+                append_data_targets(I, target->stmts[i], targets, n_targets, cap);
+            }
+        }
+        return 1;
+    }
+
+    if (*n_targets >= *cap) {
+        *cap = *cap ? *cap * 2 : 8;
+        *targets = (OfortDataTarget *)realloc(*targets, sizeof(OfortDataTarget) * (size_t)*cap);
+        if (!*targets) ofort_error(I, "Out of memory collecting data targets");
+    }
+    (*targets)[*n_targets].target = clone_data_target_with_loop_values(I, target);
+    (*targets)[*n_targets].count = data_target_count_node(I, target);
+    (*n_targets)++;
+    return 1;
+}
+
+static OfortNode *clone_data_expr_with_loop_values(OfortInterpreter *I, OfortNode *node) {
+    OfortNode *copy;
+    if (!node) return NULL;
+    if (node->type == FND_IDENT) {
+        OfortVar *v = find_var(I, node->name);
+        if (v && v->val.type == FVAL_INTEGER) {
+            copy = alloc_node(I, FND_INT_LIT);
+            copy->int_val = v->val.v.i;
+            copy->num_val = (double)v->val.v.i;
+            copy->line = node->line;
+            return copy;
+        }
+    }
+    copy = alloc_node(I, node->type);
+    *copy = *node;
+    if (node->n_children > 0) {
+        for (int i = 0; i < node->n_children && i < 8; i++) {
+            copy->children[i] = clone_data_expr_with_loop_values(I, node->children[i]);
+        }
+    }
+    if (node->n_stmts > 0 && node->stmts) {
+        copy->stmts = (OfortNode **)calloc((size_t)node->n_stmts, sizeof(OfortNode *));
+        if (!copy->stmts) ofort_error(I, "Out of memory cloning DATA expression");
+        for (int i = 0; i < node->n_stmts; i++) {
+            copy->stmts[i] = clone_data_expr_with_loop_values(I, node->stmts[i]);
+        }
+    }
+    return copy;
+}
+
+static OfortNode *clone_data_target_with_loop_values(OfortInterpreter *I, OfortNode *node) {
+    OfortNode *copy;
+    if (!node) return NULL;
+    copy = alloc_node(I, node->type);
+    *copy = *node;
+    if (node->n_children > 0) {
+        for (int i = 0; i < node->n_children && i < 8; i++) {
+            copy->children[i] = clone_data_target_with_loop_values(I, node->children[i]);
+        }
+    }
+    if (node->n_stmts > 0 && node->stmts) {
+        copy->stmts = (OfortNode **)calloc((size_t)node->n_stmts, sizeof(OfortNode *));
+        if (!copy->stmts) ofort_error(I, "Out of memory cloning DATA target");
+        for (int i = 0; i < node->n_stmts; i++) {
+            copy->stmts[i] = clone_data_expr_with_loop_values(I, node->stmts[i]);
+        }
+    }
+    return copy;
+}
+
+static OfortNode *data_node_from_value(OfortInterpreter *I, OfortValue *value) {
+    OfortNode *n;
+    if (!value) return NULL;
+
+    switch (value->type) {
+    case FVAL_INTEGER:
+        n = alloc_node(I, FND_INT_LIT);
+        n->int_val = value->v.i;
+        n->kind = value->kind;
+        n->line = 0;
+        return n;
+    case FVAL_REAL:
+    case FVAL_DOUBLE:
+        n = alloc_node(I, FND_REAL_LIT);
+        n->num_val = value->v.r;
+        n->kind = value->kind;
+        n->line = 0;
+        return n;
+    case FVAL_COMPLEX:
+        n = alloc_node(I, FND_COMPLEX_LIT);
+        n->children[0] = alloc_node(I, FND_REAL_LIT);
+        n->children[0]->num_val = value->v.cx.re;
+        n->children[0]->line = 0;
+        n->children[1] = alloc_node(I, FND_REAL_LIT);
+        n->children[1]->num_val = value->v.cx.im;
+        n->children[1]->line = 0;
+        n->n_children = 2;
+        n->line = 0;
+        return n;
+    case FVAL_LOGICAL:
+        n = alloc_node(I, FND_LOGICAL_LIT);
+        n->bool_val = value->v.b;
+        n->line = 0;
+        return n;
+    case FVAL_CHARACTER:
+        n = alloc_node(I, FND_STRING_LIT);
+        copy_cstr(n->str_val, sizeof(n->str_val), value->v.s ? value->v.s : "");
+        n->line = 0;
+        return n;
+    default:
+        n = alloc_node(I, FND_INT_LIT);
+        n->int_val = 0;
+        n->line = 0;
+        return n;
+    }
+}
+
+static OfortNode *data_node_from_values(OfortInterpreter *I, OfortValue *values, int start, int count) {
+    if (count <= 1) return data_node_from_value(I, &values[start]);
+    OfortNode *n = alloc_node(I, FND_ARRAY_CONSTRUCTOR);
+    n->line = 0;
+    n->stmts = NULL;
+    n->n_stmts = 0;
+    int cap = 0;
+    for (int i = 0; i < count; i++) {
+        if (cap <= n->n_stmts) {
+            cap = cap ? cap * 2 : 4;
+            n->stmts = (OfortNode **)realloc(n->stmts, sizeof(OfortNode *) * (size_t)cap);
+        }
+        n->stmts[n->n_stmts++] = data_node_from_value(I, &values[start + i]);
+    }
+    return n;
 }
 
 static double random_unit(void) {
@@ -10823,6 +11207,57 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         break;
     }
 
+    case FND_DATA: {
+        for (int pair_idx = 0; pair_idx < n->n_stmts; pair_idx++) {
+            OfortNode *pair = n->stmts[pair_idx];
+            OfortNode *targets = pair->children[0];
+            OfortNode *values = pair->children[1];
+            OfortValue *vals = NULL;
+            int n_vals = 0;
+            int cap = 0;
+            OfortDataTarget *target_list = NULL;
+            int n_targets = 0;
+            int target_cap = 0;
+            int value_pos = 0;
+
+            if (!targets || !values) ofort_error(I, "Invalid DATA pair");
+
+            collect_constructor_values(I, values, &vals, &n_vals, &cap);
+            append_data_targets(I, targets, &target_list, &n_targets, &target_cap);
+
+            for (int ti = 0; ti < n_targets; ti++) {
+                int needed = target_list[ti].count;
+                if (needed <= 0) needed = 1;
+                if (value_pos + needed > n_vals) {
+                    free(target_list);
+                    for (int i = 0; i < n_vals; i++) free_value(&vals[i]);
+                    free(vals);
+                    ofort_error(I, "DATA list has fewer values than targets");
+                }
+                OfortNode *assign = alloc_node(I, FND_ASSIGN);
+                OfortNode *rhs = data_node_from_values(I, vals, value_pos, needed);
+                assign->children[0] = target_list[ti].target;
+                assign->children[1] = rhs;
+                assign->n_children = 2;
+                assign->line = n->line;
+                value_pos += needed;
+                exec_node(I, assign);
+            }
+
+            if (value_pos != n_vals) {
+                for (int i = 0; i < n_vals; i++) free_value(&vals[i]);
+                free(vals);
+                free(target_list);
+                ofort_error(I, "DATA statement has more values than targets");
+            }
+
+            for (int i = 0; i < n_vals; i++) free_value(&vals[i]);
+            free(vals);
+            free(target_list);
+        }
+        break;
+    }
+
     case FND_IF: {
         OfortValue cond = eval_node(I, n->children[0]);
         int is_true = val_to_logical(cond);
@@ -10940,7 +11375,20 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 } else {
                     /* single value */
                     OfortValue case_val = eval_node(I, cb->children[0]);
-                    if (sel.type == FVAL_CHARACTER || case_val.type == FVAL_CHARACTER) {
+                    if (case_val.type == FVAL_ARRAY) {
+                        for (int ci = 0; ci < case_val.v.arr.len && !match; ci++) {
+                            OfortValue elem = array_element_value(&case_val, ci);
+                            if (sel.type == FVAL_CHARACTER || elem.type == FVAL_CHARACTER) {
+                                char sb[OFORT_MAX_STRLEN], cb2[OFORT_MAX_STRLEN];
+                                value_to_string(I, sel, sb, sizeof(sb));
+                                value_to_string(I, elem, cb2, sizeof(cb2));
+                                match = (string_compare_fortran(sb, cb2) == 0);
+                            } else {
+                                match = (val_to_int(sel) == val_to_int(elem));
+                            }
+                            free_value(&elem);
+                        }
+                    } else if (sel.type == FVAL_CHARACTER || case_val.type == FVAL_CHARACTER) {
                         char sb[OFORT_MAX_STRLEN], cb2[OFORT_MAX_STRLEN];
                         value_to_string(I, sel, sb, sizeof(sb));
                         value_to_string(I, case_val, cb2, sizeof(cb2));
