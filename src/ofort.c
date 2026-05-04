@@ -2449,11 +2449,20 @@ static OfortNode *parse_array_ref_postfix(OfortInterpreter *I, OfortNode *target
     ref->stmts = NULL;
     ref->n_stmts = 0;
     while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
-        OfortNode *arg = parse_subscript_arg(I);
+        const char *arg_name = NULL;
+        OfortNode *arg;
+        if (check_keyword_arg(I)) {
+            arg_name = token_arg_name(advance(I));
+            advance(I); /* = */
+            arg = parse_expr(I);
+        } else {
+            arg = parse_subscript_arg(I);
+        }
         if (ref->n_stmts >= cap) {
             cap = cap ? cap * 2 : 4;
             ref->stmts = (OfortNode **)realloc(ref->stmts, sizeof(OfortNode *) * cap);
         }
+        if (arg_name) copy_cstr(ref->param_names[ref->n_stmts], sizeof(ref->param_names[ref->n_stmts]), arg_name);
         ref->stmts[ref->n_stmts++] = arg;
         if (check(I, FTOK_COMMA)) advance(I);
         else break;
@@ -4283,8 +4292,15 @@ static OfortNode *parse_function_with_type(OfortInterpreter *I, OfortValType res
     if (check(I, FTOK_RESULT)) {
         advance(I);
         expect(I, FTOK_LPAREN);
-        OfortToken *res = expect(I, FTOK_IDENT);
-        copy_cstr(n->result_name, sizeof(n->result_name), res->str_val);
+        if (!token_can_be_name(peek(I))) {
+            OfortToken *t = peek(I);
+            char found[256];
+            describe_token(found, sizeof(found), t);
+            ofort_error(I, "Syntax error at line %d: expected identifier but found %s",
+                        t->line, found);
+        }
+        OfortToken *res = advance(I);
+        copy_cstr(n->result_name, sizeof(n->result_name), token_name_text(res));
         expect(I, FTOK_RPAREN);
     }
     skip_newlines(I);
@@ -5450,7 +5466,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     }
 
     /* Expression statement or assignment: ident = expr, ident(args) = expr, or bare expr */
-    if (t->type == FTOK_IDENT || t->type == FTOK_CALL ||
+    if (token_can_be_name(t) ||
         t->type == FTOK_INT_LIT || t->type == FTOK_REAL_LIT ||
         t->type == FTOK_STRING_LIT || t->type == FTOK_TRUE || t->type == FTOK_FALSE ||
         t->type == FTOK_LPAREN || t->type == FTOK_MINUS || t->type == FTOK_PLUS ||
