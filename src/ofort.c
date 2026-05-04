@@ -432,6 +432,10 @@ static void ofort_error(OfortInterpreter *I, const char *fmt, ...) {
     longjmp(I->err_jmp, 1);
 }
 
+static void too_many_params_error(OfortInterpreter *I, const char *what) {
+    ofort_error(I, "Too many %s; maximum is %d", what, OFORT_MAX_PARAMS);
+}
+
 static void append_source_line_to_warning(OfortInterpreter *I, int line) {
     const char *p;
     const char *start;
@@ -1239,7 +1243,7 @@ static void register_generic(OfortInterpreter *I, OfortNode *node) {
         memset(g, 0, sizeof(*g));
         copy_cstr(g->name, sizeof(g->name), node->name);
     }
-    for (int i = 0; i < node->n_params && g->n_procedures < OFORT_MAX_PARAMS; i++) {
+    for (int i = 0; i < node->n_params; i++) {
         int duplicate = 0;
         for (int j = 0; j < g->n_procedures; j++) {
             if (str_eq_nocase(g->procedures[j], node->param_names[i])) {
@@ -1248,6 +1252,7 @@ static void register_generic(OfortInterpreter *I, OfortNode *node) {
             }
         }
         if (!duplicate) {
+            if (g->n_procedures >= OFORT_MAX_PARAMS) too_many_params_error(I, "generic interface procedures");
             copy_cstr(g->procedures[g->n_procedures++], sizeof(g->procedures[0]), node->param_names[i]);
         }
     }
@@ -2277,10 +2282,9 @@ static OfortNode *parse_interface_block(OfortInterpreter *I) {
             OfortNode *spec = parse_statement(I);
             if (spec && (spec->type == FND_FUNCTION || spec->type == FND_SUBROUTINE)) {
                 remember_module_proc_spec(I, spec);
-                if (n->n_params < OFORT_MAX_PARAMS) {
-                    copy_cstr(n->param_names[n->n_params++],
-                              sizeof(n->param_names[0]), spec->name);
-                }
+                if (n->n_params >= OFORT_MAX_PARAMS) too_many_params_error(I, "interface procedures");
+                copy_cstr(n->param_names[n->n_params++],
+                          sizeof(n->param_names[0]), spec->name);
             }
         } else if (check(I, FTOK_MODULE) && token_ident_upper(peek_ahead(I, 1), "PROCEDURE")) {
             advance(I); /* MODULE */
@@ -2288,7 +2292,8 @@ static OfortNode *parse_interface_block(OfortInterpreter *I) {
             while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
                 if (check(I, FTOK_COMMA)) {
                     advance(I);
-                } else if (token_can_be_name(peek(I)) && n->n_params < OFORT_MAX_PARAMS) {
+                } else if (token_can_be_name(peek(I))) {
+                    if (n->n_params >= OFORT_MAX_PARAMS) too_many_params_error(I, "interface procedures");
                     OfortToken *proc = advance(I);
                     copy_cstr(n->param_names[n->n_params++],
                               sizeof(n->param_names[0]), token_name_text(proc));
@@ -2544,6 +2549,7 @@ static OfortNode *parse_array_ref_postfix(OfortInterpreter *I, OfortNode *target
             cap = cap ? cap * 2 : 4;
             ref->stmts = (OfortNode **)realloc(ref->stmts, sizeof(OfortNode *) * cap);
         }
+        if (ref->n_stmts >= OFORT_MAX_PARAMS) too_many_params_error(I, "array reference arguments");
         if (arg_name) copy_cstr(ref->param_names[ref->n_stmts], sizeof(ref->param_names[ref->n_stmts]), arg_name);
         ref->stmts[ref->n_stmts++] = arg;
         if (check(I, FTOK_COMMA)) advance(I);
@@ -2740,6 +2746,7 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
                     cap2 = cap2 ? cap2 * 2 : 8;
                     call_node->stmts = (OfortNode **)realloc(call_node->stmts, sizeof(OfortNode *) * cap2);
                 }
+                if (call_node->n_stmts >= OFORT_MAX_PARAMS) too_many_params_error(I, "function arguments");
                 if (arg_name) copy_cstr(call_node->param_names[call_node->n_stmts], sizeof(call_node->param_names[call_node->n_stmts]), arg_name);
                 call_node->stmts[call_node->n_stmts++] = arg;
                 if (check(I, FTOK_COMMA)) advance(I);
@@ -2785,6 +2792,7 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
                     cap2 = cap2 ? cap2 * 2 : 8;
                     call_node->stmts = (OfortNode **)realloc(call_node->stmts, sizeof(OfortNode *) * cap2);
                 }
+                if (call_node->n_stmts >= OFORT_MAX_PARAMS) too_many_params_error(I, "function arguments");
                 if (arg_name) copy_cstr(call_node->param_names[call_node->n_stmts], sizeof(call_node->param_names[call_node->n_stmts]), arg_name);
                 call_node->stmts[call_node->n_stmts++] = arg;
                 if (check(I, FTOK_COMMA)) advance(I);
@@ -4363,6 +4371,7 @@ static OfortNode *parse_subroutine(OfortInterpreter *I) {
     if (check(I, FTOK_LPAREN)) {
         advance(I);
         while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+            if (n->n_params >= OFORT_MAX_PARAMS) too_many_params_error(I, "subroutine parameters");
             OfortToken *param = expect(I, FTOK_IDENT);
             copy_cstr(n->param_names[n->n_params], sizeof(n->param_names[n->n_params]), param->str_val);
             n->param_types[n->n_params] = FVAL_VOID; /* resolved later */
@@ -4402,6 +4411,7 @@ static OfortNode *parse_function_with_type(OfortInterpreter *I, OfortValType res
     if (check(I, FTOK_LPAREN)) {
         advance(I);
         while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+            if (n->n_params >= OFORT_MAX_PARAMS) too_many_params_error(I, "function parameters");
             OfortToken *param = expect(I, FTOK_IDENT);
             copy_cstr(n->param_names[n->n_params], sizeof(n->param_names[n->n_params]), param->str_val);
             n->param_types[n->n_params] = FVAL_VOID;
@@ -4533,7 +4543,8 @@ static OfortNode *parse_module_procedure_body(OfortInterpreter *I) {
         copy_cstr(n->str_val, sizeof(n->str_val), spec->str_val);
         copy_cstr(n->result_name, sizeof(n->result_name), spec->result_name);
         n->n_params = spec->n_params;
-        for (int i = 0; i < spec->n_params; i++) {
+        if (spec->n_params > OFORT_MAX_PARAMS) too_many_params_error(I, "module procedure parameters");
+    for (int i = 0; i < spec->n_params; i++) {
             copy_cstr(n->param_names[i], sizeof(n->param_names[i]), spec->param_names[i]);
             n->param_types[i] = spec->param_types[i];
             copy_cstr(n->param_type_names[i], sizeof(n->param_type_names[i]), spec->param_type_names[i]);
@@ -4619,15 +4630,14 @@ static OfortNode *parse_type_def(OfortInterpreter *I) {
                             if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
                             target = advance(I);
                         }
-                        if (n->n_params < OFORT_MAX_PARAMS) {
-                            copy_cstr(n->param_names[n->n_params],
-                                      sizeof(n->param_names[n->n_params]),
-                                      token_name_text(binding));
-                            copy_cstr(n->binding_proc_names[n->n_params],
-                                      sizeof(n->binding_proc_names[n->n_params]),
-                                      token_name_text(target));
-                            n->n_params++;
-                        }
+                        if (n->n_params >= OFORT_MAX_PARAMS) too_many_params_error(I, "type-bound procedures");
+                        copy_cstr(n->param_names[n->n_params],
+                                  sizeof(n->param_names[n->n_params]),
+                                  token_name_text(binding));
+                        copy_cstr(n->binding_proc_names[n->n_params],
+                                  sizeof(n->binding_proc_names[n->n_params]),
+                                  token_name_text(target));
+                        n->n_params++;
                         if (check(I, FTOK_COMMA)) advance(I);
                         else break;
                     }
@@ -5105,6 +5115,7 @@ static OfortNode *parse_inquire_stmt(OfortInterpreter *I) {
                     n->stmts = (OfortNode **)realloc(n->stmts, sizeof(OfortNode *) * cap);
                     if (!n->stmts) ofort_error(I, "Out of memory");
                 }
+                if (n->n_stmts >= OFORT_MAX_PARAMS) too_many_params_error(I, "INQUIRE specifiers");
                 copy_cstr(n->param_names[n->n_stmts], sizeof(n->param_names[n->n_stmts]), name);
                 n->stmts[n->n_stmts++] = target;
             }
@@ -5123,6 +5134,7 @@ static OfortNode *parse_inquire_stmt(OfortInterpreter *I) {
             n->stmts = (OfortNode **)realloc(n->stmts, sizeof(OfortNode *) * cap);
             if (!n->stmts) ofort_error(I, "Out of memory");
         }
+        if (n->n_stmts >= OFORT_MAX_PARAMS) too_many_params_error(I, "INQUIRE items");
         copy_cstr(n->param_names[n->n_stmts], sizeof(n->param_names[n->n_stmts]), "$iolength_item");
         n->stmts[n->n_stmts++] = item;
         if (check(I, FTOK_COMMA)) advance(I);
@@ -5264,14 +5276,16 @@ static OfortNode *parse_access_stmt(OfortInterpreter *I) {
         }
     if (token_ident_upper(peek(I), "OPERATOR")) {
         char op_name[256];
-        if (parse_operator_designator(I, op_name, sizeof(op_name)) && n->n_params < OFORT_MAX_PARAMS) {
+        if (parse_operator_designator(I, op_name, sizeof(op_name))) {
+            if (n->n_params >= OFORT_MAX_PARAMS) too_many_params_error(I, "access specifiers");
             copy_cstr(n->param_names[n->n_params++], sizeof(n->param_names[0]), op_name);
         } else {
             advance(I);
         }
         continue;
     }
-        if (check(I, FTOK_IDENT) && n->n_params < OFORT_MAX_PARAMS) {
+        if (check(I, FTOK_IDENT)) {
+            if (n->n_params >= OFORT_MAX_PARAMS) too_many_params_error(I, "access specifiers");
             OfortToken *name = advance(I);
             copy_cstr(n->param_names[n->n_params++], sizeof(n->param_names[0]), name->str_val);
         } else {
@@ -5620,6 +5634,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
                     cap = cap ? cap * 2 : 8;
                     n->stmts = (OfortNode **)realloc(n->stmts, sizeof(OfortNode *) * cap);
                 }
+                if (n->n_stmts >= OFORT_MAX_PARAMS) too_many_params_error(I, "call arguments");
                 if (arg_name) copy_cstr(n->param_names[n->n_stmts], sizeof(n->param_names[n->n_stmts]), arg_name);
                 n->stmts[n->n_stmts++] = arg;
                 if (check(I, FTOK_COMMA)) advance(I);
@@ -8657,6 +8672,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         /* Could be function call, array reference, or type constructor */
         /* Evaluate arguments */
         int nargs = n->n_stmts;
+        if (nargs > OFORT_MAX_PARAMS) too_many_params_error(I, "function arguments");
         OfortValue args[OFORT_MAX_PARAMS];
         char procedure_call_name[256];
         procedure_call_name[0] = '\0';
@@ -8991,6 +9007,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 const char *proc_name = find_type_binding_proc(I, receiver.v.dt.type_name, member->name);
                 if (proc_name) {
                     OfortFunc *func = find_func(I, proc_name);
+                    if (n->n_stmts + 1 > OFORT_MAX_PARAMS) too_many_params_error(I, "type-bound call arguments");
                     OfortValue args[OFORT_MAX_PARAMS];
                     int nargs = 1;
                     if (!func || !func->is_function)
@@ -12507,9 +12524,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 ofort_error(I, "'%s' is a function, not a subroutine", proc_name);
 
             int nargs = n->n_stmts + 1;
+            if (nargs > OFORT_MAX_PARAMS) too_many_params_error(I, "type-bound subroutine arguments");
             OfortValue args[OFORT_MAX_PARAMS];
             args[0] = copy_value(*receiver_target);
-            for (int i = 0; i < n->n_stmts && i + 1 < OFORT_MAX_PARAMS; i++) {
+            for (int i = 0; i < n->n_stmts; i++) {
                 args[i + 1] = eval_node(I, n->stmts[i]);
             }
             push_scope(I);
@@ -12549,6 +12567,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         /* Check for intrinsic subroutines */
         /* (none currently — user subroutines only) */
 
+        if (nargs > OFORT_MAX_PARAMS) too_many_params_error(I, "subroutine call arguments");
         OfortValue args[OFORT_MAX_PARAMS];
         int arg_alias[OFORT_MAX_PARAMS] = {0};
         OfortVar *arg_alias_var[OFORT_MAX_PARAMS] = {0};
@@ -16082,3 +16101,4 @@ void ofort_reset(OfortInterpreter *interp) {
     clear_timing(interp);
     clear_line_profile(interp);
 }
+
