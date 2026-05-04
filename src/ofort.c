@@ -3944,10 +3944,28 @@ static OfortNode *parse_forall_stmt(OfortInterpreter *I) {
         else break;
     }
     expect(I, FTOK_RPAREN);
-    n->stmts = (OfortNode **)calloc(1, sizeof(OfortNode *));
-    if (!n->stmts) ofort_error(I, "Out of memory");
-    n->stmts[0] = parse_statement(I);
-    n->n_stmts = 1;
+    if (check(I, FTOK_NEWLINE) || check(I, FTOK_SEMICOLON)) {
+        skip_newlines(I);
+        OfortNode *body = parse_block_until_end(I, "FORALL");
+        n->n_stmts = body->n_stmts;
+        if (n->n_stmts > 0) {
+            n->stmts = (OfortNode **)calloc((size_t)n->n_stmts, sizeof(OfortNode *));
+            if (!n->stmts) ofort_error(I, "Out of memory");
+            for (int i = 0; i < n->n_stmts; i++) n->stmts[i] = body->stmts[i];
+        }
+        consume_end(I, "FORALL");
+    } else {
+        OfortNode *body_stmt = parse_statement(I);
+        if (body_stmt) {
+            n->stmts = (OfortNode **)calloc(1, sizeof(OfortNode *));
+            if (!n->stmts) ofort_error(I, "Out of memory");
+            n->stmts[0] = body_stmt;
+            n->n_stmts = 1;
+        }
+        if (!body_stmt && check_end(I, "FORALL")) {
+            consume_end(I, "FORALL");
+        }
+    }
     return n;
 }
 
@@ -9942,14 +9960,218 @@ static int find_statement_label(OfortNode *block, int label) {
     return -1;
 }
 
-static void exec_forall_level(OfortInterpreter *I, OfortNode *n, int level) {
+typedef struct {
+    OfortVar *var;
+    OfortValue base;
+    OfortValue staged;
+    int base_present;
+    int base_is_allocatable;
+    int base_scalar_allocated;
+} OfortForallTarget;
+
+static int forall_array_shapes_match(const OfortValue *a, const OfortValue *b) {
+    if (!a || !b || a->type != FVAL_ARRAY || b->type != FVAL_ARRAY) return 0;
+    if (a->v.arr.elem_type != b->v.arr.elem_type) return 0;
+    if (a->v.arr.n_dims != b->v.arr.n_dims) return 0;
+    if (a->v.arr.len != b->v.arr.len) return 0;
+    for (int i = 0; i < a->v.arr.n_dims; i++) {
+        if (a->v.arr.dims[i] != b->v.arr.dims[i] ||
+            a->v.arr.lower_bounds[i] != b->v.arr.lower_bounds[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int values_equal_deep(OfortInterpreter *I, const OfortValue *a, const OfortValue *b) {
+    if (!a || !b) return 0;
+    if (a->type != b->type) return 0;
+    switch (a->type) {
+        case FVAL_INTEGER:
+            return a->v.i == b->v.i;
+        case FVAL_REAL:
+        case FVAL_DOUBLE:
+            return a->v.r == b->v.r;
+        case FVAL_COMPLEX:
+            return a->v.cx.re == b->v.cx.re && a->v.cx.im == b->v.cx.im;
+        case FVAL_LOGICAL:
+            return a->v.b == b->v.b;
+        case FVAL_CHARACTER:
+            return string_equal_fortran(a->v.s ? a->v.s : "", b->v.s ? b->v.s : "");
+        case FVAL_ARRAY: {
+            if (!forall_array_shapes_match(a, b)) return 0;
+            for (int i = 0; i < a->v.arr.len; i++) {
+                OfortValue av = array_element_value(a, i);
+                OfortValue bv = array_element_value(b, i);
+                int equal = values_equal_deep(I, &av, &bv);
+                free_value(&av);
+                free_value(&bv);
+                if (!equal) return 0;
+            }
+            return 1;
+        }
+        case FVAL_DERIVED: {
+            if (strcmp(a->v.dt.type_name, b->v.dt.type_name) != 0 ||
+                a->v.dt.n_fields != b->v.dt.n_fields) return 0;
+            for (int i = 0; i < a->v.dt.n_fields; i++) {
+                if (!values_equal_deep(I, &a->v.dt.fields[i], &b->v.dt.fields[i])) return 0;
+            }
+            return 1;
+        }
+        default:
+            return 1;
+    }
+}
+
+static const char *extract_forall_lhs_name(OfortNode *lhs) {
+    if (!lhs) return NULL;
+    if (lhs->type == FND_IDENT || lhs->type == FND_FUNC_CALL || lhs->type == FND_ARRAY_REF) return lhs->name;
+    if (lhs->type == FND_MEMBER && lhs->children[0] && lhs->children[0]->type == FND_IDENT) {
+        return lhs->children[0]->name;
+    }
+    return NULL;
+}
+
+static void collect_forall_target_var(OfortInterpreter *I, OfortVar ***vars_ptr, int *n_vars, int *cap_vars, OfortVar *var) {
+    if (!var) return;
+    for (int i = 0; i < *n_vars; i++) {
+        if ((*vars_ptr)[i] == var) return;
+    }
+    if (*n_vars >= *cap_vars) {
+        int next_cap = *cap_vars == 0 ? 8 : (*cap_vars * 2);
+        OfortVar **grown = (OfortVar **)realloc(*vars_ptr, sizeof(*grown) * (size_t)next_cap);
+        if (!grown) ofort_error(I, "Out of memory");
+        (void)memset(grown + *cap_vars, 0, sizeof(*grown) * (size_t)(next_cap - *cap_vars));
+        *vars_ptr = grown;
+        *cap_vars = next_cap;
+    }
+    (*vars_ptr)[*n_vars] = var;
+    (*n_vars)++;
+}
+
+static void collect_forall_target_nodes(OfortInterpreter *I, OfortNode *n,
+                                      OfortVar ***vars_ptr, int *n_vars, int *cap_vars) {
+    if (!n) return;
+    if (n->type == FND_ASSIGN || n->type == FND_POINTER_ASSIGN) {
+        const char *name = extract_forall_lhs_name(n->children[0]);
+        if (name && *name) {
+            OfortVar *var = find_var(I, name);
+            if (var) collect_forall_target_var(I, vars_ptr, n_vars, cap_vars, var);
+        }
+    }
+    for (int i = 0; i < n->n_children; i++) collect_forall_target_nodes(I, n->children[i], vars_ptr, n_vars, cap_vars);
+    for (int i = 0; i < n->n_stmts; i++) collect_forall_target_nodes(I, n->stmts[i], vars_ptr, n_vars, cap_vars);
+}
+
+static int collect_forall_targets(OfortInterpreter *I, OfortNode *n, OfortForallTarget **out_targets) {
+    OfortVar **vars = NULL;
+    int n_vars = 0;
+    int cap_vars = 0;
+    for (int i = 0; i < n->n_stmts; i++) collect_forall_target_nodes(I, n->stmts[i], &vars, &n_vars, &cap_vars);
+    if (n_vars == 0) {
+        *out_targets = NULL;
+        return 0;
+    }
+    OfortForallTarget *targets = (OfortForallTarget *)calloc((size_t)n_vars, sizeof(*targets));
+    if (!targets) ofort_error(I, "Out of memory");
+    for (int i = 0; i < n_vars; i++) {
+        targets[i].var = vars[i];
+        targets[i].base = copy_value(vars[i]->val);
+        targets[i].base_present = vars[i]->present;
+        targets[i].base_is_allocatable = vars[i]->is_allocatable;
+        targets[i].base_scalar_allocated = vars[i]->scalar_allocated;
+        targets[i].staged = copy_value(vars[i]->val);
+    }
+    free(vars);
+    *out_targets = targets;
+    return n_vars;
+}
+
+static void free_forall_targets(OfortForallTarget *targets, int n_targets) {
+    if (!targets) return;
+    for (int i = 0; i < n_targets; i++) {
+        free_value(&targets[i].base);
+        free_value(&targets[i].staged);
+    }
+    free(targets);
+}
+
+static void restore_forall_targets_to_base(OfortInterpreter *I, OfortForallTarget *targets, int n_targets) {
+    (void)I;
+    for (int i = 0; i < n_targets; i++) {
+        OfortForallTarget *t = &targets[i];
+        if (!t->var) continue;
+        free_value(&t->var->val);
+        t->var->present = t->base_present;
+        t->var->scalar_allocated = t->base_scalar_allocated;
+        t->var->is_allocatable = t->base_is_allocatable;
+        t->var->val = copy_value(t->base);
+    }
+}
+
+static void merge_forall_targets(OfortInterpreter *I, OfortForallTarget *targets,
+                                int n_targets) {
+    for (int i = 0; i < n_targets; i++) {
+        OfortForallTarget *t = &targets[i];
+        OfortVar *var = t->var;
+        if (!var) continue;
+        if (values_equal_deep(I, &var->val, &t->base)) continue;
+        if (var->val.type != FVAL_ARRAY) {
+            free_value(&t->staged);
+            t->staged = copy_value(var->val);
+            continue;
+        }
+
+        if (!forall_array_shapes_match(&var->val, &t->base)) {
+            free_value(&t->staged);
+            t->staged = copy_value(var->val);
+            continue;
+        }
+
+        for (int j = 0; j < var->val.v.arr.len; j++) {
+            OfortValue base_elem = array_element_value(&t->base, j);
+            OfortValue cur_elem = array_element_value(&var->val, j);
+            if (!values_equal_deep(I, &cur_elem, &base_elem)) {
+                if (assign_packed_array_element(&t->staged, j, cur_elem)) {
+                    free_value(&cur_elem);
+                } else {
+                    free_value(&t->staged.v.arr.data[j]);
+                    t->staged.v.arr.data[j] = cur_elem;
+                }
+            } else {
+                free_value(&cur_elem);
+            }
+            free_value(&base_elem);
+        }
+    }
+}
+
+static void commit_forall_targets(OfortInterpreter *I, OfortForallTarget *targets, int n_targets) {
+    (void)I;
+    for (int i = 0; i < n_targets; i++) {
+        OfortForallTarget *t = &targets[i];
+        if (!t->var) continue;
+        free_value(&t->var->val);
+        t->var->present = t->base_present;
+        t->var->scalar_allocated = t->base_scalar_allocated;
+        t->var->is_allocatable = t->base_is_allocatable;
+        t->var->val = copy_value(t->staged);
+    }
+}
+
+static void exec_forall_level(OfortInterpreter *I, OfortNode *n, int level,
+                             OfortForallTarget *targets, int n_targets) {
     int child = level * 3;
     OfortValue lv;
     OfortValue uv;
     OfortValue sv;
     int lo, hi, step;
     if (level >= n->n_params) {
-        if (n->n_stmts > 0) exec_node(I, n->stmts[0]);
+        for (int i = 0; i < n->n_stmts; i++) {
+            exec_node(I, n->stmts[i]);
+            if (I->returning || I->exiting || I->cycling || I->stopping || I->goto_active) break;
+        }
+        merge_forall_targets(I, targets, n_targets);
         return;
     }
     lv = eval_node(I, n->children[child]);
@@ -9964,7 +10186,8 @@ static void exec_forall_level(OfortInterpreter *I, OfortNode *n, int level) {
     if (step == 0) ofort_error(I, "FORALL stride cannot be zero");
     for (int i = lo; step > 0 ? i <= hi : i >= hi; i += step) {
         set_var(I, n->param_names[level], make_integer(i));
-        exec_forall_level(I, n, level + 1);
+        exec_forall_level(I, n, level + 1, targets, n_targets);
+        restore_forall_targets_to_base(I, targets, n_targets);
         if (I->returning || I->exiting || I->cycling || I->stopping || I->goto_active) break;
     }
 }
@@ -11995,7 +12218,17 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         break;
 
     case FND_FORALL:
-        exec_forall_level(I, n, 0);
+        {
+            OfortForallTarget *targets = NULL;
+            int n_targets = collect_forall_targets(I, n, &targets);
+            exec_forall_level(I, n, 0, targets, n_targets);
+            if (!I->returning && !I->exiting && !I->cycling && !I->stopping && !I->goto_active) {
+                commit_forall_targets(I, targets, n_targets);
+            } else {
+                restore_forall_targets_to_base(I, targets, n_targets);
+            }
+            free_forall_targets(targets, n_targets);
+        }
         break;
 
     case FND_STOP:
