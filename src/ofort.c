@@ -3060,6 +3060,9 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
     int is_optional = 0;
     int intent = 0;
     int decl_dims[7] = {0};
+    int decl_lower_bounds[7] = {0};
+    int decl_has_lower_bound[7] = {0};
+    OfortNode *decl_dim_exprs[7] = {0};
     int n_decl_dims = 0;
 
     if (vtype == FVAL_REAL && check(I, FTOK_STAR)) {
@@ -3174,17 +3177,29 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
                     decl_dims[n_decl_dims++] = 0; /* inferred/assumed size */
                 } else {
                     OfortNode *dim_expr = parse_dimension_bound_expr(I);
+                    int dim_index = n_decl_dims;
                     /* For now assume it's a simple integer */
                     if (dim_expr->type == FND_INT_LIT)
                         decl_dims[n_decl_dims++] = (int)dim_expr->int_val;
-                    else
+                    else {
                         decl_dims[n_decl_dims++] = 0;
+                        decl_dim_exprs[dim_index] = dim_expr;
+                    }
                     /* range: skip lo:hi */
                     if (check(I, FTOK_COLON)) {
                         advance(I);
+                        if (dim_expr->type == FND_INT_LIT) {
+                            decl_lower_bounds[dim_index] = (int)dim_expr->int_val;
+                            decl_has_lower_bound[dim_index] = 1;
+                        }
                         OfortNode *hi = parse_expr(I);
-                        if (hi->type == FND_INT_LIT)
-                            decl_dims[n_decl_dims - 1] = (int)hi->int_val;
+                        if (hi->type == FND_INT_LIT) {
+                            decl_dims[dim_index] = (int)hi->int_val;
+                            decl_dim_exprs[dim_index] = NULL;
+                        } else {
+                            decl_dims[dim_index] = 0;
+                            decl_dim_exprs[dim_index] = hi;
+                        }
                     }
                 }
                 if (check(I, FTOK_COMMA)) advance(I);
@@ -3259,6 +3274,16 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
         decl->is_optional = is_optional;
         decl->intent = intent;
         decl->line = name_tok->line;
+        memcpy(decl->dims, decl_dims, sizeof(decl_dims));
+        memcpy(decl->lower_bounds, decl_lower_bounds, sizeof(decl_lower_bounds));
+        memcpy(decl->has_lower_bound, decl_has_lower_bound, sizeof(decl_has_lower_bound));
+        decl->n_dims = n_decl_dims;
+        if (n_decl_dims > 0) {
+            decl->stmts = (OfortNode **)calloc((size_t)n_decl_dims, sizeof(OfortNode *));
+            if (!decl->stmts) ofort_error(I, "Out of memory");
+            decl->n_stmts = n_decl_dims;
+            for (int di = 0; di < n_decl_dims; di++) decl->stmts[di] = decl_dim_exprs[di];
+        }
 
         if (vtype == FVAL_CHARACTER && check(I, FTOK_STAR)) {
             advance(I);
@@ -12597,6 +12622,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         for (int i = 0; i < fn->n_params && i < nargs; i++) {
             if (!arg_alias[i] && n->stmts[i]->type == FND_IDENT && fn->param_intents[i] != 1 &&
                 args[i].type != FVAL_VOID && !procedure_ref_name(&args[i])) {
+                OfortVar *actual = find_var(I, n->stmts[i]->name);
+                if (actual && actual->is_parameter) continue;
                 set_var(I, n->stmts[i]->name, copy_value(args[i]));
             } else if (!arg_alias[i] && n->stmts[i]->type == FND_MEMBER && fn->param_intents[i] != 1 &&
                        args[i].type != FVAL_VOID && !procedure_ref_name(&args[i])) {
