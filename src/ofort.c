@@ -2994,6 +2994,35 @@ static OfortValType token_to_valtype(OfortTokenType t) {
     }
 }
 
+static int normalize_intrinsic_type_wrapper_declaration(OfortInterpreter *I) {
+    int pos = I->tok_pos;
+    OfortToken *type_tok;
+    OfortToken *intrinsic_tok;
+
+    if (pos + 3 >= I->n_tokens) return 0;
+    if (I->tokens[pos].type != FTOK_TYPE ||
+        I->tokens[pos + 1].type != FTOK_LPAREN ||
+        !is_type_keyword(I->tokens[pos + 2].type) ||
+        I->tokens[pos + 3].type != FTOK_RPAREN) {
+        return 0;
+    }
+
+    type_tok = &I->tokens[pos];
+    intrinsic_tok = &I->tokens[pos + 2];
+    type_tok->type = intrinsic_tok->type;
+    type_tok->start = intrinsic_tok->start;
+    type_tok->length = intrinsic_tok->length;
+    type_tok->num_val = intrinsic_tok->num_val;
+    type_tok->int_val = intrinsic_tok->int_val;
+    type_tok->kind = intrinsic_tok->kind;
+    copy_cstr(type_tok->str_val, sizeof(type_tok->str_val), intrinsic_tok->str_val);
+
+    memmove(&I->tokens[pos + 1], &I->tokens[pos + 4],
+            (size_t)(I->n_tokens - (pos + 4)) * sizeof(I->tokens[0]));
+    I->n_tokens -= 3;
+    return 1;
+}
+
 static const char *valtype_standard_name(OfortValType type) {
     switch (type) {
         case FVAL_INTEGER: return "INTEGER";
@@ -5620,6 +5649,9 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
             return parse_type_def(I);
         }
         if (next->type == FTOK_LPAREN) {
+            if (normalize_intrinsic_type_wrapper_declaration(I)) {
+                return parse_declaration(I);
+            }
             return parse_derived_type_declaration(I);
         }
         advance(I);
