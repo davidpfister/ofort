@@ -3135,6 +3135,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
     int decl_dims[7] = {0};
     int decl_lower_bounds[7] = {0};
     int decl_has_lower_bound[7] = {0};
+    OfortNode *decl_lower_bound_exprs[7] = {0};
     OfortNode *decl_dim_exprs[7] = {0};
     int n_decl_dims = 0;
 
@@ -3272,6 +3273,10 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
                         if (int_constant_node(dim_expr, &lower_value)) {
                             decl_lower_bounds[dim_index] = lower_value;
                             decl_has_lower_bound[dim_index] = 1;
+                        } else {
+                            decl_lower_bounds[dim_index] = 1;
+                            decl_lower_bound_exprs[dim_index] = dim_expr;
+                            decl_has_lower_bound[dim_index] = 1;
                         }
                         if (check(I, FTOK_RPAREN) || check(I, FTOK_COMMA)) {
                             decl_dims[dim_index] = 0;
@@ -3363,6 +3368,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
         memcpy(decl->dims, decl_dims, sizeof(decl_dims));
         memcpy(decl->lower_bounds, decl_lower_bounds, sizeof(decl_lower_bounds));
         memcpy(decl->has_lower_bound, decl_has_lower_bound, sizeof(decl_has_lower_bound));
+        memcpy(decl->lower_bound_exprs, decl_lower_bound_exprs, sizeof(decl_lower_bound_exprs));
         decl->n_dims = n_decl_dims;
         if (n_decl_dims > 0) {
             decl->stmts = (OfortNode **)calloc((size_t)n_decl_dims, sizeof(OfortNode *));
@@ -3435,6 +3441,10 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
                         advance(I);
                         if (de->type == FND_INT_LIT) {
                             decl->lower_bounds[dim_index] = (int)de->int_val;
+                            decl->has_lower_bound[dim_index] = 1;
+                        } else {
+                            decl->lower_bounds[dim_index] = 1;
+                            decl->lower_bound_exprs[dim_index] = de;
                             decl->has_lower_bound[dim_index] = 1;
                         }
                         if (check(I, FTOK_RPAREN) || check(I, FTOK_COMMA)) {
@@ -6526,6 +6536,11 @@ static OfortValue make_derived_array_from_decl(OfortInterpreter *I, OfortNode *n
 
     for (int i = 0; i < ndims; i++) {
         lower_bounds[i] = n->has_lower_bound[i] ? n->lower_bounds[i] : 1;
+        if (n->has_lower_bound[i] && n->lower_bound_exprs[i]) {
+            OfortValue lv = eval_node(I, n->lower_bound_exprs[i]);
+            lower_bounds[i] = (int)val_to_int(lv);
+            free_value(&lv);
+        }
         dims[i] = n->dims[i];
         if (dims[i] <= 0 && n->stmts && i < n->n_stmts && n->stmts[i]) {
             OfortValue dv = eval_node(I, n->stmts[i]);
@@ -6550,6 +6565,11 @@ static OfortValue make_array_from_decl(OfortInterpreter *I, OfortNode *n) {
 
     for (int i = 0; i < ndims; i++) {
         lower_bounds[i] = n->has_lower_bound[i] ? n->lower_bounds[i] : 1;
+        if (n->has_lower_bound[i] && n->lower_bound_exprs[i]) {
+            OfortValue lv = eval_node(I, n->lower_bound_exprs[i]);
+            lower_bounds[i] = (int)val_to_int(lv);
+            free_value(&lv);
+        }
         dims[i] = n->dims[i];
         if (dims[i] <= 0 && n->stmts && i < n->n_stmts && n->stmts[i]) {
             OfortValue dv = eval_node(I, n->stmts[i]);
@@ -6619,6 +6639,11 @@ static int fast_local_array_shape_matches(OfortInterpreter *I, OfortNode *n, Ofo
     if (!arr || arr->type != FVAL_ARRAY || arr->v.arr.n_dims != n->n_dims) return 0;
     for (int i = 0; i < n->n_dims; i++) {
         int lower = n->has_lower_bound[i] ? n->lower_bounds[i] : 1;
+        if (n->has_lower_bound[i] && n->lower_bound_exprs[i]) {
+            OfortValue lv = eval_node(I, n->lower_bound_exprs[i]);
+            lower = (int)val_to_int(lv);
+            free_value(&lv);
+        }
         int dim = n->dims[i];
         if (dim <= 0 && n->stmts && i < n->n_stmts && n->stmts[i]) {
             OfortValue dv = eval_node(I, n->stmts[i]);
@@ -11994,6 +12019,20 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         int decl_char_len = n->val_type == FVAL_CHARACTER ? eval_character_length(I, n) : 0;
         OfortVar *existing = find_var(I, n->name);
         OfortVar *existing_current = find_var_in_current_scope(I, n->name);
+        if (existing && existing == existing_current &&
+            existing->val.type == FVAL_ARRAY && n->n_dims > 0) {
+            for (int i = 0; i < n->n_dims && i < existing->val.v.arr.n_dims && i < 7; i++) {
+                if (n->has_lower_bound[i]) {
+                    int lower = n->lower_bounds[i];
+                    if (n->lower_bound_exprs[i]) {
+                        OfortValue lv = eval_node(I, n->lower_bound_exprs[i]);
+                        lower = (int)val_to_int(lv);
+                        free_value(&lv);
+                    }
+                    existing->val.v.arr.lower_bounds[i] = lower;
+                }
+            }
+        }
         if (existing && (n->is_save || (I->procedure_depth > 0 && n->is_implicit_save))) {
             existing->is_save = 1;
             existing->is_implicit_save = n->is_implicit_save;
