@@ -25,6 +25,7 @@
 static void normalize_newlines(char *source);
 static char *maybe_wrap_loose_source(char *source);
 static char *read_file(const char *path);
+static char *copy_string(const char *text);
 static const char *skip_space(const char *line);
 static int starts_with_word_nocase(const char *line, const char *word);
 static int identifier_char(int c);
@@ -36,6 +37,18 @@ typedef struct {
     int count;
     int cap;
 } PathList;
+
+typedef struct {
+    char *path;
+    int start_line;
+    int line_count;
+} SourceMapEntry;
+
+typedef struct {
+    SourceMapEntry *entries;
+    int count;
+    int cap;
+} SourceMap;
 
 static int append_text(char **buf, size_t *len, size_t *cap, const char *text) {
     size_t n = strlen(text);
@@ -89,6 +102,93 @@ static int append_text_n(char **buf, size_t *len, size_t *cap, const char *text,
     *len += n;
     (*buf)[*len] = '\0';
     return 1;
+}
+
+static void source_map_free(SourceMap *map) {
+    if (!map) return;
+    for (int i = 0; i < map->count; i++) {
+        free(map->entries[i].path);
+    }
+    free(map->entries);
+    map->entries = NULL;
+    map->count = 0;
+    map->cap = 0;
+}
+
+static int source_map_add(SourceMap *map, const char *path, int start_line, int line_count) {
+    SourceMapEntry *new_entries;
+
+    if (!map) return 1;
+    if (map->count == map->cap) {
+        int new_cap = map->cap ? map->cap * 2 : 8;
+        new_entries = (SourceMapEntry *)realloc(map->entries, (size_t)new_cap * sizeof(*map->entries));
+        if (!new_entries) {
+            fprintf(stderr, "out of memory\n");
+            return 0;
+        }
+        map->entries = new_entries;
+        map->cap = new_cap;
+    }
+    map->entries[map->count].path = copy_string(path);
+    if (!map->entries[map->count].path) {
+        fprintf(stderr, "out of memory\n");
+        return 0;
+    }
+    map->entries[map->count].start_line = start_line;
+    map->entries[map->count].line_count = line_count;
+    map->count++;
+    return 1;
+}
+
+static int source_text_line_count(const char *text) {
+    int lines = 0;
+    const char *p;
+
+    if (!text || text[0] == '\0') return 0;
+    lines = 1;
+    for (p = text; *p; p++) {
+        if (*p == '\n' && p[1] != '\0') {
+            lines++;
+        }
+    }
+    return lines;
+}
+
+static const SourceMapEntry *source_map_find(const SourceMap *map, int global_line, int *local_line) {
+    if (!map || global_line <= 0) return NULL;
+    for (int i = 0; i < map->count; i++) {
+        const SourceMapEntry *entry = &map->entries[i];
+        int start = entry->start_line;
+        int end = start + entry->line_count - 1;
+        if (entry->line_count > 0 && global_line >= start && global_line <= end) {
+            if (local_line) *local_line = global_line - start + 1;
+            return entry;
+        }
+    }
+    return NULL;
+}
+
+static int extract_error_line(const char *error) {
+    const char *p;
+
+    if (!error) return 0;
+    p = strstr(error, " at line ");
+    if (p) return atoi(p + 9);
+    p = strstr(error, "\nline ");
+    if (p) return atoi(p + 6);
+    if (strncmp(error, "line ", 5) == 0) return atoi(error + 5);
+    return 0;
+}
+
+static void print_source_mapped_error(const char *error, const SourceMap *map) {
+    int global_line = extract_error_line(error);
+    int local_line = 0;
+    const SourceMapEntry *entry = source_map_find(map, global_line, &local_line);
+
+    if (entry) {
+        fprintf(stderr, "%s:%d: ", entry->path, local_line);
+    }
+    fprintf(stderr, "%s\n", (error && error[0] != '\0') ? error : "Fortran execution failed");
 }
 
 static char *read_stream(FILE *fp, const char *name) {
@@ -1337,8 +1437,17 @@ static OfortInterpreter *create_ofort_interpreter(void) {
     return interp;
 }
 
+static OfortInterpreter *create_repl_interpreter(void) {
+    OfortInterpreter *interp = create_ofort_interpreter();
+    if (interp) {
+        ofort_set_live_stdout(interp, 1);
+    }
+    return interp;
+}
+
 static int execute_source_text(const char *text, int print_expr_statements, int suppress_output,
-                               int command_argc, char **command_args, double setup_start) {
+                               int command_argc, char **command_args, double setup_start,
+                               const SourceMap *source_map) {
     char *source = copy_string(text);
     OfortInterpreter *interp;
     int rc;
@@ -1364,6 +1473,7 @@ static int execute_source_text(const char *text, int print_expr_statements, int 
     ofort_set_print_expr_statements(interp, print_expr_statements);
     ofort_set_suppress_output(interp, suppress_output);
     ofort_set_command_args(interp, command_argc, (const char *const *)command_args);
+    ofort_set_live_stdout(interp, ISATTY(FILENO(stdin)) && ISATTY(FILENO(stdout)));
 
     rc = ofort_execute(interp, source);
     if (rc == 0) {
@@ -1392,7 +1502,7 @@ static int execute_source_text(const char *text, int print_expr_statements, int 
                 print_detailed_time(setup_elapsed, &timing);
             }
         }
-        fprintf(stderr, "%s\n", (error && error[0] != '\0') ? error : "Fortran execution failed");
+        print_source_mapped_error(error, source_map);
     }
 
     ofort_destroy(interp);
@@ -1489,7 +1599,7 @@ static int run_ofort_file_to_path(const char *source_path, const char *out_path)
     return rc == 0 ? 0 : 1;
 }
 
-static int check_ofort_file(const char *source_path) {
+static int check_ofort_file(const char *source_path, int quiet, int label_failures) {
     double setup_start = monotonic_seconds();
     char *source = read_file(source_path);
     OfortInterpreter *interp;
@@ -1520,11 +1630,17 @@ static int check_ofort_file(const char *source_path) {
             print_detailed_time(setup_elapsed, &timing);
         }
     }
-    if (rc == 0) {
+    if (rc == 0 && !quiet) {
         printf("ofort check passed\n");
-    } else {
+    } else if (rc != 0) {
         const char *error = ofort_get_error(interp);
+        if (label_failures) {
+            fprintf(stderr, "%s:\n", source_path);
+        }
         fprintf(stderr, "%s\n", (error && error[0] != '\0') ? error : "ofort check failed");
+        if (label_failures) {
+            fprintf(stderr, "\n");
+        }
     }
 
     ofort_destroy(interp);
@@ -1533,26 +1649,35 @@ static int check_ofort_file(const char *source_path) {
 }
 
 static int run_each_file(const char *const *paths, int npaths, int syntax_check,
-                         int command_argc, char **command_args, int time_operation) {
+                         int command_argc, char **command_args, int time_operation,
+                         int quiet) {
     int failures = 0;
+    const char **failed_paths = (const char **)calloc((size_t)npaths, sizeof(*failed_paths));
+
+    if (!failed_paths) {
+        fprintf(stderr, "out of memory\n");
+        return 2;
+    }
 
     for (int i = 0; i < npaths; i++) {
         int rc;
         double start = monotonic_seconds();
-        if (i > 0) {
+        if (!quiet && i > 0) {
             printf("\n");
         }
-        printf("==> %s\n", paths[i]);
-        fflush(stdout);
+        if (!quiet) {
+            printf("==> %s\n", paths[i]);
+            fflush(stdout);
+        }
 
         if (syntax_check) {
-            rc = check_ofort_file(paths[i]);
+            rc = check_ofort_file(paths[i], quiet, quiet);
         } else {
             char *source = read_file(paths[i]);
             if (!source) {
                 rc = 2;
             } else {
-                rc = execute_source_text(source, 0, 0, command_argc, command_args, start);
+                rc = execute_source_text(source, 0, 0, command_argc, command_args, start, NULL);
                 free(source);
             }
         }
@@ -1560,10 +1685,23 @@ static int run_each_file(const char *const *paths, int npaths, int syntax_check,
             print_elapsed_time(start);
         }
         if (rc != 0) {
+            failed_paths[failures] = paths[i];
             failures++;
         }
     }
 
+    if (!quiet || failures > 0) {
+        printf("\n");
+    }
+    printf("checked %d files: %d passed, %d failed\n", npaths, npaths - failures, failures);
+    if (failures > 0) {
+        printf("\nfailing files:\n");
+        for (int i = 0; i < failures; i++) {
+            printf("  %s\n", failed_paths[i]);
+        }
+    }
+
+    free(failed_paths);
     return failures == 0 ? 0 : 1;
 }
 
@@ -2093,6 +2231,84 @@ static int has_glob_wildcard(const char *path) {
     return path && (strchr(path, '*') || strchr(path, '?'));
 }
 
+static int path_is_absolute(const char *path) {
+    if (!path || !path[0]) return 0;
+    if (path[0] == '/' || path[0] == '\\') return 1;
+    return isalpha((unsigned char)path[0]) && path[1] == ':';
+}
+
+static void manifest_dirname(const char *path, char *dir, size_t dir_size) {
+    const char *slash1 = strrchr(path, '\\');
+    const char *slash2 = strrchr(path, '/');
+    const char *slash = slash1 > slash2 ? slash1 : slash2;
+    size_t len;
+
+    if (!dir || dir_size == 0) return;
+    if (!slash) {
+        dir[0] = '\0';
+        return;
+    }
+    len = (size_t)(slash - path + 1);
+    if (len >= dir_size) len = dir_size - 1;
+    memcpy(dir, path, len);
+    dir[len] = '\0';
+}
+
+static int path_list_add_manifest(PathList *list, const char *manifest_path) {
+    char *text;
+    char base_dir[1024];
+    char *cursor;
+
+    text = read_file(manifest_path);
+    if (!text) return 0;
+    normalize_newlines(text);
+    manifest_dirname(manifest_path, base_dir, sizeof(base_dir));
+
+    cursor = text;
+    while (*cursor) {
+        char *line = cursor;
+        char *newline = strchr(cursor, '\n');
+        char *p = line;
+        char *end;
+
+        if (newline) {
+            *newline = '\0';
+            cursor = newline + 1;
+        } else {
+            cursor += strlen(cursor);
+        }
+        while (*p && isspace((unsigned char)*p)) p++;
+        end = p + strlen(p);
+        while (end > p && isspace((unsigned char)end[-1])) end--;
+        *end = '\0';
+        if (*p != '\0' && *p != '#' && *p != '!') {
+            char full[2048];
+            if (path_is_absolute(p) || base_dir[0] == '\0') {
+                snprintf(full, sizeof(full), "%s", p);
+            } else {
+                snprintf(full, sizeof(full), "%s%s", base_dir, p);
+            }
+            if (!path_list_add(list, full)) {
+                free(text);
+                return 0;
+            }
+        }
+    }
+
+    free(text);
+    return 1;
+}
+
+static int add_source_path_arg(PathList *list, const char *arg, int expand_globs) {
+    if (arg && arg[0] == '@' && arg[1] != '\0') {
+        return path_list_add_manifest(list, arg + 1);
+    }
+    if (expand_globs && has_glob_wildcard(arg)) {
+        return 2;
+    }
+    return path_list_add(list, arg);
+}
+
 #ifdef _WIN32
 static int expand_windows_glob(PathList *list, const char *pattern) {
     intptr_t handle;
@@ -2333,7 +2549,7 @@ static int run_interactive(const char *load_path, int run_after_load) {
     printf("Enter Fortran source.\n");
     printf("Commands: . runs, .run [n] [-- args] repeats, .time [n] [-- args] times, .runq [n] [-- args] runs and quits, .quit quits, .clear clears, .del n[:m] deletes lines, .ins n text inserts, .rep n text replaces, .rename old new renames, .list lists, .decl lists declarations, .vars [names] lists values, .info [names] lists details, .shapes [names] lists array shapes, .sizes [names] lists array sizes, .stats [names] lists array stats, .load file loads, .load-run file loads/runs.\n");
 
-    repl_interp = create_ofort_interpreter();
+    repl_interp = create_repl_interpreter();
     if (!repl_interp) {
         fprintf(stderr, "failed to create Fortran interpreter\n");
         return 2;
@@ -2522,7 +2738,7 @@ static int run_interactive(const char *load_path, int run_after_load) {
             cap = 0;
             executed_len = 0;
             ofort_destroy(repl_interp);
-            repl_interp = create_ofort_interpreter();
+            repl_interp = create_repl_interpreter();
             if (!repl_interp) {
                 fprintf(stderr, "failed to create Fortran interpreter\n");
                 return 2;
@@ -2539,7 +2755,7 @@ static int run_interactive(const char *load_path, int run_after_load) {
                     if (delete_source_lines(&buf, &len, first_line, last_line)) {
                         executed_len = 0;
                         ofort_destroy(repl_interp);
-                        repl_interp = create_ofort_interpreter();
+                        repl_interp = create_repl_interpreter();
                         if (!repl_interp) {
                             fprintf(stderr, "failed to create Fortran interpreter\n");
                             free(buf);
@@ -2566,7 +2782,7 @@ static int run_interactive(const char *load_path, int run_after_load) {
                     if (insert_source_line(&buf, &len, &cap, edit_line, edit_text)) {
                         executed_len = 0;
                         ofort_destroy(repl_interp);
-                        repl_interp = create_ofort_interpreter();
+                        repl_interp = create_repl_interpreter();
                         if (!repl_interp) {
                             fprintf(stderr, "failed to create Fortran interpreter\n");
                             free(buf);
@@ -2593,7 +2809,7 @@ static int run_interactive(const char *load_path, int run_after_load) {
                     if (replace_source_line(&buf, &len, &cap, edit_line, edit_text)) {
                         executed_len = 0;
                         ofort_destroy(repl_interp);
-                        repl_interp = create_ofort_interpreter();
+                        repl_interp = create_repl_interpreter();
                         if (!repl_interp) {
                             fprintf(stderr, "failed to create Fortran interpreter\n");
                             free(buf);
@@ -2623,7 +2839,7 @@ static int run_interactive(const char *load_path, int run_after_load) {
                     } else if (rename_source_identifier(&buf, &len, &cap, rename_args[0], rename_args[1])) {
                         executed_len = 0;
                         ofort_destroy(repl_interp);
-                        repl_interp = create_ofort_interpreter();
+                        repl_interp = create_repl_interpreter();
                         if (!repl_interp) {
                             fprintf(stderr, "failed to create Fortran interpreter\n");
                             free_split_args(rename_args, n_rename_args);
@@ -2802,7 +3018,7 @@ static int run_interactive(const char *load_path, int run_after_load) {
                 trim_line_end(local_path);
                 if (load_interactive_file(local_path, &buf, &len, &cap, &footer)) {
                     ofort_destroy(repl_interp);
-                    repl_interp = create_ofort_interpreter();
+                    repl_interp = create_repl_interpreter();
                     if (!repl_interp) {
                         fprintf(stderr, "failed to create Fortran interpreter\n");
                         free(buf);
@@ -2837,7 +3053,7 @@ static int run_interactive(const char *load_path, int run_after_load) {
                 } else {
                     executed_len = 0;
                     ofort_destroy(repl_interp);
-                    repl_interp = create_ofort_interpreter();
+                    repl_interp = create_repl_interpreter();
                     if (!repl_interp) {
                         fprintf(stderr, "failed to create Fortran interpreter\n");
                         free(buf);
@@ -2919,14 +3135,23 @@ static char *read_file(const char *path) {
     return source;
 }
 
-static char *read_files_concatenated(const char *const *paths, int npaths) {
+static char *read_files_concatenated(const char *const *paths, int npaths, SourceMap *source_map) {
     char *source = NULL;
     size_t len = 0;
     size_t cap = 0;
+    int next_line = 1;
 
     for (int i = 0; i < npaths; i++) {
         char *part = read_file(paths[i]);
+        int line_count;
         if (!part) {
+            free(source);
+            return NULL;
+        }
+        normalize_newlines(part);
+        line_count = source_text_line_count(part);
+        if (!source_map_add(source_map, paths[i], next_line, line_count)) {
+            free(part);
             free(source);
             return NULL;
         }
@@ -2936,6 +3161,7 @@ static char *read_files_concatenated(const char *const *paths, int npaths) {
             return NULL;
         }
         free(part);
+        next_line += line_count;
         if (len > 0 && source[len - 1] != '\n' && !append_text(&source, &len, &cap, "\n")) {
             free(source);
             return NULL;
@@ -3053,28 +3279,82 @@ static char *maybe_wrap_loose_source(char *source) {
 }
 
 static void print_usage(const char *program) {
-    fprintf(stderr, "usage: %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
-    fprintf(stderr, "       %s --each [--check] [options] file-or-glob [file-or-glob ...] [-- args...]\n", program);
+    fprintf(stderr, "usage: %s [--version] [-w] [--quiet] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
+    fprintf(stderr, "       %s --each [--check] [--quiet] [options] file-or-glob [file-or-glob ...] [-- args...]\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load file.f90\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load-run file.f90\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --check file.f90\n", program);
     fprintf(stderr, "       %s --check-gfortran file.f90\n", program);
     fprintf(stderr, "       %s < file.f90\n", program);
+    fprintf(stderr, "       --version prints the ofort version\n");
     fprintf(stderr, "       -w suppresses warnings\n");
+    fprintf(stderr, "       --quiet suppresses success/progress output but not diagnostics\n");
     fprintf(stderr, "       --fast enables safe interpreter fast paths and suppresses warnings\n");
     fprintf(stderr, "       --no-specialize disables specialized pattern/program fast paths\n");
     fprintf(stderr, "       --time prints elapsed time for the requested operation\n");
     fprintf(stderr, "       --time-detail prints setup, lex, parse, register, execute, and total times\n");
     fprintf(stderr, "       --profile-lines prints elapsed execution time by source line\n");
     fprintf(stderr, "       --each treats each file or Windows glob match as a separate program\n");
+    fprintf(stderr, "       @file reads source file names from a manifest, one path per line\n");
     fprintf(stderr, "       --implicit-typing, --legacy-implicit uses I-N integer/rest real implicit typing (default)\n");
     fprintf(stderr, "       --no-implicit-typing rejects undeclared variables unless declared or covered by IMPLICIT\n");
     fprintf(stderr, "       with no file in a console, start an interactive session\n");
 }
 
+static int build_month_number(const char *month) {
+    static const char *months[] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+    };
+
+    for (int i = 0; i < 12; i++) {
+        if (strcmp(month, months[i]) == 0) {
+            return i + 1;
+        }
+    }
+    return 0;
+}
+
+static const char *build_compiler_name(void) {
+#if defined(__clang__)
+    return "clang";
+#elif defined(__GNUC__)
+    return "gcc";
+#elif defined(_MSC_VER)
+    return "msvc";
+#else
+    return "unknown";
+#endif
+}
+
+static void print_version(void) {
+    char month_text[4] = {0};
+    int day = 0;
+    int year = 0;
+    int month = 0;
+    int hour = 0;
+    int minute = 0;
+
+    if (sscanf(__DATE__, "%3s %d %d", month_text, &day, &year) == 3) {
+        month = build_month_number(month_text);
+    }
+    sscanf(__TIME__, "%d:%d", &hour, &minute);
+
+    if (month > 0 && day > 0 && year > 0) {
+        printf("ofort %s (built on %04d-%02d-%02d %02d:%02d by %s %s)\n",
+               OFORT_VERSION, year, month, day, hour, minute,
+               build_compiler_name(), OFORT_BUILD_FLAGS);
+    } else {
+        printf("ofort %s (built on %s %s by %s %s)\n",
+               OFORT_VERSION, __DATE__, __TIME__,
+               build_compiler_name(), OFORT_BUILD_FLAGS);
+    }
+}
+
 int main(int argc, char **argv) {
     char *source;
     PathList source_paths = {0};
+    SourceMap source_map = {0};
     const char *load_path = NULL;
     const char *syntax_check_path = NULL;
     const char *check_path = NULL;
@@ -3084,8 +3364,20 @@ int main(int argc, char **argv) {
     int time_operation = 0;
     int each_mode = 0;
     int each_check = 0;
+    int quiet = 0;
     double setup_start = 0.0;
     int i;
+    if (ISATTY(FILENO(stdout))) {
+        setvbuf(stdout, NULL, _IONBF, 0);
+    }
+    if (ISATTY(FILENO(stderr))) {
+        setvbuf(stderr, NULL, _IONBF, 0);
+    }
+
+    if (argc == 2 && strcmp(argv[1], "--version") == 0) {
+        print_version();
+        return 0;
+    }
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--each") == 0) {
@@ -3101,6 +3393,8 @@ int main(int argc, char **argv) {
             g_implicit_typing = 0;
         } else if (strcmp(argv[i], "-w") == 0) {
             g_warnings_enabled = 0;
+        } else if (strcmp(argv[i], "--quiet") == 0) {
+            quiet = 1;
         } else if (strcmp(argv[i], "--fast") == 0) {
             g_fast_mode = 1;
             g_warnings_enabled = 0;
@@ -3156,12 +3450,17 @@ int main(int argc, char **argv) {
                 path_list_free(&source_paths);
                 return 2;
             }
-            if (each_mode) {
+            if (each_mode && argv[i][0] == '@' && argv[i][1] != '\0') {
+                if (!path_list_add_manifest(&source_paths, argv[i] + 1)) {
+                    path_list_free(&source_paths);
+                    return 2;
+                }
+            } else if (each_mode) {
                 if (!expand_windows_glob(&source_paths, argv[i])) {
                     path_list_free(&source_paths);
                     return 2;
                 }
-            } else if (!path_list_add(&source_paths, argv[i])) {
+            } else if (!add_source_path_arg(&source_paths, argv[i], 0)) {
                 path_list_free(&source_paths);
                 return 2;
             }
@@ -3178,7 +3477,7 @@ int main(int argc, char **argv) {
 
     if (syntax_check_path) {
         double start = monotonic_seconds();
-        int rc = check_ofort_file(syntax_check_path);
+        int rc = check_ofort_file(syntax_check_path, quiet, 0);
         if (time_operation && !g_time_detail) print_elapsed_time(start);
         path_list_free(&source_paths);
         return rc;
@@ -3200,14 +3499,14 @@ int main(int argc, char **argv) {
             return 2;
         }
         rc = run_each_file(source_paths.items, source_paths.count, each_check,
-                           program_argc, program_args, time_operation);
+                           program_argc, program_args, time_operation, quiet);
         path_list_free(&source_paths);
         return rc;
     }
 
     if (source_paths.count > 0) {
         setup_start = monotonic_seconds();
-        source = read_files_concatenated(source_paths.items, source_paths.count);
+        source = read_files_concatenated(source_paths.items, source_paths.count, &source_map);
     } else if (ISATTY(FILENO(stdin))) {
         path_list_free(&source_paths);
         return run_interactive(NULL, 0);
@@ -3216,15 +3515,19 @@ int main(int argc, char **argv) {
         source = read_stream(stdin, "stdin");
     }
     if (!source) {
+        source_map_free(&source_map);
         path_list_free(&source_paths);
         return 2;
     }
     {
         double start = setup_start > 0.0 ? setup_start : monotonic_seconds();
-        int rc = execute_source_text(source, 0, 0, program_argc, program_args, start);
+        int rc = execute_source_text(source, 0, 0, program_argc, program_args, start,
+                                     source_paths.count > 0 ? &source_map : NULL);
         if (time_operation && !g_time_detail) print_elapsed_time(start);
         free(source);
+        source_map_free(&source_map);
         path_list_free(&source_paths);
         return rc;
     }
 }
+
