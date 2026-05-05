@@ -87,9 +87,14 @@ typedef struct {
     char field_type_names[OFORT_MAX_FIELDS][64];
     OfortValType field_types[OFORT_MAX_FIELDS];
     int field_char_lens[OFORT_MAX_FIELDS];
+    OfortNode *field_char_len_exprs[OFORT_MAX_FIELDS];
+    OfortNode *field_kind_exprs[OFORT_MAX_FIELDS];
     int field_dims[OFORT_MAX_FIELDS][7];
+    OfortNode *field_dim_exprs[OFORT_MAX_FIELDS][7];
     int field_n_dims[OFORT_MAX_FIELDS];
     int n_fields;
+    char type_param_names[OFORT_MAX_PARAMS][64];
+    int n_type_params;
     char binding_names[OFORT_MAX_PARAMS][256];
     char binding_proc_names[OFORT_MAX_PARAMS][256];
     int n_bindings;
@@ -4823,6 +4828,21 @@ static OfortNode *parse_type_def(OfortInterpreter *I) {
     OfortNode *n = alloc_node(I, FND_TYPE_DEF);
     copy_cstr(n->name, sizeof(n->name), name->str_val);
     n->line = tt->line;
+    if (check(I, FTOK_LPAREN)) {
+        advance(I);
+        while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+            if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+            if (n->n_type_params >= OFORT_MAX_PARAMS)
+                too_many_params_error(I, "parameterized derived type parameters");
+            copy_cstr(n->type_param_names[n->n_type_params],
+                      sizeof(n->type_param_names[0]),
+                      token_name_text(advance(I)));
+            n->n_type_params++;
+            if (check(I, FTOK_COMMA)) advance(I);
+            else break;
+        }
+        expect(I, FTOK_RPAREN);
+    }
     skip_newlines(I);
 
     /* parse fields and simple type-bound PROCEDURE bindings until END TYPE */
@@ -4910,11 +4930,24 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
     int intent = 0;
     int decl_dims[7] = {0};
     int n_decl_dims = 0;
+    OfortNode *type_param_exprs[OFORT_MAX_PARAMS] = {0};
+    int n_type_param_exprs = 0;
     OfortNode *block;
     int cap = 0;
 
     expect(I, FTOK_LPAREN);
     type_name = expect(I, FTOK_IDENT);
+    if (check(I, FTOK_LPAREN)) {
+        advance(I);
+        while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+            if (n_type_param_exprs >= OFORT_MAX_PARAMS)
+                too_many_params_error(I, "parameterized derived type actual parameters");
+            type_param_exprs[n_type_param_exprs++] = parse_expr(I);
+            if (check(I, FTOK_COMMA)) advance(I);
+            else break;
+        }
+        expect(I, FTOK_RPAREN);
+    }
     expect(I, FTOK_RPAREN);
 
     while (check(I, FTOK_COMMA)) {
@@ -4998,6 +5031,10 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
         decl->is_optional = is_optional;
         decl->intent = intent;
         decl->line = name_tok->line;
+        decl->n_type_param_exprs = n_type_param_exprs;
+        for (int pi = 0; pi < n_type_param_exprs; pi++) {
+            decl->type_param_exprs[pi] = type_param_exprs[pi];
+        }
         memcpy(decl->dims, decl_dims, sizeof(decl_dims));
         decl->n_dims = n_decl_dims;
 
@@ -6109,7 +6146,10 @@ static OfortValue default_value(OfortValType vtype, int char_len) {
 }
 
 static OfortValue make_array(OfortValType elem_type, int *dims, int n_dims);
+static OfortValue make_array_with_char_len(OfortValType elem_type, int *dims, int n_dims, int char_len);
 static OfortValue make_derived_array(OfortInterpreter *I, const char *type_name, int *dims, int n_dims);
+static OfortValue default_derived_value_with_params(OfortInterpreter *I, const char *type_name,
+                                                    OfortNode **param_exprs, int n_param_exprs);
 
 static OfortValue default_derived_value(OfortInterpreter *I, const char *type_name) {
     OfortTypeDef *td = find_type_def(I, type_name);
@@ -6126,21 +6166,73 @@ static OfortValue default_derived_value(OfortInterpreter *I, const char *type_na
         return make_void_val();
     }
     for (int i = 0; i < td->n_fields; i++) {
+        int field_kind = 0;
+        int field_char_len = td->field_char_lens[i];
+        int field_dims[7];
+        OfortValType field_type = td->field_types[i];
+        memcpy(field_dims, td->field_dims[i], sizeof(field_dims));
+        if (td->field_kind_exprs[i]) {
+            OfortValue kv = eval_node(I, td->field_kind_exprs[i]);
+            field_kind = (int)val_to_int(kv);
+            free_value(&kv);
+            if (field_type == FVAL_REAL && field_kind == 8) field_type = FVAL_DOUBLE;
+        }
+        if (td->field_char_len_exprs[i]) {
+            OfortValue cv = eval_node(I, td->field_char_len_exprs[i]);
+            field_char_len = (int)val_to_int(cv);
+            free_value(&cv);
+        }
+        if (field_char_len < 0) field_char_len = 0;
+        if (field_char_len >= OFORT_MAX_STRLEN) field_char_len = OFORT_MAX_STRLEN - 1;
+        for (int d = 0; d < td->field_n_dims[i] && d < 7; d++) {
+            if (td->field_dim_exprs[i][d]) {
+                OfortValue dv = eval_node(I, td->field_dim_exprs[i][d]);
+                field_dims[d] = (int)val_to_int(dv);
+                free_value(&dv);
+            }
+        }
         copy_cstr(v.v.dt.field_names[i], sizeof(v.v.dt.field_names[i]), td->field_names[i]);
         if (td->field_n_dims[i] > 0) {
-            if (td->field_types[i] == FVAL_DERIVED && td->field_type_names[i][0]) {
+            if (field_type == FVAL_DERIVED && td->field_type_names[i][0]) {
                 v.v.dt.fields[i] = make_derived_array(I, td->field_type_names[i],
-                                                       td->field_dims[i], td->field_n_dims[i]);
+                                                       field_dims, td->field_n_dims[i]);
             } else {
-                v.v.dt.fields[i] = make_array(td->field_types[i], td->field_dims[i], td->field_n_dims[i]);
+                v.v.dt.fields[i] = make_array_with_char_len(field_type, field_dims,
+                                                            td->field_n_dims[i], field_char_len);
             }
-        } else if (td->field_types[i] == FVAL_DERIVED && td->field_type_names[i][0]) {
-            v.v.dt.fields[i] = default_derived_value(I, td->field_type_names[i]);
+        } else if (field_type == FVAL_DERIVED && td->field_type_names[i][0]) {
+            v.v.dt.fields[i] = default_derived_value_with_params(I, td->field_type_names[i], NULL, 0);
         } else {
-            v.v.dt.fields[i] = default_value(td->field_types[i], td->field_char_lens[i]);
+            v.v.dt.fields[i] = default_value(field_type, field_char_len);
+            if (field_kind > 0) v.v.dt.fields[i].kind = field_kind;
         }
     }
     return v;
+}
+
+static OfortValue default_derived_value_with_params(OfortInterpreter *I, const char *type_name,
+                                                    OfortNode **param_exprs, int n_param_exprs) {
+    OfortTypeDef *td = find_type_def(I, type_name);
+    OfortValue param_vals[OFORT_MAX_PARAMS];
+    int n_params;
+    OfortValue result;
+    if (!td) return make_void_val();
+    n_params = td->n_type_params < n_param_exprs ? td->n_type_params : n_param_exprs;
+    for (int i = 0; i < n_params; i++) {
+        param_vals[i] = eval_node(I, param_exprs[i]);
+    }
+    if (n_params > 0) {
+        push_scope(I);
+        for (int i = 0; i < n_params; i++) {
+            declare_var(I, td->type_param_names[i], copy_value(param_vals[i]));
+        }
+    }
+    result = default_derived_value(I, type_name);
+    if (n_params > 0) {
+        pop_scope(I);
+        for (int i = 0; i < n_params; i++) free_value(&param_vals[i]);
+    }
+    return result;
 }
 
 typedef struct {
@@ -11749,6 +11841,11 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         copy_cstr(td->name, sizeof(td->name), n->name);
         td->n_fields = 0;
         td->n_bindings = 0;
+        td->n_type_params = n->n_type_params;
+        for (int i = 0; i < n->n_type_params && i < OFORT_MAX_PARAMS; i++) {
+            copy_cstr(td->type_param_names[i], sizeof(td->type_param_names[i]),
+                      n->type_param_names[i]);
+        }
         for (int i = 0; i < n->n_params && i < OFORT_MAX_PARAMS; i++) {
             copy_cstr(td->binding_names[td->n_bindings],
                       sizeof(td->binding_names[td->n_bindings]),
@@ -11766,8 +11863,25 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 for (int j = 0; j < s->n_stmts; j++) {
                     OfortNode *d = s->stmts[j];
                     if ((d->type == FND_VARDECL || d->type == FND_PARAMDECL) && td->n_fields < OFORT_MAX_FIELDS) {
+                        int is_type_param = 0;
+                        for (int tp = 0; tp < td->n_type_params; tp++) {
+                            if (str_eq_nocase(d->name, td->type_param_names[tp])) {
+                                is_type_param = 1;
+                                break;
+                            }
+                        }
+                        if (is_type_param) continue;
                         OfortValType field_type = d->val_type;
-                        if (d->kind_expr && d->kind == 0) {
+                        int kind_is_type_param = 0;
+                        if (d->kind_expr && d->kind_expr->type == FND_IDENT) {
+                            for (int tp = 0; tp < td->n_type_params; tp++) {
+                                if (str_eq_nocase(d->kind_expr->name, td->type_param_names[tp])) {
+                                    kind_is_type_param = 1;
+                                    break;
+                                }
+                            }
+                        }
+                        if (d->kind_expr && d->kind == 0 && !kind_is_type_param) {
                             OfortValue kv = eval_node(I, d->kind_expr);
                             int rk = (int)val_to_int(kv);
                             free_value(&kv);
@@ -11781,14 +11895,36 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                             copy_cstr(td->field_type_names[td->n_fields],
                                       sizeof(td->field_type_names[td->n_fields]), d->str_val);
                         td->field_char_lens[td->n_fields] = d->char_len;
+                        td->field_char_len_exprs[td->n_fields] = d->char_len_expr;
+                        td->field_kind_exprs[td->n_fields] = d->kind_expr;
                         td->field_n_dims[td->n_fields] = d->n_dims;
                         memcpy(td->field_dims[td->n_fields], d->dims, sizeof(td->field_dims[td->n_fields]));
+                        for (int fd = 0; fd < d->n_dims && fd < 7 && fd < d->n_stmts; fd++) {
+                            td->field_dim_exprs[td->n_fields][fd] = d->stmts ? d->stmts[fd] : NULL;
+                        }
                         td->n_fields++;
                     }
                 }
             } else if ((s->type == FND_VARDECL || s->type == FND_PARAMDECL) && td->n_fields < OFORT_MAX_FIELDS) {
+                int is_type_param = 0;
+                for (int tp = 0; tp < td->n_type_params; tp++) {
+                    if (str_eq_nocase(s->name, td->type_param_names[tp])) {
+                        is_type_param = 1;
+                        break;
+                    }
+                }
+                if (is_type_param) continue;
                 OfortValType field_type = s->val_type;
-                if (s->kind_expr && s->kind == 0) {
+                int kind_is_type_param = 0;
+                if (s->kind_expr && s->kind_expr->type == FND_IDENT) {
+                    for (int tp = 0; tp < td->n_type_params; tp++) {
+                        if (str_eq_nocase(s->kind_expr->name, td->type_param_names[tp])) {
+                            kind_is_type_param = 1;
+                            break;
+                        }
+                    }
+                }
+                if (s->kind_expr && s->kind == 0 && !kind_is_type_param) {
                     OfortValue kv = eval_node(I, s->kind_expr);
                     int rk = (int)val_to_int(kv);
                     free_value(&kv);
@@ -11802,8 +11938,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     copy_cstr(td->field_type_names[td->n_fields],
                               sizeof(td->field_type_names[td->n_fields]), s->str_val);
                 td->field_char_lens[td->n_fields] = s->char_len;
+                td->field_char_len_exprs[td->n_fields] = s->char_len_expr;
+                td->field_kind_exprs[td->n_fields] = s->kind_expr;
                 td->field_n_dims[td->n_fields] = s->n_dims;
                 memcpy(td->field_dims[td->n_fields], s->dims, sizeof(td->field_dims[td->n_fields]));
+                for (int fd = 0; fd < s->n_dims && fd < 7 && fd < s->n_stmts; fd++) {
+                    td->field_dim_exprs[td->n_fields][fd] = s->stmts ? s->stmts[fd] : NULL;
+                }
                 td->n_fields++;
             }
         }
@@ -11968,7 +12109,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         } else if (n->n_children > 0 && n->children[0]) {
             val = eval_node(I, n->children[0]);
         } else if (n->val_type == FVAL_DERIVED) {
-            val = default_derived_value(I, n->str_val);
+            val = default_derived_value_with_params(I, n->str_val,
+                                                    n->type_param_exprs,
+                                                    n->n_type_param_exprs);
         } else {
             val = default_value(n->val_type, n->val_type == FVAL_CHARACTER ? decl_char_len : n->char_len);
         }
@@ -12192,6 +12335,37 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
             OfortValue *target = member_lvalue(I, lhs);
             if (target) {
+                if (target->type == FVAL_ARRAY) {
+                    if (rhs.type == FVAL_ARRAY) {
+                        if (rhs.v.arr.len != target->v.arr.len)
+                            ofort_error(I, "Array assignment shape mismatch");
+                        for (int i = 0; i < target->v.arr.len; i++) {
+                            OfortValue elem = array_element_value(&rhs, i);
+                            if (target->v.arr.data && target->v.arr.data[i].kind > 0 && is_numeric_type(elem.type))
+                                elem.kind = target->v.arr.data[i].kind;
+                            if (assign_packed_array_element(target, i, elem)) {
+                                free_value(&elem);
+                            } else {
+                                free_value(&target->v.arr.data[i]);
+                                target->v.arr.data[i] = elem;
+                            }
+                        }
+                    } else {
+                        for (int i = 0; i < target->v.arr.len; i++) {
+                            OfortValue elem = copy_value(rhs);
+                            if (target->v.arr.data && target->v.arr.data[i].kind > 0 && is_numeric_type(elem.type))
+                                elem.kind = target->v.arr.data[i].kind;
+                            if (assign_packed_array_element(target, i, elem)) {
+                                free_value(&elem);
+                            } else {
+                                free_value(&target->v.arr.data[i]);
+                                target->v.arr.data[i] = elem;
+                            }
+                        }
+                    }
+                    free_value(&rhs);
+                    break;
+                }
                 free_value(target);
                 *target = rhs;
                 break;
