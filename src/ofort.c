@@ -516,11 +516,20 @@ static int name_in_list_nocase(const char *name, char names[OFORT_MAX_PARAMS][25
 /* ── Value constructors ─────────────────────── */
 static OfortValue make_integer(long long v) {
     OfortValue r; memset(&r, 0, sizeof(r));
-    r.type = FVAL_INTEGER; r.kind = 4; r.v.i = v; return r;
+    r.type = FVAL_INTEGER; r.kind = 4; r.v.i = v; r.v.i128 = (__int128)v; return r;
 }
 static OfortValue make_integer_kind(long long v, int kind) {
     OfortValue r = make_integer(v);
     r.kind = kind > 0 ? kind : 4;
+    if (r.kind == 16) r.v.i128 = (__int128)v;
+    return r;
+}
+static OfortValue make_integer128(__int128 v) {
+    OfortValue r; memset(&r, 0, sizeof(r));
+    r.type = FVAL_INTEGER;
+    r.kind = 16;
+    r.v.i128 = v;
+    r.v.i = (long long)v;
     return r;
 }
 static OfortValue make_real(double v) {
@@ -1183,6 +1192,54 @@ static OfortGeneric *find_generic(OfortInterpreter *I, const char *name) {
     return NULL;
 }
 
+static __int128 parse_int128_text(const char *text) {
+    __int128 value = 0;
+    int neg = 0;
+    if (!text) return 0;
+    while (isspace((unsigned char)*text)) text++;
+    if (*text == '-') {
+        neg = 1;
+        text++;
+    } else if (*text == '+') {
+        text++;
+    }
+    while (isdigit((unsigned char)*text)) {
+        value = value * 10 + (*text - '0');
+        text++;
+    }
+    return neg ? -value : value;
+}
+
+static void int128_to_string(__int128 value, char *buf, size_t buf_size) {
+    char tmp[64];
+    int pos = 0;
+    int neg = 0;
+    unsigned __int128 mag;
+    if (buf_size == 0) return;
+    if (value < 0) {
+        neg = 1;
+        mag = (unsigned __int128)(-(value + 1)) + 1;
+    } else {
+        mag = (unsigned __int128)value;
+    }
+    do {
+        tmp[pos++] = (char)('0' + (mag % 10));
+        mag /= 10;
+    } while (mag && pos < (int)sizeof(tmp) - 1);
+    if (neg && pos < (int)sizeof(tmp) - 1) tmp[pos++] = '-';
+    if ((size_t)pos >= buf_size) pos = (int)buf_size - 1;
+    for (int i = 0; i < pos; i++) buf[i] = tmp[pos - 1 - i];
+    buf[pos] = '\0';
+}
+
+static __int128 value_to_int128(OfortValue v) {
+    if (v.type == FVAL_INTEGER) {
+        if (v.kind == 16) return v.v.i128;
+        return (__int128)v.v.i;
+    }
+    return (__int128)val_to_int(v);
+}
+
 static OfortModule *find_module(OfortInterpreter *I, const char *name) {
     char upper[256];
     if (!name || !name[0]) return NULL;
@@ -1681,6 +1738,7 @@ static void tokenize(OfortInterpreter *I, const char *src) {
                 t->kind = literal_kind ? literal_kind : (is_double_lit ? 8 : 4);
             } else {
                 t->type = FTOK_INT_LIT;
+                if (!t->str_val[0]) copy_cstr(t->str_val, sizeof(t->str_val), numbuf);
                 t->int_val = strtoll(numbuf, NULL, 10);
                 t->num_val = (double)t->int_val;
                 t->kind = literal_kind ? literal_kind : 4;
@@ -2590,6 +2648,7 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
         n->int_val = t->int_val;
         n->num_val = t->num_val;
         n->kind = t->kind;
+        copy_cstr(n->str_val, sizeof(n->str_val), t->str_val);
         n->line = t->line;
         return n;
     }
@@ -6911,7 +6970,9 @@ static void append_to_buffer(char *buf, int bufsize, const char *text) {
 static void value_to_string(OfortInterpreter *I, OfortValue v, char *buf, int bufsize) {
     switch (v.type) {
         case FVAL_INTEGER:
-            snprintf(buf, bufsize, "%lld", v.v.i);
+            if (v.kind == 16) int128_to_string(v.v.i128, buf, (size_t)bufsize);
+            else if (v.int_repr[0]) snprintf(buf, bufsize, "%s", v.int_repr);
+            else snprintf(buf, bufsize, "%lld", v.v.i);
             break;
         case FVAL_REAL:
             snprintf(buf, bufsize, "%.7g", v.v.r);
@@ -7694,7 +7755,23 @@ static void format_descriptors(OfortInterpreter *I, const char *p, const char *e
             for (int r = 0; r < repeat && *vidx < nvals; r++, (*vidx)++) {
                 char buf[64];
                 long long iv = val_to_int(vals[*vidx]);
-                if (min_digits > 0) {
+                if (vals[*vidx].type == FVAL_INTEGER && (vals[*vidx].kind == 16 || vals[*vidx].int_repr[0])) {
+                    char exact[64];
+                    int len;
+                    int pad_count;
+                    int out_pos = 0;
+                    if (vals[*vidx].kind == 16) int128_to_string(vals[*vidx].v.i128, exact, sizeof(exact));
+                    else copy_cstr(exact, sizeof(exact), vals[*vidx].int_repr);
+                    len = (int)strlen(exact);
+                    if (width < 0) width = 0;
+                    if (width > 60) width = 60;
+                    pad_count = width > len ? width - len : 0;
+                    for (int k = 0; k < pad_count && out_pos < (int)sizeof(buf) - 1; k++) buf[out_pos++] = ' ';
+                    for (int k = 0; exact[k] && out_pos < (int)sizeof(buf) - 1; k++) {
+                        buf[out_pos++] = exact[k];
+                    }
+                    buf[out_pos] = '\0';
+                } else if (min_digits > 0) {
                     char raw[64];
                     char padded[64];
                     int raw_len, zero_count, digit_len, pad_count, out_pos = 0;
@@ -8145,6 +8222,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
 
     switch (n->type) {
     case FND_INT_LIT:
+        if (n->kind == 16 && n->str_val[0]) return make_integer128(parse_int128_text(n->str_val));
         return make_integer_kind(n->int_val, n->kind);
 
     case FND_REAL_LIT:
@@ -8196,7 +8274,15 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
     case FND_NEGATE: {
         OfortValue v = eval_node(I, n->children[0]);
         switch (v.type) {
-            case FVAL_INTEGER: v.v.i = -v.v.i; break;
+            case FVAL_INTEGER:
+                if (v.kind == 16) {
+                    v.v.i128 = -v.v.i128;
+                    v.v.i = (long long)v.v.i128;
+                    v.int_repr[0] = '\0';
+                } else {
+                    v.v.i = -v.v.i;
+                }
+                break;
             case FVAL_REAL: case FVAL_DOUBLE: v.v.r = -v.v.r; break;
             case FVAL_COMPLEX: v.v.cx.re = -v.v.cx.re; v.v.cx.im = -v.v.cx.im; break;
             default: ofort_error(I, "Cannot negate this type");
@@ -8444,6 +8530,22 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
 
         /* Integer arithmetic */
         {
+            int result_kind = (left.kind == 16 || right.kind == 16) ? 16 :
+                              (left.kind == 8 || right.kind == 8) ? 8 : 4;
+            if (result_kind == 16) {
+                __int128 a = value_to_int128(left), b = value_to_int128(right), res;
+                switch (n->type) {
+                    case FND_ADD: res = a + b; break;
+                    case FND_SUB: res = a - b; break;
+                    case FND_MUL: res = a * b; break;
+                    case FND_DIV:
+                        if (b == 0) ofort_error(I, "Division by zero");
+                        res = a / b; break;
+                    default: res = 0; break;
+                }
+                free_value(&left); free_value(&right);
+                return make_integer128(res);
+            }
             long long a = val_to_int(left), b = val_to_int(right);
             long long res;
             switch (n->type) {
@@ -8456,7 +8558,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 default: res = 0; break;
             }
             free_value(&left); free_value(&right);
-            return make_integer(res);
+            return make_integer_kind(res, result_kind);
         }
     }
 
@@ -8522,6 +8624,18 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                         case FND_GE: elem_result = (cmp >= 0); break;
                         default: break;
                     }
+                } else if (lv->type == FVAL_INTEGER && rv->type == FVAL_INTEGER &&
+                           (lv->kind == 16 || rv->kind == 16)) {
+                    __int128 a = value_to_int128(*lv), b = value_to_int128(*rv);
+                    switch (n->type) {
+                        case FND_EQ: elem_result = (a == b); break;
+                        case FND_NEQ: elem_result = (a != b); break;
+                        case FND_LT: elem_result = (a < b); break;
+                        case FND_GT: elem_result = (a > b); break;
+                        case FND_LE: elem_result = (a <= b); break;
+                        case FND_GE: elem_result = (a >= b); break;
+                        default: break;
+                    }
                 } else {
                     double a = val_to_real(*lv), b = val_to_real(*rv);
                     switch (n->type) {
@@ -8553,6 +8667,18 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 case FND_GT: result = (cmp > 0); break;
                 case FND_LE: result = (cmp <= 0); break;
                 case FND_GE: result = (cmp >= 0); break;
+                default: break;
+            }
+        } else if (left.type == FVAL_INTEGER && right.type == FVAL_INTEGER &&
+                   (left.kind == 16 || right.kind == 16)) {
+            __int128 a = value_to_int128(left), b = value_to_int128(right);
+            switch (n->type) {
+                case FND_EQ: result = (a == b); break;
+                case FND_NEQ: result = (a != b); break;
+                case FND_LT: result = (a < b); break;
+                case FND_GT: result = (a > b); break;
+                case FND_LE: result = (a <= b); break;
+                case FND_GE: result = (a >= b); break;
                 default: break;
             }
         } else {
@@ -10711,6 +10837,7 @@ static int values_equal_deep(OfortInterpreter *I, const OfortValue *a, const Ofo
     if (a->type != b->type) return 0;
     switch (a->type) {
         case FVAL_INTEGER:
+            if (a->kind == 16 || b->kind == 16) return value_to_int128(*a) == value_to_int128(*b);
             return a->v.i == b->v.i;
         case FVAL_REAL:
         case FVAL_DOUBLE:
@@ -13983,6 +14110,9 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             if (kind == 1) return make_integer_kind(127, 1);
             if (kind == 2) return make_integer_kind(32767, 2);
             if (kind == 8) return make_integer_kind(LLONG_MAX, 8);
+            if (kind == 16) {
+                return make_integer128(parse_int128_text("170141183460469231731687303715884105727"));
+            }
             return make_integer_kind(2147483647LL, 4);
         }
         if (args[0].type == FVAL_DOUBLE || args[0].kind == 8) return make_double(DBL_MAX);
