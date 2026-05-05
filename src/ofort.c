@@ -13524,6 +13524,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             fn = func ? func->node : NULL;
         }
         if (!func) {
+            OfortVar *proc_var = find_var(I, n->name);
+            const char *proc_name = proc_var ? procedure_ref_name(&proc_var->val) : NULL;
+            if (proc_name) {
+                func = find_func(I, proc_name);
+                fn = func ? func->node : NULL;
+            }
+        }
+        if (!func) {
             ofort_error(I, "Unknown subroutine '%s' at line %d", n->name, n->line);
         }
         if (func->is_function) {
@@ -13536,6 +13544,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             break;
         }
         push_scope(I);
+        {
+            OfortModule *mod = find_module(I, func->module_name);
+            if (mod) {
+                for (int mi = 0; mi < mod->n_vars; mi++) {
+                    declare_var(I, mod->vars[mi].name, copy_value(mod->vars[mi].val));
+                }
+            }
+        }
         /* Bind parameters */
         for (int i = 0; i < fn->n_params; i++) {
             OfortVar *pv;
