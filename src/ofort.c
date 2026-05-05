@@ -7215,6 +7215,52 @@ static int read_next_string_token(const char **p, char *buf, int bufsize) {
     return 1;
 }
 
+static int read_formatted_string_field(const char **fmtp, const char **textp,
+                                       char *buf, int bufsize) {
+    const char *f = *fmtp;
+    int repeat = 0;
+    int width = 0;
+    char desc;
+    int i;
+
+    while (*f == '(' || *f == ')' || *f == ',' || isspace((unsigned char)*f)) f++;
+    if (!*f) return 0;
+
+    while (isdigit((unsigned char)*f)) {
+        repeat = repeat * 10 + (*f - '0');
+        f++;
+    }
+    if (repeat <= 0) repeat = 1;
+
+    desc = (char)toupper((unsigned char)*f);
+    if (!desc) return 0;
+    f++;
+
+    if (desc == 'X') {
+        *textp += repeat;
+        *fmtp = f;
+        return read_formatted_string_field(fmtp, textp, buf, bufsize);
+    }
+
+    while (isdigit((unsigned char)*f)) {
+        width = width * 10 + (*f - '0');
+        f++;
+    }
+    if (*f == '.') {
+        f++;
+        while (isdigit((unsigned char)*f)) f++;
+    }
+    if (width <= 0) return 0;
+
+    for (i = 0; i < width && (*textp)[i] && i < bufsize - 1; i++) {
+        buf[i] = (*textp)[i];
+    }
+    buf[i] = '\0';
+    *textp += width;
+    *fmtp = f;
+    return 1;
+}
+
 static void assign_token_to_value(OfortValue *dest, const char *token) {
     if (dest->type == FVAL_INTEGER) {
         dest->v.i = strtoll(token, NULL, 10);
@@ -7556,19 +7602,31 @@ static void read_values_from_string(OfortInterpreter *I, const char *text, Ofort
         return;
     }
 
+    if (n->format_str[0]) {
+        const char *fmtp = n->format_str;
+        const char *textp = p;
+        for (int i = 0; i < n->n_stmts; i++) {
+            if (read_formatted_string_field(&fmtp, &textp, tok, sizeof(tok))) {
+                assign_token_to_read_target(I, n->stmts[i], tok);
+            }
+        }
+        return;
+    }
+
     for (int i = 0; i < n->n_stmts; i++) {
-        if (n->stmts[i]->type != FND_IDENT) continue;
-        OfortVar *v = find_var(I, n->stmts[i]->name);
-        if (!v) ofort_error(I, "Undefined variable '%s'", n->stmts[i]->name);
-        if (v->val.type == FVAL_ARRAY) {
-            for (int j = 0; j < v->val.v.arr.len; j++) {
-                if (!read_next_string_token(&p, tok, sizeof(tok))) break;
-                assign_token_to_value(&v->val.v.arr.data[j], tok);
+        if (n->stmts[i]->type == FND_IDENT) {
+            OfortVar *v = find_var(I, n->stmts[i]->name);
+            if (!v) ofort_error(I, "Undefined variable '%s'", n->stmts[i]->name);
+            if (v->val.type == FVAL_ARRAY) {
+                for (int j = 0; j < v->val.v.arr.len; j++) {
+                    if (!read_next_string_token(&p, tok, sizeof(tok))) break;
+                    assign_token_to_value(&v->val.v.arr.data[j], tok);
+                }
+                continue;
             }
-        } else {
-            if (read_next_string_token(&p, tok, sizeof(tok))) {
-                assign_token_to_value(&v->val, tok);
-            }
+        }
+        if (read_next_string_token(&p, tok, sizeof(tok))) {
+            assign_token_to_read_target(I, n->stmts[i], tok);
         }
     }
 }
