@@ -520,8 +520,18 @@ static int name_in_list_nocase(const char *name, char names[OFORT_MAX_PARAMS][25
 
 /* ── Value constructors ─────────────────────── */
 static int make_procedure_ref_text(const char *name, char *buf, size_t buf_size) {
+    const char *prefix = "__ofort_proc:";
+    size_t prefix_len = strlen(prefix);
+    size_t name_len;
     if (!name || !name[0] || buf_size == 0) return 0;
-    snprintf(buf, buf_size, "__ofort_proc:%s", name);
+    if (buf_size <= prefix_len + 1) return 0;
+    name_len = strlen(name);
+    if (prefix_len + name_len >= buf_size) {
+        name_len = buf_size - prefix_len - 1;
+    }
+    memcpy(buf, prefix, prefix_len);
+    memcpy(buf + prefix_len, name, name_len);
+    buf[prefix_len + name_len] = '\0';
     return 1;
 }
 
@@ -2312,10 +2322,18 @@ static OfortNode *parse_procedure_declaration(OfortInterpreter *I) {
         if (token_can_be_name(peek(I))) {
             OfortToken *name_tok = advance(I);
             OfortNode *decl = alloc_node(I, FND_VARDECL);
+            char proc_ref[OFORT_MAX_STRLEN];
             copy_cstr(decl->name, sizeof(decl->name), token_name_text(name_tok));
             decl->val_type = FVAL_CHARACTER;
             decl->char_len = 256;
             decl->line = name_tok->line;
+            if (make_procedure_ref_text(token_name_text(name_tok), proc_ref, sizeof(proc_ref))) {
+                OfortNode *init = alloc_node(I, FND_STRING_LIT);
+                copy_cstr(init->str_val, sizeof(init->str_val), proc_ref);
+                init->line = name_tok->line;
+                decl->children[0] = init;
+                decl->n_children = 1;
+            }
             if (block->n_stmts >= cap) {
                 cap = cap ? cap * 2 : 4;
                 block->stmts = (OfortNode **)realloc(block->stmts, sizeof(OfortNode *) * cap);
@@ -3244,17 +3262,23 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
                     /* range: skip lo:hi */
                     if (check(I, FTOK_COLON)) {
                         advance(I);
-                        if (dim_expr->type == FND_INT_LIT) {
-                            decl_lower_bounds[dim_index] = (int)dim_expr->int_val;
+                        int lower_value = 0;
+                        if (int_constant_node(dim_expr, &lower_value)) {
+                            decl_lower_bounds[dim_index] = lower_value;
                             decl_has_lower_bound[dim_index] = 1;
                         }
-                        OfortNode *hi = parse_expr(I);
-                        if (hi->type == FND_INT_LIT) {
-                            decl_dims[dim_index] = (int)hi->int_val;
-                            decl_dim_exprs[dim_index] = NULL;
-                        } else {
+                        if (check(I, FTOK_RPAREN) || check(I, FTOK_COMMA)) {
                             decl_dims[dim_index] = 0;
-                            decl_dim_exprs[dim_index] = hi;
+                        } else {
+                            OfortNode *hi = parse_expr(I);
+                            int hi_value = 0;
+                            if (int_constant_node(hi, &hi_value)) {
+                                decl_dims[dim_index] = hi_value;
+                                decl_dim_exprs[dim_index] = NULL;
+                            } else {
+                                decl_dims[dim_index] = 0;
+                                decl_dim_exprs[dim_index] = hi;
+                            }
                         }
                     }
                 }
@@ -3531,6 +3555,97 @@ static OfortNode *parse_if(OfortInterpreter *I) {
 
 static OfortNode *parse_do(OfortInterpreter *I) {
     OfortToken *dot = advance(I); /* consume DO */
+
+    /* DO CONCURRENT, executed serially by ofort */
+    if (token_ident_upper(peek(I), "CONCURRENT")) {
+        OfortNode *n = alloc_node(I, FND_DO_CONCURRENT);
+        n->line = dot->line;
+        advance(I); /* CONCURRENT */
+        expect(I, FTOK_LPAREN);
+        while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+            OfortToken *name;
+            if (!(check(I, FTOK_IDENT) && peek_ahead(I, 1)->type == FTOK_ASSIGN)) {
+                if (n->n_children >= OFORT_MAX_CHILDREN)
+                    ofort_error(I, "DO CONCURRENT mask expression is too complex");
+                n->children[n->n_children++] = parse_expr(I);
+                n->bool_val = 1;
+                break;
+            }
+            if (n->n_params >= OFORT_MAX_PARAMS || n->n_children + 3 >= OFORT_MAX_CHILDREN)
+                ofort_error(I, "DO CONCURRENT has too many control variables");
+            name = expect(I, FTOK_IDENT);
+            copy_cstr(n->param_names[n->n_params++], sizeof(n->param_names[0]), name->str_val);
+            expect(I, FTOK_ASSIGN);
+            n->children[n->n_children++] = parse_expr(I);
+            expect(I, FTOK_COLON);
+            n->children[n->n_children++] = parse_expr(I);
+            if (check(I, FTOK_COLON)) {
+                advance(I);
+                n->children[n->n_children++] = parse_expr(I);
+            } else {
+                OfortNode *one = alloc_node(I, FND_INT_LIT);
+                one->int_val = 1;
+                one->num_val = 1.0;
+                one->line = name->line;
+                n->children[n->n_children++] = one;
+            }
+            if (check(I, FTOK_COMMA)) {
+                advance(I);
+                if (!(check(I, FTOK_IDENT) && peek_ahead(I, 1)->type == FTOK_ASSIGN)) {
+                    if (n->n_children >= OFORT_MAX_CHILDREN)
+                        ofort_error(I, "DO CONCURRENT mask expression is too complex");
+                    n->children[n->n_children++] = parse_expr(I);
+                    n->bool_val = 1;
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        expect(I, FTOK_RPAREN);
+
+        while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_SEMICOLON) && !check(I, FTOK_EOF)) {
+            if (check(I, FTOK_COMMA)) {
+                advance(I);
+            } else if (check(I, FTOK_IDENT) && token_ident_upper(peek(I), "LOCAL")) {
+                advance(I);
+                if (check(I, FTOK_LPAREN)) {
+                    advance(I);
+                    while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+                        if (token_can_be_name(peek(I))) {
+                            if (n->int_val >= OFORT_MAX_PARAMS)
+                                too_many_params_error(I, "DO CONCURRENT locality variables");
+                            copy_cstr(n->binding_proc_names[n->int_val],
+                                      sizeof(n->binding_proc_names[0]),
+                                      token_name_text(advance(I)));
+                            n->int_val++;
+                        } else {
+                            advance(I);
+                        }
+                        if (check(I, FTOK_COMMA)) advance(I);
+                        else break;
+                    }
+                    expect(I, FTOK_RPAREN);
+                }
+            } else if (check(I, FTOK_IDENT)) {
+                advance(I);
+                if (check(I, FTOK_LPAREN)) skip_balanced_parens(I);
+            } else {
+                advance(I);
+            }
+        }
+        skip_newlines(I);
+
+        OfortNode *body = parse_block_until_end(I, "DO");
+        n->n_stmts = body->n_stmts;
+        if (n->n_stmts > 0) {
+            n->stmts = (OfortNode **)calloc((size_t)n->n_stmts, sizeof(OfortNode *));
+            if (!n->stmts) ofort_error(I, "Out of memory");
+            for (int i = 0; i < n->n_stmts; i++) n->stmts[i] = body->stmts[i];
+        }
+        consume_end(I, "DO");
+        return n;
+    }
 
     /* DO WHILE */
     if (check(I, FTOK_WHILE)) {
@@ -4579,7 +4694,9 @@ static OfortNode *parse_typed_function(OfortInterpreter *I) {
 
     if (check(I, FTOK_LPAREN)) {
         int depth = 0;
-        if (type_tok->type == FTOK_TYPE && peek_ahead(I, 1)->type == FTOK_IDENT) {
+        if (type_tok->type == FTOK_TYPE && is_type_keyword(peek_ahead(I, 1)->type)) {
+            result_type = token_to_valtype(peek_ahead(I, 1)->type);
+        } else if (type_tok->type == FTOK_TYPE && peek_ahead(I, 1)->type == FTOK_IDENT) {
             copy_cstr(derived_type_name, sizeof(derived_type_name), peek_ahead(I, 1)->str_val);
             result_type = FVAL_DERIVED;
         }
@@ -5039,9 +5156,6 @@ static OfortNode *parse_allocate(OfortInterpreter *I) {
                         } else if (check(I, FTOK_COLON)) {
                             advance(I);
                             char_len = 0;
-                        } else if (check(I, FTOK_INT_LIT)) {
-                            OfortToken *len_tok = advance(I);
-                            char_len = (int)len_tok->int_val;
                         } else if (!check(I, FTOK_RPAREN)) {
                             OfortNode *len_expr_node = parse_expr(I);
                             len_expr = len_expr_node;
@@ -5049,9 +5163,6 @@ static OfortNode *parse_allocate(OfortInterpreter *I) {
                                 char_len = (int)len_expr_node->int_val;
                         }
                         expect(I, FTOK_RPAREN);
-                    } else if (check(I, FTOK_INT_LIT)) {
-                        OfortToken *len_tok = advance(I);
-                        char_len = (int)len_tok->int_val;
                     } else if (check(I, FTOK_COLON)) {
                         advance(I);
                         char_len = 0;
@@ -5072,9 +5183,6 @@ static OfortNode *parse_allocate(OfortInterpreter *I) {
                         } else if (check(I, FTOK_COLON)) {
                             advance(I);
                             char_len = 0;
-                        } else if (check(I, FTOK_INT_LIT)) {
-                            OfortToken *len_tok = advance(I);
-                            char_len = (int)len_tok->int_val;
                         } else if (!check(I, FTOK_RPAREN)) {
                             OfortNode *len_expr_node = parse_expr(I);
                             len_expr = len_expr_node;
@@ -5087,9 +5195,6 @@ static OfortNode *parse_allocate(OfortInterpreter *I) {
                     } else if (check(I, FTOK_COLON)) {
                         advance(I);
                         char_len = 0;
-                    } else if (check(I, FTOK_INT_LIT)) {
-                        OfortToken *len_tok = advance(I);
-                        char_len = (int)len_tok->int_val;
                     } else if (!check(I, FTOK_RPAREN)) {
                         OfortNode *len_expr_node = parse_expr(I);
                         len_expr = len_expr_node;
@@ -11379,6 +11484,48 @@ static void exec_forall_level(OfortInterpreter *I, OfortNode *n, int level,
     }
 }
 
+static void exec_do_concurrent_level(OfortInterpreter *I, OfortNode *n, int level) {
+    int child = level * 3;
+    OfortValue lv;
+    OfortValue uv;
+    OfortValue sv;
+    int lo, hi, step;
+
+    if (level >= n->n_params) {
+        if (n->bool_val) {
+            int mask_child = n->n_params * 3;
+            OfortValue mv = eval_node(I, n->children[mask_child]);
+            int take = val_to_logical(mv);
+            free_value(&mv);
+            if (!take) return;
+        }
+        for (int i = 0; i < n->n_stmts; i++) {
+            exec_node(I, n->stmts[i]);
+            if (I->returning || I->exiting || I->cycling || I->stopping || I->goto_active) break;
+        }
+        return;
+    }
+
+    lv = eval_node(I, n->children[child]);
+    uv = eval_node(I, n->children[child + 1]);
+    sv = eval_node(I, n->children[child + 2]);
+    lo = (int)val_to_int(lv);
+    hi = (int)val_to_int(uv);
+    step = (int)val_to_int(sv);
+    free_value(&lv);
+    free_value(&uv);
+    free_value(&sv);
+    if (step == 0) ofort_error(I, "DO CONCURRENT stride cannot be zero");
+
+    for (int i = lo; step > 0 ? i <= hi : i >= hi; i += step) {
+        set_var(I, n->param_names[level], make_integer(i));
+        exec_do_concurrent_level(I, n, level + 1);
+        if (I->returning || I->stopping || I->goto_active) break;
+        if (I->exiting) { I->exiting = 0; break; }
+        if (I->cycling) { I->cycling = 0; }
+    }
+}
+
 static int associate_selector_is_assignable(OfortInterpreter *I, OfortNode *selector) {
     if (!selector) return 0;
     if (selector->type == FND_IDENT || selector->type == FND_MEMBER ||
@@ -12168,6 +12315,34 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 set_var(I, n->name, make_integer(iter));
             }
         }
+        break;
+    }
+
+    case FND_DO_CONCURRENT: {
+        int n_local = (int)n->int_val;
+        OfortVar **local_vars = NULL;
+        OfortVar *saved_vars = NULL;
+        if (n_local > 0) {
+            local_vars = (OfortVar **)calloc((size_t)n_local, sizeof(*local_vars));
+            saved_vars = (OfortVar *)calloc((size_t)n_local, sizeof(*saved_vars));
+            if (!local_vars || !saved_vars) ofort_error(I, "Out of memory");
+            for (int i = 0; i < n_local; i++) {
+                local_vars[i] = find_var(I, n->binding_proc_names[i]);
+                if (local_vars[i]) {
+                    saved_vars[i] = *local_vars[i];
+                    saved_vars[i].val = copy_value(local_vars[i]->val);
+                }
+            }
+        }
+        exec_do_concurrent_level(I, n, 0);
+        for (int i = 0; i < n_local; i++) {
+            if (local_vars[i]) {
+                free_value(&local_vars[i]->val);
+                *local_vars[i] = saved_vars[i];
+            }
+        }
+        free(local_vars);
+        free(saved_vars);
         break;
     }
 
