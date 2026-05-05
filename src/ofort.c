@@ -210,6 +210,9 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n);
 static const char *type_token_intrinsic_name(OfortTokenType t);
 static void exec_node(OfortInterpreter *I, OfortNode *n);
 static void format_output(OfortInterpreter *I, const char *fmt, OfortValue *vals, int nvals);
+static void render_write_to_string(OfortInterpreter *I, const char *fmt,
+                                   OfortValue *vals, int nvals,
+                                   char *buf, int bufsize);
 static void read_values_from_string(OfortInterpreter *I, const char *text, OfortNode *n);
 static int read_direct_record_as_string(OfortInterpreter *I, OfortUnitFile *entry, int rec, char *buf, int bufsize);
 static int read_direct_from_file(OfortInterpreter *I, OfortUnitFile *entry, OfortNode *n, int rec);
@@ -4140,6 +4143,17 @@ static OfortNode *parse_write(OfortInterpreter *I) {
                     n->children[1] = parse_expr(I);
                     if (n->n_children < 2) n->n_children = 2;
                 }
+            } else if (str_eq_nocase(name, "advance")) {
+                if (check(I, FTOK_STRING_LIT)) {
+                    if (str_eq_nocase(peek(I)->str_val, "no")) n->no_advance = 1;
+                    advance(I);
+                } else {
+                    OfortNode *adv_expr = parse_expr(I);
+                    if (adv_expr && adv_expr->type == FND_STRING_LIT &&
+                        str_eq_nocase(adv_expr->str_val, "no")) {
+                        n->no_advance = 1;
+                    }
+                }
             } else {
                 /* Other WRITE controls are currently ignored. */
                 if (check(I, FTOK_STAR) || check(I, FTOK_INT_LIT) ||
@@ -7264,16 +7278,29 @@ static int inquire_iolength_value(OfortValue v) {
     return 0;
 }
 
-static void write_values_to_file(OfortInterpreter *I, const char *path, OfortValue *vals, int nvals) {
-    FILE *fp = fopen(path, "a");
-    if (!fp) ofort_error(I, "Cannot open '%s' for writing", path);
-    for (int i = 0; i < nvals; i++) {
-        char buf[4096];
-        if (i > 0) fputc(' ', fp);
-        value_to_string(I, vals[i], buf, sizeof(buf));
-        fputs(buf, fp);
+static void format_output_with_advance(OfortInterpreter *I, const char *fmt,
+                                       OfortValue *vals, int nvals,
+                                       int no_advance) {
+    format_output(I, fmt, vals, nvals);
+    if (no_advance) {
+        while (I->out_len > 0 &&
+               (I->output[I->out_len - 1] == '\n' || I->output[I->out_len - 1] == '\r')) {
+            I->output[--I->out_len] = '\0';
+        }
     }
-    fputc('\n', fp);
+}
+
+static void write_formatted_to_file(OfortInterpreter *I, const char *path,
+                                    const char *fmt, OfortValue *vals, int nvals,
+                                    int no_advance) {
+    char text_buf[OFORT_MAX_OUTPUT];
+    FILE *fp;
+
+    render_write_to_string(I, fmt, vals, nvals, text_buf, sizeof(text_buf));
+    fp = fopen(path, "a");
+    if (!fp) ofort_error(I, "Cannot open '%s' for writing", path);
+    fputs(text_buf, fp);
+    if (!no_advance) fputc('\n', fp);
     fclose(fp);
 }
 
@@ -12034,7 +12061,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 OfortUnitFile *entry = find_unit_file(I, unit);
                 free_value(&uv);
                 if (!entry && unit == 6) {
-                    format_output(I, fmt, vals, nvals);
+                    format_output_with_advance(I, fmt, vals, nvals, n->no_advance);
                     wrote_stdout = 1;
                 } else {
                     if (!entry) entry = ensure_unit_file(I, unit, 1);
@@ -12055,7 +12082,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         write_values_to_stream_file(I, entry->path, vals, nvals);
                         status = 0;
                     } else {
-                        write_values_to_file(I, entry->path, vals, nvals);
+                        write_formatted_to_file(I, entry->path, fmt, vals, nvals, n->no_advance);
                         status = 0;
                     }
                 }
@@ -12066,7 +12093,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             OfortUnitFile *entry = find_unit_file(I, unit);
             free_value(&uv);
             if (!entry && unit == 6) {
-                format_output(I, fmt, vals, nvals);
+                format_output_with_advance(I, fmt, vals, nvals, n->no_advance);
                 wrote_stdout = 1;
                 status = 0;
             } else {
@@ -12088,12 +12115,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     write_values_to_stream_file(I, entry->path, vals, nvals);
                     status = 0;
                 } else {
-                    write_values_to_file(I, entry->path, vals, nvals);
+                    write_formatted_to_file(I, entry->path, fmt, vals, nvals, n->no_advance);
                     status = 0;
                 }
             }
         } else {
-            format_output(I, fmt, vals, nvals);
+            format_output_with_advance(I, fmt, vals, nvals, n->no_advance);
             wrote_stdout = 1;
             status = 0;
         }
