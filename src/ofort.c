@@ -4215,6 +4215,13 @@ static OfortNode *parse_forall_stmt(OfortInterpreter *I) {
     expect(I, FTOK_LPAREN);
     while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
         OfortToken *name;
+        if (!(check(I, FTOK_IDENT) && peek_ahead(I, 1)->type == FTOK_ASSIGN)) {
+            if (n->n_children >= OFORT_MAX_CHILDREN)
+                ofort_error(I, "FORALL mask expression is too complex");
+            n->children[n->n_children++] = parse_expr(I);
+            n->bool_val = 1;
+            break;
+        }
         if (n->n_params >= OFORT_MAX_PARAMS || n->n_children + 3 >= OFORT_MAX_CHILDREN)
             ofort_error(I, "FORALL has too many control variables");
         name = expect(I, FTOK_IDENT);
@@ -4233,7 +4240,16 @@ static OfortNode *parse_forall_stmt(OfortInterpreter *I) {
             one->line = name->line;
             n->children[n->n_children++] = one;
         }
-        if (check(I, FTOK_COMMA)) advance(I);
+        if (check(I, FTOK_COMMA)) {
+            advance(I);
+            if (!(check(I, FTOK_IDENT) && peek_ahead(I, 1)->type == FTOK_ASSIGN)) {
+                if (n->n_children >= OFORT_MAX_CHILDREN)
+                    ofort_error(I, "FORALL mask expression is too complex");
+                n->children[n->n_children++] = parse_expr(I);
+                n->bool_val = 1;
+                break;
+            }
+        }
         else break;
     }
     expect(I, FTOK_RPAREN);
@@ -11043,6 +11059,13 @@ static void exec_forall_level(OfortInterpreter *I, OfortNode *n, int level,
     OfortValue sv;
     int lo, hi, step;
     if (level >= n->n_params) {
+        if (n->bool_val) {
+            int mask_child = n->n_params * 3;
+            OfortValue mv = eval_node(I, n->children[mask_child]);
+            int take = val_to_logical(mv);
+            free_value(&mv);
+            if (!take) return;
+        }
         for (int i = 0; i < n->n_stmts; i++) {
             exec_node(I, n->stmts[i]);
             if (I->returning || I->exiting || I->cycling || I->stopping || I->goto_active) break;
