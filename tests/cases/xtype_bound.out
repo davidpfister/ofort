@@ -1,0 +1,9 @@
+initial point:
+x = 3
+y = 4
+norm = 5
+
+after scaling by 2:
+x = 6
+y = 8
+norm = 10

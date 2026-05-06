@@ -1,0 +1,17 @@
+s = [Fortran], len = 7
+t = [allocatable character], len = 21
+after concatenation:
+s = [Fortran allocatable character], len = 29
+
+words array with fixed element length after allocation:
+words(1) = [alpha ], len = 6
+words(2) = [beta  ], len = 6
+words(3) = [gamma ], len = 6
+
+same allocatable array reallocated with longer element length:
+words(1) = [red         ], len = 12
+words(2) = [green       ], len = 12
+words(3) = [blue        ], len = 12
+
+separator with same length as s:
+*****************************

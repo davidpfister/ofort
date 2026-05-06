@@ -1,0 +1,44 @@
+program xmerge
+implicit none
+integer, parameter :: n = 5
+integer :: a(n), b(n), c(n)
+logical :: tf(n)
+integer :: x, y, z
+
+a = [10, 20, 30, 40, 50]
+b = [1, 2, 3, 4, 5]
+tf = [.true., .false., .true., .false., .true.]
+
+! scalar true value, scalar false value, scalar mask
+x = 10
+y = 20
+z = merge(x, y, .true.)
+print *, "scalar, scalar, scalar:"
+print *, z
+
+! array true value, array false value, array mask
+c = merge(a, b, tf)
+print *, "array, array, array:"
+print *, c
+
+! array true value, array false value, scalar mask
+c = merge(a, b, .false.)
+print *, "array, array, scalar:"
+print *, c
+
+! scalar true value, array false value, array mask
+c = merge(100, b, tf)
+print *, "scalar, array, array:"
+print *, c
+
+! array true value, scalar false value, array mask
+c = merge(a, -1, tf)
+print *, "array, scalar, array:"
+print *, c
+
+! scalar true value, scalar false value, array mask
+c = merge(1, 0, tf)
+print *, "scalar, scalar, array:"
+print *, c
+
+end program xmerge

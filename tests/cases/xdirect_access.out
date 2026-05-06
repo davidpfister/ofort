@@ -1,0 +1,4 @@
+read records in nonsequential order:
+rec = 3: record 3
+rec = 1: record 1
+rec = 5: record 5

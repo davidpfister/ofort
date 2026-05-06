@@ -1,0 +1,8 @@
+before = F
+open = T T
+name = xinquire_case.tmp
+modes = STREAM READWRITE YES YES YES
+stream = YES
+size pos = 5 6
+iolength = 11
+after = F

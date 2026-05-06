@@ -29,6 +29,7 @@ def case_files():
     return sorted(
         source for source in CASES.glob("*.f90")
         if source.name not in {
+            "xinput_output_unit.f90",
             "xsub.f90",
             "ximplicit_none.f90",
             "xtype_change.f90",
@@ -458,6 +459,98 @@ def test_multiple_source_files_are_concatenated(tmp_path):
     assert result.stdout.split() == ["42"]
 
 
+def test_manifest_source_files_are_concatenated(tmp_path):
+    first = tmp_path / "part1.f90"
+    second = tmp_path / "part2.f90"
+    manifest = tmp_path / "files.txt"
+    first.write_text(
+        "program xmanifest\n"
+        "implicit none\n"
+        "integer :: i\n"
+        "i = 7\n",
+        encoding="utf-8",
+    )
+    second.write_text(
+        "print *, i * 6\n"
+        "end program xmanifest\n",
+        encoding="utf-8",
+    )
+    manifest.write_text(
+        "# relative paths are resolved from the manifest directory\n"
+        "part1.f90\n"
+        "\n"
+        "! another comment\n"
+        "part2.f90\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), f"@{manifest}"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    assert result.stdout.split() == ["42"]
+
+
+def test_manifest_each_mode_runs_files_separately(tmp_path):
+    first = tmp_path / "a.f90"
+    second = tmp_path / "b.f90"
+    manifest = tmp_path / "files.txt"
+    first.write_text("print *, 11\n", encoding="utf-8")
+    second.write_text("print *, 22\n", encoding="utf-8")
+    manifest.write_text("a.f90\nb.f90\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--each", f"@{manifest}"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    assert "a.f90" in result.stdout
+    assert "b.f90" in result.stdout
+    assert "11" in result.stdout.split()
+    assert "22" in result.stdout.split()
+
+
+def test_manifest_errors_include_source_file_name(tmp_path):
+    first = tmp_path / "part1.f90"
+    second = tmp_path / "part2.f90"
+    manifest = tmp_path / "files.txt"
+    first.write_text(
+        "program xmanifest_error\n"
+        "implicit none\n",
+        encoding="utf-8",
+    )
+    second.write_text(
+        "print *, 1 .bad. 2\n"
+        "end program xmanifest_error\n",
+        encoding="utf-8",
+    )
+    manifest.write_text("part1.f90\npart2.f90\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), f"@{manifest}"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 1
+    assert str(second) in result.stderr
+    assert f"{second}:1:" in result.stderr
+    assert "line 3:" in result.stderr
+
+
 def test_private_module_names_are_not_imported(tmp_path):
     source = tmp_path / "xprivate_hidden.f90"
     source.write_text(
@@ -597,6 +690,23 @@ def test_w_option_suppresses_implicit_external_unit_warning(tmp_path):
     assert result.returncode == 0, result.stderr
     assert result.stdout == "70 80\n"
     assert result.stderr == ""
+
+
+def test_input_unit_reads_from_stdin(tmp_path):
+    source = CASES / "xinput_output_unit.f90"
+
+    result = subprocess.run(
+        [str(OFORT), str(source)],
+        input="Alice\n33\n",
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    assert result.stdout == source.with_suffix(".out").read_text(encoding="utf-8")
 
 
 def test_fast_option_suppresses_warnings_and_preserves_output():
