@@ -7172,6 +7172,10 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     /* MODULE */
     if (t->type == FTOK_MODULE) return parse_module(I);
 
+    if (token_can_be_name(t) && peek_ahead(I, 1)->type == FTOK_POINTER_ASSIGN) {
+        goto expression_statement;
+    }
+
     /* IF */
     if (t->type == FTOK_IF) { leave_spec_section(I); return parse_if(I); }
 
