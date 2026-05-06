@@ -197,6 +197,7 @@ struct OfortInterpreter {
     int consumed_bare_end;
     int in_spec_section;
     int stop_expr_at_slash;
+    int stop_expr_at_colon;
     /* node pool for memory management */
     OfortNode **node_pool;
     int node_pool_len;
@@ -243,6 +244,7 @@ static OfortNode *parse_data_target_list(OfortInterpreter *I);
 static OfortNode *parse_data_value_list(OfortInterpreter *I);
 static OfortNode *parse_implied_do(OfortInterpreter *I);
 static OfortNode *parse_expr(OfortInterpreter *I);
+static OfortNode *parse_expr_until_colon(OfortInterpreter *I);
 static OfortNode *parse_statement(OfortInterpreter *I);
 static int is_procedure_prefix_token(OfortToken *t);
 static OfortNode *parse_module_procedure_body(OfortInterpreter *I);
@@ -2974,7 +2976,7 @@ static OfortNode *parse_subscript_arg(OfortInterpreter *I) {
         slice->n_children = 2;
         advance(I);
         if (!check(I, FTOK_RPAREN) && !check(I, FTOK_COMMA)) {
-            slice->children[2] = parse_expr(I);
+            slice->children[2] = parse_expr_until_colon(I);
             slice->n_children = 3;
         }
         arg = slice;
@@ -2984,20 +2986,20 @@ static OfortNode *parse_subscript_arg(OfortInterpreter *I) {
         slice->n_children = 2;
         advance(I);
         if (!check(I, FTOK_RPAREN) && !check(I, FTOK_COMMA) && !check(I, FTOK_COLON)) {
-            slice->children[1] = parse_expr(I);
+            slice->children[1] = parse_expr_until_colon(I);
         } else {
             slice->children[1] = NULL;
         }
         if (check(I, FTOK_COLON)) {
             advance(I);
             if (!check(I, FTOK_RPAREN) && !check(I, FTOK_COMMA)) {
-                slice->children[2] = parse_expr(I);
+                slice->children[2] = parse_expr_until_colon(I);
                 slice->n_children = 3;
             }
         }
         arg = slice;
     } else {
-        arg = parse_expr(I);
+        arg = parse_expr_until_colon(I);
     }
     if (arg && arg->type != FND_SLICE && (check(I, FTOK_COLON) || check(I, FTOK_DCOLON))) {
         int double_colon = check(I, FTOK_DCOLON);
@@ -3006,14 +3008,14 @@ static OfortNode *parse_subscript_arg(OfortInterpreter *I) {
         slice->children[0] = arg;
         slice->n_children = 2;
         if (!double_colon && !check(I, FTOK_RPAREN) && !check(I, FTOK_COMMA) && !check(I, FTOK_COLON)) {
-            slice->children[1] = parse_expr(I);
+            slice->children[1] = parse_expr_until_colon(I);
         } else {
             slice->children[1] = NULL;
         }
         if (double_colon || check(I, FTOK_COLON)) {
             if (!double_colon) advance(I);
             if (!check(I, FTOK_RPAREN) && !check(I, FTOK_COMMA)) {
-                slice->children[2] = parse_expr(I);
+                slice->children[2] = parse_expr_until_colon(I);
                 slice->n_children = 3;
             }
         }
@@ -3056,7 +3058,7 @@ static OfortNode *parse_array_ref_postfix(OfortInterpreter *I, OfortNode *target
         if (check_keyword_arg(I)) {
             arg_name = token_arg_name(advance(I));
             advance(I); /* = */
-            arg = parse_expr(I);
+            arg = parse_expr_until_colon(I);
         } else {
             arg = parse_subscript_arg(I);
         }
@@ -3364,9 +3366,13 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
 }
 
 /* operator precedence levels */
+static int expr_at_stop_token(OfortInterpreter *I) {
+    return I->stop_expr_at_colon && check(I, FTOK_COLON);
+}
+
 static OfortNode *parse_power(OfortInterpreter *I) {
     OfortNode *left = parse_primary(I);
-    while (check(I, FTOK_POWER)) {
+    while (!expr_at_stop_token(I) && check(I, FTOK_POWER)) {
         advance(I);
         OfortNode *right = parse_primary(I); /* right-associative */
         OfortNode *n = alloc_node(I, FND_POWER);
@@ -3385,7 +3391,8 @@ static OfortNode *parse_unary(OfortInterpreter *I) {
 
 static OfortNode *parse_mul(OfortInterpreter *I) {
     OfortNode *left = parse_unary(I);
-    while (check(I, FTOK_STAR) || (check(I, FTOK_SLASH) && !I->stop_expr_at_slash)) {
+    while (!expr_at_stop_token(I) &&
+           (check(I, FTOK_STAR) || (check(I, FTOK_SLASH) && !I->stop_expr_at_slash))) {
         OfortTokenType op = advance(I)->type;
         OfortNode *right = parse_unary(I);
         OfortNode *n = alloc_node(I, op == FTOK_STAR ? FND_MUL : FND_DIV);
@@ -3398,7 +3405,7 @@ static OfortNode *parse_mul(OfortInterpreter *I) {
 
 static OfortNode *parse_add(OfortInterpreter *I) {
     OfortNode *left = parse_mul(I);
-    while (check(I, FTOK_PLUS) || check(I, FTOK_MINUS)) {
+    while (!expr_at_stop_token(I) && (check(I, FTOK_PLUS) || check(I, FTOK_MINUS))) {
         OfortTokenType op = advance(I)->type;
         OfortNode *right = parse_mul(I);
         OfortNode *n = alloc_node(I, op == FTOK_PLUS ? FND_ADD : FND_SUB);
@@ -3411,7 +3418,7 @@ static OfortNode *parse_add(OfortInterpreter *I) {
 
 static OfortNode *parse_concat(OfortInterpreter *I) {
     OfortNode *left = parse_add(I);
-    while (check(I, FTOK_CONCAT)) {
+    while (!expr_at_stop_token(I) && check(I, FTOK_CONCAT)) {
         advance(I);
         OfortNode *right = parse_add(I);
         OfortNode *n = alloc_node(I, FND_CONCAT);
@@ -3424,10 +3431,11 @@ static OfortNode *parse_concat(OfortInterpreter *I) {
 
 static OfortNode *parse_comparison(OfortInterpreter *I) {
     OfortNode *left = parse_concat(I);
-    while (check(I, FTOK_EQ) || check(I, FTOK_NEQ) ||
+    while (!expr_at_stop_token(I) &&
+           (check(I, FTOK_EQ) || check(I, FTOK_NEQ) ||
            check(I, FTOK_LT) || check(I, FTOK_GT) ||
            check(I, FTOK_LE) || check(I, FTOK_GE) ||
-           check(I, FTOK_USER_OP)) {
+           check(I, FTOK_USER_OP))) {
         OfortToken *op_token = advance(I);
         OfortTokenType op = op_token->type;
         OfortNode *right = parse_concat(I);
@@ -3475,7 +3483,7 @@ static OfortNode *parse_not(OfortInterpreter *I) {
 
 static OfortNode *parse_and(OfortInterpreter *I) {
     OfortNode *left = parse_not(I);
-    while (check(I, FTOK_AND)) {
+    while (!expr_at_stop_token(I) && check(I, FTOK_AND)) {
         advance(I);
         OfortNode *right = parse_not(I);
         OfortNode *n = alloc_node(I, FND_AND);
@@ -3488,7 +3496,7 @@ static OfortNode *parse_and(OfortInterpreter *I) {
 
 static OfortNode *parse_or(OfortInterpreter *I) {
     OfortNode *left = parse_and(I);
-    while (check(I, FTOK_OR)) {
+    while (!expr_at_stop_token(I) && check(I, FTOK_OR)) {
         advance(I);
         OfortNode *right = parse_and(I);
         OfortNode *n = alloc_node(I, FND_OR);
@@ -3501,7 +3509,7 @@ static OfortNode *parse_or(OfortInterpreter *I) {
 
 static OfortNode *parse_eqv(OfortInterpreter *I) {
     OfortNode *left = parse_or(I);
-    while (check(I, FTOK_EQVOP) || check(I, FTOK_NEQVOP)) {
+    while (!expr_at_stop_token(I) && (check(I, FTOK_EQVOP) || check(I, FTOK_NEQVOP))) {
         OfortTokenType op = advance(I)->type;
         OfortNode *right = parse_or(I);
         OfortNode *n = alloc_node(I, op == FTOK_EQVOP ? FND_EQV : FND_NEQV);
@@ -3514,6 +3522,15 @@ static OfortNode *parse_eqv(OfortInterpreter *I) {
 
 static OfortNode *parse_expr(OfortInterpreter *I) {
     return parse_eqv(I);
+}
+
+static OfortNode *parse_expr_until_colon(OfortInterpreter *I) {
+    int old_stop = I->stop_expr_at_colon;
+    OfortNode *n;
+    I->stop_expr_at_colon = 1;
+    n = parse_expr(I);
+    I->stop_expr_at_colon = old_stop;
+    return n;
 }
 
 /* ── Type keyword checking ──────────────────── */
@@ -3629,7 +3646,7 @@ static OfortNode *parse_dimension_bound_expr(OfortInterpreter *I) {
         n->line = mt->line;
         return n;
     }
-    return parse_expr(I);
+    return parse_expr_until_colon(I);
 }
 
 static OfortNode *parse_declaration(OfortInterpreter *I) {
@@ -3816,7 +3833,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
                         } else if (check(I, FTOK_RPAREN) || check(I, FTOK_COMMA)) {
                             decl_dims[dim_index] = 0;
                         } else {
-                            OfortNode *hi = parse_expr(I);
+                            OfortNode *hi = parse_expr_until_colon(I);
                             int hi_value = 0;
                             if (int_constant_node(hi, &hi_value)) {
                                 decl_dims[dim_index] = hi_value;
@@ -3998,7 +4015,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
                         } else if (check(I, FTOK_RPAREN) || check(I, FTOK_COMMA)) {
                             decl->dims[dim_index] = 0;
                         } else {
-                            OfortNode *dh = parse_expr(I);
+                            OfortNode *dh = parse_expr_until_colon(I);
                             if (dh->type == FND_INT_LIT) {
                                 decl->dims[dim_index] = (int)dh->int_val;
                             } else if (dim_index < decl->n_stmts) {
@@ -4614,7 +4631,7 @@ static int data_statement_follows(OfortInterpreter *I) {
         if (type == FTOK_NEWLINE || type == FTOK_EOF) return 0;
         if (type == FTOK_LPAREN) depth++;
         else if (type == FTOK_RPAREN && depth > 0) depth--;
-        else if (type == FTOK_SLASH) return 1;
+        else if (type == FTOK_SLASH && depth == 0) return 1;
         else if (type == FTOK_ASSIGN && depth == 0) return 0;
     }
     return 0;
@@ -5094,6 +5111,7 @@ static OfortNode *parse_common_statement(OfortInterpreter *I) {
                         decl->dims[decl->n_dims++] = 0;
                     } else {
                         OfortNode *dim = parse_dimension_bound_expr(I);
+                        int dim_index = decl->n_dims;
                         if (dim->type == FND_INT_LIT) {
                             decl->dims[decl->n_dims] = (int)dim->int_val;
                         } else {
@@ -5106,6 +5124,33 @@ static OfortNode *parse_common_statement(OfortInterpreter *I) {
                         decl->stmts[decl->n_dims] = dim;
                         decl->n_stmts = decl->n_dims + 1;
                         decl->n_dims++;
+                        if (check(I, FTOK_COLON)) {
+                            advance(I);
+                            int lower_value = 0;
+                            if (int_constant_node(dim, &lower_value)) {
+                                decl->lower_bounds[dim_index] = lower_value;
+                                decl->has_lower_bound[dim_index] = 1;
+                            } else {
+                                decl->lower_bounds[dim_index] = 1;
+                                decl->lower_bound_exprs[dim_index] = dim;
+                                decl->has_lower_bound[dim_index] = 1;
+                            }
+                            if (check(I, FTOK_STAR)) {
+                                advance(I);
+                                decl->dims[dim_index] = 0;
+                            } else if (check(I, FTOK_RPAREN) || check(I, FTOK_COMMA)) {
+                                decl->dims[dim_index] = 0;
+                            } else {
+                                OfortNode *hi = parse_expr_until_colon(I);
+                                int hi_value = 0;
+                                if (int_constant_node(hi, &hi_value)) {
+                                    decl->dims[dim_index] = hi_value;
+                                } else {
+                                    decl->dims[dim_index] = 0;
+                                    decl->stmts[dim_index] = hi;
+                                }
+                            }
+                        }
                     }
                     if (check(I, FTOK_COMMA)) advance(I);
                     else break;
@@ -5187,7 +5232,7 @@ static OfortNode *parse_dimension_statement(OfortInterpreter *I) {
                     } else if (check(I, FTOK_RPAREN) || check(I, FTOK_COMMA)) {
                         decl->dims[dim_index] = 0;
                     } else {
-                        OfortNode *hi = parse_expr(I);
+                        OfortNode *hi = parse_expr_until_colon(I);
                         int hi_value = 0;
                         if (int_constant_node(hi, &hi_value)) {
                             decl->dims[dim_index] = hi_value;
@@ -5809,6 +5854,9 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
     int is_optional = 0;
     int intent = 0;
     int decl_dims[7] = {0};
+    int decl_lower_bounds[7] = {0};
+    int decl_has_lower_bound[7] = {0};
+    OfortNode *decl_lower_bound_exprs[7] = {0};
     int n_decl_dims = 0;
     OfortNode *type_param_exprs[OFORT_MAX_PARAMS] = {0};
     int n_type_param_exprs = 0;
@@ -5854,10 +5902,37 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
                     decl_dims[n_decl_dims++] = 0;
                 } else {
                     OfortNode *dim_expr = parse_dimension_bound_expr(I);
+                    int dim_index = n_decl_dims;
                     if (dim_expr->type == FND_INT_LIT)
                         decl_dims[n_decl_dims++] = (int)dim_expr->int_val;
                     else
                         decl_dims[n_decl_dims++] = 0;
+                    if (check(I, FTOK_COLON)) {
+                        advance(I);
+                        int lower_value = 0;
+                        if (int_constant_node(dim_expr, &lower_value)) {
+                            decl_lower_bounds[dim_index] = lower_value;
+                            decl_has_lower_bound[dim_index] = 1;
+                        } else {
+                            decl_lower_bounds[dim_index] = 1;
+                            decl_lower_bound_exprs[dim_index] = dim_expr;
+                            decl_has_lower_bound[dim_index] = 1;
+                        }
+                        if (check(I, FTOK_STAR)) {
+                            advance(I);
+                            decl_dims[dim_index] = 0;
+                        } else if (check(I, FTOK_RPAREN) || check(I, FTOK_COMMA)) {
+                            decl_dims[dim_index] = 0;
+                        } else {
+                            OfortNode *hi = parse_expr_until_colon(I);
+                            int hi_value = 0;
+                            if (int_constant_node(hi, &hi_value)) {
+                                decl_dims[dim_index] = hi_value;
+                            } else {
+                                decl_dims[dim_index] = 0;
+                            }
+                        }
+                    }
                 }
                 if (check(I, FTOK_COMMA)) advance(I);
                 else break;
@@ -5929,6 +6004,9 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
             decl->type_param_exprs[pi] = type_param_exprs[pi];
         }
         memcpy(decl->dims, decl_dims, sizeof(decl_dims));
+        memcpy(decl->lower_bounds, decl_lower_bounds, sizeof(decl_lower_bounds));
+        memcpy(decl->has_lower_bound, decl_has_lower_bound, sizeof(decl_has_lower_bound));
+        memcpy(decl->lower_bound_exprs, decl_lower_bound_exprs, sizeof(decl_lower_bound_exprs));
         decl->n_dims = n_decl_dims;
 
         if (check(I, FTOK_LPAREN) && n_decl_dims == 0) {
@@ -5970,7 +6048,7 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
                         if (check(I, FTOK_RPAREN) || check(I, FTOK_COMMA)) {
                             decl->dims[dim_index] = 0;
                         } else {
-                            OfortNode *dh = parse_expr(I);
+                            OfortNode *dh = parse_expr_until_colon(I);
                             if (int_constant_node(dh, &dh_value)) {
                                 decl->dims[dim_index] = dh_value;
                             } else if (dim_index < decl->n_stmts) {
