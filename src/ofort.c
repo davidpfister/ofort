@@ -89,6 +89,7 @@ typedef struct {
     int field_char_lens[OFORT_MAX_FIELDS];
     OfortNode *field_char_len_exprs[OFORT_MAX_FIELDS];
     OfortNode *field_kind_exprs[OFORT_MAX_FIELDS];
+    OfortNode *field_init_exprs[OFORT_MAX_FIELDS];
     int field_dims[OFORT_MAX_FIELDS][7];
     OfortNode *field_dim_exprs[OFORT_MAX_FIELDS][7];
     int field_n_dims[OFORT_MAX_FIELDS];
@@ -6504,6 +6505,8 @@ static OfortValue default_value(OfortValType vtype, int char_len) {
 
 static OfortValue make_array(OfortValType elem_type, int *dims, int n_dims);
 static OfortValue make_array_with_char_len(OfortValType elem_type, int *dims, int n_dims, int char_len);
+static int assign_packed_array_element(OfortValue *arr, int index, OfortValue rhs);
+static OfortValue array_element_value(const OfortValue *arr, int index);
 static OfortValue make_derived_array(OfortInterpreter *I, const char *type_name, int *dims, int n_dims);
 static OfortValue default_derived_value_with_params(OfortInterpreter *I, const char *type_name,
                                                     OfortNode **param_exprs, int n_param_exprs);
@@ -6562,6 +6565,47 @@ static OfortValue default_derived_value(OfortInterpreter *I, const char *type_na
         } else {
             v.v.dt.fields[i] = default_value(field_type, field_char_len);
             if (field_kind > 0) v.v.dt.fields[i].kind = field_kind;
+        }
+        if (td->field_init_exprs[i]) {
+            OfortValue init = eval_node(I, td->field_init_exprs[i]);
+            if (v.v.dt.fields[i].type == FVAL_ARRAY && init.type == FVAL_ARRAY) {
+                int count = init.v.arr.len < v.v.dt.fields[i].v.arr.len ?
+                            init.v.arr.len : v.v.dt.fields[i].v.arr.len;
+                for (int j = 0; j < count; j++) {
+                    OfortValue elem = array_element_value(&init, j);
+                    if (v.v.dt.fields[i].v.arr.elem_type == FVAL_CHARACTER)
+                        elem = resize_character_value(elem, field_char_len);
+                    if (field_kind > 0 && is_numeric_type(elem.type)) elem.kind = field_kind;
+                    if (assign_packed_array_element(&v.v.dt.fields[i], j, elem)) {
+                        free_value(&elem);
+                    } else {
+                        free_value(&v.v.dt.fields[i].v.arr.data[j]);
+                        v.v.dt.fields[i].v.arr.data[j] = elem;
+                    }
+                }
+                free_value(&init);
+            } else if (v.v.dt.fields[i].type == FVAL_ARRAY) {
+                for (int j = 0; j < v.v.dt.fields[i].v.arr.len; j++) {
+                    OfortValue elem = copy_value(init);
+                    if (v.v.dt.fields[i].v.arr.elem_type == FVAL_CHARACTER)
+                        elem = resize_character_value(elem, field_char_len);
+                    if (field_kind > 0 && is_numeric_type(elem.type)) elem.kind = field_kind;
+                    if (assign_packed_array_element(&v.v.dt.fields[i], j, elem)) {
+                        free_value(&elem);
+                    } else {
+                        free_value(&v.v.dt.fields[i].v.arr.data[j]);
+                        v.v.dt.fields[i].v.arr.data[j] = elem;
+                    }
+                }
+                free_value(&init);
+            } else {
+                init = coerce_assignment_value(I, td->field_names[i], v.v.dt.fields[i].type, init);
+                if (v.v.dt.fields[i].type == FVAL_CHARACTER)
+                    init = resize_character_value(init, field_char_len);
+                if (field_kind > 0 && is_numeric_type(init.type)) init.kind = field_kind;
+                free_value(&v.v.dt.fields[i]);
+                v.v.dt.fields[i] = init;
+            }
         }
     }
     return v;
@@ -12337,6 +12381,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         td->field_char_lens[td->n_fields] = d->char_len;
                         td->field_char_len_exprs[td->n_fields] = d->char_len_expr;
                         td->field_kind_exprs[td->n_fields] = d->kind_expr;
+                        td->field_init_exprs[td->n_fields] =
+                            (d->n_children > 0 && d->children[0]) ? d->children[0] : NULL;
                         td->field_n_dims[td->n_fields] = d->n_dims;
                         memcpy(td->field_dims[td->n_fields], d->dims, sizeof(td->field_dims[td->n_fields]));
                         for (int fd = 0; fd < d->n_dims && fd < 7 && fd < d->n_stmts; fd++) {
@@ -12380,6 +12426,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 td->field_char_lens[td->n_fields] = s->char_len;
                 td->field_char_len_exprs[td->n_fields] = s->char_len_expr;
                 td->field_kind_exprs[td->n_fields] = s->kind_expr;
+                td->field_init_exprs[td->n_fields] =
+                    (s->n_children > 0 && s->children[0]) ? s->children[0] : NULL;
                 td->field_n_dims[td->n_fields] = s->n_dims;
                 memcpy(td->field_dims[td->n_fields], s->dims, sizeof(td->field_dims[td->n_fields]));
                 for (int fd = 0; fd < s->n_dims && fd < 7 && fd < s->n_stmts; fd++) {
