@@ -3882,7 +3882,13 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
         decl->n_dims = n_decl_dims;
 
         /* per-variable dimension: x(10) */
-        if (check(I, FTOK_LPAREN) && n_decl_dims == 0) {
+        if (check(I, FTOK_LPAREN) && n_decl_dims > 0) {
+            /* Some vendor tests repeat the array spec after a DIMENSION
+               attribute, e.g. INTEGER,DIMENSION(:)::A(:).  Keep the
+               attribute dimensions and consume the redundant variable
+               dimensions so parsing can continue. */
+            skip_balanced_parens(I);
+        } else if (check(I, FTOK_LPAREN) && n_decl_dims == 0) {
             advance(I);
             decl->n_dims = 0;
             int dim_cap = 0;
