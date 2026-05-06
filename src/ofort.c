@@ -3452,7 +3452,11 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
             advance(I);
             if (check(I, FTOK_LPAREN)) {
                 advance(I);
-                if (check(I, FTOK_COLON)) {
+                if (check(I, FTOK_STAR)) {
+                    advance(I);
+                    decl->char_len = OFORT_MAX_STRLEN - 1;
+                    decl->char_len_expr = NULL;
+                } else if (check(I, FTOK_COLON)) {
                     advance(I);
                     decl->char_len = 0;
                     decl->char_len_expr = NULL;
