@@ -1445,9 +1445,66 @@ static int macro_index(OfortMacro *macros, int n_macros, const char *name, size_
     return -1;
 }
 
+static int pp_macro_defined(OfortMacro *macros, int n_macros, const char *name, size_t name_len) {
+    return macro_index(macros, n_macros, name, name_len) >= 0;
+}
+
+static int pp_eval_condition(OfortMacro *macros, int n_macros, const char *q, const char *line_end) {
+    while (q < line_end && isspace((unsigned char)*q)) q++;
+    if (q < line_end && *q == '!') {
+        return !pp_eval_condition(macros, n_macros, q + 1, line_end);
+    }
+    if ((size_t)(line_end - q) >= 7 && strncmp(q, "defined", 7) == 0 &&
+        (q + 7 == line_end || !isalnum((unsigned char)q[7]))) {
+        const char *name_start;
+        const char *name_end;
+        q += 7;
+        while (q < line_end && isspace((unsigned char)*q)) q++;
+        if (q < line_end && *q == '(') {
+            q++;
+            while (q < line_end && isspace((unsigned char)*q)) q++;
+            name_start = q;
+            while (q < line_end && (isalnum((unsigned char)*q) || *q == '_')) q++;
+            name_end = q;
+            return pp_macro_defined(macros, n_macros, name_start, (size_t)(name_end - name_start));
+        }
+        name_start = q;
+        while (q < line_end && (isalnum((unsigned char)*q) || *q == '_')) q++;
+        name_end = q;
+        return pp_macro_defined(macros, n_macros, name_start, (size_t)(name_end - name_start));
+    }
+    if (q < line_end && (isalpha((unsigned char)*q) || *q == '_')) {
+        const char *name_start = q;
+        int mi;
+        long val;
+        char *endp;
+        while (q < line_end && (isalnum((unsigned char)*q) || *q == '_')) q++;
+        mi = macro_index(macros, n_macros, name_start, (size_t)(q - name_start));
+        if (mi < 0) return 0;
+        val = strtol(macros[mi].replacement, &endp, 0);
+        return endp != macros[mi].replacement ? val != 0 : macros[mi].replacement[0] != '\0';
+    }
+    if (q < line_end && (isdigit((unsigned char)*q) || *q == '-')) {
+        char buf[64];
+        size_t n = (size_t)(line_end - q);
+        char *endp;
+        long val;
+        if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+        memcpy(buf, q, n);
+        buf[n] = '\0';
+        val = strtol(buf, &endp, 0);
+        return endp != buf && val != 0;
+    }
+    return 0;
+}
+
 static char *preprocess_source(OfortInterpreter *I, const char *source) {
     OfortMacro macros[128];
     int n_macros = 0;
+    int pp_active[64];
+    int pp_parent_active[64];
+    int pp_branch_taken[64];
+    int pp_depth = 0;
     char *out = NULL;
     size_t out_len = 0, out_cap = 0;
     const char *p = source;
@@ -1484,18 +1541,110 @@ static char *preprocess_source(OfortInterpreter *I, const char *source) {
                 rep_start = q;
                 rep_end = line_end;
                 while (rep_end > rep_start && (rep_end[-1] == ' ' || rep_end[-1] == '\t')) rep_end--;
-                if (n_macros >= (int)(sizeof(macros) / sizeof(macros[0])))
-                    ofort_error(I, "Too many #define macros");
-                {
-                    size_t name_len = (size_t)(name_end - name_start);
-                    size_t rep_len = (size_t)(rep_end - rep_start);
-                    if (name_len >= sizeof(macros[0].name) || rep_len >= sizeof(macros[0].replacement))
-                        ofort_error(I, "#define macro is too long");
-                    memcpy(macros[n_macros].name, name_start, name_len);
-                    macros[n_macros].name[name_len] = '\0';
-                    memcpy(macros[n_macros].replacement, rep_start, rep_len);
-                    macros[n_macros].replacement[rep_len] = '\0';
-                    n_macros++;
+                if (pp_depth == 0 || pp_active[pp_depth - 1]) {
+                    if (n_macros >= (int)(sizeof(macros) / sizeof(macros[0])))
+                        ofort_error(I, "Too many #define macros");
+                    {
+                        size_t name_len = (size_t)(name_end - name_start);
+                        size_t rep_len = (size_t)(rep_end - rep_start);
+                        if (name_len >= sizeof(macros[0].name) || rep_len >= sizeof(macros[0].replacement))
+                            ofort_error(I, "#define macro is too long");
+                        memcpy(macros[n_macros].name, name_start, name_len);
+                        macros[n_macros].name[name_len] = '\0';
+                        memcpy(macros[n_macros].replacement, rep_start, rep_len);
+                        macros[n_macros].replacement[rep_len] = '\0';
+                        n_macros++;
+                    }
+                }
+                append_char_text(&out, &out_len, &out_cap, '\n');
+            } else if ((size_t)(line_end - q) >= 5 && strncmp(q, "ifdef", 5) == 0 &&
+                       (q + 5 == line_end || isspace((unsigned char)q[5]))) {
+                int parent = pp_depth == 0 ? 1 : pp_active[pp_depth - 1];
+                const char *name_start;
+                const char *name_end;
+                q += 5;
+                while (q < line_end && isspace((unsigned char)*q)) q++;
+                name_start = q;
+                while (q < line_end && (isalnum((unsigned char)*q) || *q == '_')) q++;
+                name_end = q;
+                if (pp_depth >= (int)(sizeof(pp_active) / sizeof(pp_active[0])))
+                    ofort_error(I, "Too many nested preprocessor conditionals");
+                pp_parent_active[pp_depth] = parent;
+                pp_active[pp_depth] = parent && pp_macro_defined(macros, n_macros, name_start, (size_t)(name_end - name_start));
+                pp_branch_taken[pp_depth] = pp_active[pp_depth];
+                pp_depth++;
+                append_char_text(&out, &out_len, &out_cap, '\n');
+            } else if ((size_t)(line_end - q) >= 6 && strncmp(q, "ifndef", 6) == 0 &&
+                       (q + 6 == line_end || isspace((unsigned char)q[6]))) {
+                int parent = pp_depth == 0 ? 1 : pp_active[pp_depth - 1];
+                const char *name_start;
+                const char *name_end;
+                q += 6;
+                while (q < line_end && isspace((unsigned char)*q)) q++;
+                name_start = q;
+                while (q < line_end && (isalnum((unsigned char)*q) || *q == '_')) q++;
+                name_end = q;
+                if (pp_depth >= (int)(sizeof(pp_active) / sizeof(pp_active[0])))
+                    ofort_error(I, "Too many nested preprocessor conditionals");
+                pp_parent_active[pp_depth] = parent;
+                pp_active[pp_depth] = parent && !pp_macro_defined(macros, n_macros, name_start, (size_t)(name_end - name_start));
+                pp_branch_taken[pp_depth] = pp_active[pp_depth];
+                pp_depth++;
+                append_char_text(&out, &out_len, &out_cap, '\n');
+            } else if ((size_t)(line_end - q) >= 2 && strncmp(q, "if", 2) == 0 &&
+                       (q + 2 == line_end || isspace((unsigned char)q[2]))) {
+                int parent = pp_depth == 0 ? 1 : pp_active[pp_depth - 1];
+                int cond;
+                q += 2;
+                if (pp_depth >= (int)(sizeof(pp_active) / sizeof(pp_active[0])))
+                    ofort_error(I, "Too many nested preprocessor conditionals");
+                cond = pp_eval_condition(macros, n_macros, q, line_end);
+                pp_parent_active[pp_depth] = parent;
+                pp_active[pp_depth] = parent && cond;
+                pp_branch_taken[pp_depth] = pp_active[pp_depth];
+                pp_depth++;
+                append_char_text(&out, &out_len, &out_cap, '\n');
+            } else if ((size_t)(line_end - q) >= 4 && strncmp(q, "elif", 4) == 0 &&
+                       (q + 4 == line_end || isspace((unsigned char)q[4]))) {
+                int idx;
+                int cond;
+                if (pp_depth <= 0) ofort_error(I, "Unexpected #elif");
+                idx = pp_depth - 1;
+                q += 4;
+                cond = pp_eval_condition(macros, n_macros, q, line_end);
+                pp_active[idx] = pp_parent_active[idx] && !pp_branch_taken[idx] && cond;
+                if (pp_active[idx]) pp_branch_taken[idx] = 1;
+                append_char_text(&out, &out_len, &out_cap, '\n');
+            } else if ((size_t)(line_end - q) >= 4 && strncmp(q, "else", 4) == 0 &&
+                       (q + 4 == line_end || isspace((unsigned char)q[4]))) {
+                int idx;
+                if (pp_depth <= 0) ofort_error(I, "Unexpected #else");
+                idx = pp_depth - 1;
+                pp_active[idx] = pp_parent_active[idx] && !pp_branch_taken[idx];
+                pp_branch_taken[idx] = 1;
+                append_char_text(&out, &out_len, &out_cap, '\n');
+            } else if ((size_t)(line_end - q) >= 5 && strncmp(q, "endif", 5) == 0 &&
+                       (q + 5 == line_end || isspace((unsigned char)q[5]))) {
+                if (pp_depth <= 0) ofort_error(I, "Unexpected #endif");
+                pp_depth--;
+                append_char_text(&out, &out_len, &out_cap, '\n');
+            } else if ((size_t)(line_end - q) >= 5 && strncmp(q, "undef", 5) == 0 &&
+                       (q + 5 == line_end || isspace((unsigned char)q[5]))) {
+                if (pp_depth == 0 || pp_active[pp_depth - 1]) {
+                    const char *name_start;
+                    const char *name_end;
+                    int mi;
+                    q += 5;
+                    while (q < line_end && isspace((unsigned char)*q)) q++;
+                    name_start = q;
+                    while (q < line_end && (isalnum((unsigned char)*q) || *q == '_')) q++;
+                    name_end = q;
+                    mi = macro_index(macros, n_macros, name_start, (size_t)(name_end - name_start));
+                    if (mi >= 0) {
+                        memmove(&macros[mi], &macros[mi + 1],
+                                (size_t)(n_macros - mi - 1) * sizeof(macros[0]));
+                        n_macros--;
+                    }
                 }
                 append_char_text(&out, &out_len, &out_cap, '\n');
             } else if (q >= line_end) {
@@ -1505,7 +1654,9 @@ static char *preprocess_source(OfortInterpreter *I, const char *source) {
             }
         } else {
             q = line_start;
-            while (q < line_end) {
+            if (pp_depth > 0 && !pp_active[pp_depth - 1]) {
+                append_char_text(&out, &out_len, &out_cap, '\n');
+            } else while (q < line_end) {
                 if (*q == '\'' || *q == '"') {
                     char quote = *q;
                     append_char_text(&out, &out_len, &out_cap, *q++);
