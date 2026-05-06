@@ -63,6 +63,7 @@ typedef struct OfortScope {
     int n_vars;
     int implicit_none;
     char implicit_types[26];
+    int implicit_char_lens[26];
     struct OfortScope *parent;
 } OfortScope;
 
@@ -579,6 +580,7 @@ static OfortScope *push_scope(OfortInterpreter *I) {
     if (s->parent) {
         s->implicit_none = s->parent->implicit_none;
         memcpy(s->implicit_types, s->parent->implicit_types, sizeof(s->implicit_types));
+        memcpy(s->implicit_char_lens, s->parent->implicit_char_lens, sizeof(s->implicit_char_lens));
     }
     I->current_scope = s;
     return s;
@@ -588,12 +590,14 @@ static void set_scope_explicit_typing(OfortScope *s) {
     if (!s) return;
     s->implicit_none = 1;
     memset(s->implicit_types, 0, sizeof(s->implicit_types));
+    memset(s->implicit_char_lens, 0, sizeof(s->implicit_char_lens));
 }
 
 static void set_scope_legacy_implicit_typing(OfortScope *s) {
     if (!s) return;
     s->implicit_none = 0;
     for (int i = 0; i < 26; i++) s->implicit_types[i] = 'R';
+    memset(s->implicit_char_lens, 0, sizeof(s->implicit_char_lens));
     for (int i = 'I' - 'A'; i <= 'N' - 'A'; i++) s->implicit_types[i] = 'I';
 }
 
@@ -663,6 +667,17 @@ static OfortValType implicit_type_for_name(OfortInterpreter *I, const char *name
         s = s->parent;
     }
     return FVAL_VOID;
+}
+
+static int implicit_char_len_for_name(OfortInterpreter *I, const char *name) {
+    char c = name && name[0] ? (char)toupper((unsigned char)name[0]) : '\0';
+    int idx = (c >= 'A' && c <= 'Z') ? c - 'A' : -1;
+    OfortScope *s = I->current_scope;
+    while (s && idx >= 0) {
+        if (s->implicit_types[idx] == 'C') return s->implicit_char_lens[idx];
+        s = s->parent;
+    }
+    return 0;
 }
 
 static const char *value_type_name(OfortValType type) {
@@ -821,8 +836,10 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
     int has_implicit_type = 0;
     OfortValType implicit_type = implicit_type_for_name(I, name, &has_implicit_type);
     if (has_implicit_type) {
+        int implicit_char_len = implicit_type == FVAL_CHARACTER ? implicit_char_len_for_name(I, name) : 0;
         val = coerce_assignment_value(I, name, implicit_type, val);
-        val = resize_character_value(val, implicit_type == FVAL_CHARACTER ? OFORT_MAX_STRLEN - 1 : 0);
+        val = resize_character_value(val, implicit_type == FVAL_CHARACTER ?
+                                     (implicit_char_len > 0 ? implicit_char_len : OFORT_MAX_STRLEN - 1) : 0);
     }
     if (s->n_vars >= OFORT_MAX_VARS) ofort_error(I, "Too many variables");
     OfortVar *v = &s->vars[s->n_vars++];
@@ -5772,8 +5789,22 @@ static OfortNode *parse_implicit_stmt(OfortInterpreter *I) {
             vtype = token_to_valtype(advance(I)->type);
         }
 
+        int implicit_char_len = 0;
         if (check(I, FTOK_LPAREN) && vtype == FVAL_CHARACTER) {
-            skip_balanced_parens(I);
+            advance(I);
+            if (check(I, FTOK_STAR)) {
+                advance(I);
+                implicit_char_len = OFORT_MAX_STRLEN - 1;
+            } else if (check(I, FTOK_COLON)) {
+                advance(I);
+                implicit_char_len = 0;
+            } else if (!check(I, FTOK_RPAREN)) {
+                OfortNode *len_expr = parse_expr(I);
+                if (len_expr && len_expr->type == FND_INT_LIT)
+                    implicit_char_len = (int)len_expr->int_val;
+            }
+            while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) advance(I);
+            expect(I, FTOK_RPAREN);
         } else if (check(I, FTOK_LPAREN) &&
                    (vtype == FVAL_INTEGER || vtype == FVAL_REAL || vtype == FVAL_DOUBLE)) {
             OfortToken *after_lparen = peek_ahead(I, 1);
@@ -5799,7 +5830,10 @@ static OfortNode *parse_implicit_stmt(OfortInterpreter *I) {
                 lo = hi;
                 hi = tmp;
             }
-            for (int i = lo; i <= hi; i++) n->implicit_types[i] = implicit_type_code(vtype);
+            for (int i = lo; i <= hi; i++) {
+                n->implicit_types[i] = implicit_type_code(vtype);
+                if (vtype == FVAL_CHARACTER) n->implicit_char_lens[i] = implicit_char_len;
+            }
             if (check(I, FTOK_COMMA)) advance(I);
             else break;
         }
@@ -12480,10 +12514,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (n->bool_val) {
                 I->current_scope->implicit_none = 1;
                 memset(I->current_scope->implicit_types, 0, sizeof(I->current_scope->implicit_types));
+                memset(I->current_scope->implicit_char_lens, 0, sizeof(I->current_scope->implicit_char_lens));
             } else {
                 I->current_scope->implicit_none = 0;
                 for (int i = 0; i < 26; i++) {
                     if (n->implicit_types[i]) I->current_scope->implicit_types[i] = n->implicit_types[i];
+                    if (n->implicit_types[i] == 'C') I->current_scope->implicit_char_lens[i] = n->implicit_char_lens[i];
                 }
             }
         }
