@@ -3349,7 +3349,11 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
                             decl_lower_bound_exprs[dim_index] = dim_expr;
                             decl_has_lower_bound[dim_index] = 1;
                         }
-                        if (check(I, FTOK_RPAREN) || check(I, FTOK_COMMA)) {
+                        if (check(I, FTOK_STAR)) {
+                            advance(I);
+                            decl_dims[dim_index] = 0;
+                            decl_dim_exprs[dim_index] = NULL;
+                        } else if (check(I, FTOK_RPAREN) || check(I, FTOK_COMMA)) {
                             decl_dims[dim_index] = 0;
                         } else {
                             OfortNode *hi = parse_expr(I);
@@ -3522,7 +3526,10 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
                             decl->lower_bound_exprs[dim_index] = de;
                             decl->has_lower_bound[dim_index] = 1;
                         }
-                        if (check(I, FTOK_RPAREN) || check(I, FTOK_COMMA)) {
+                        if (check(I, FTOK_STAR)) {
+                            advance(I);
+                            decl->dims[dim_index] = 0;
+                        } else if (check(I, FTOK_RPAREN) || check(I, FTOK_COMMA)) {
                             decl->dims[dim_index] = 0;
                         } else {
                             OfortNode *dh = parse_expr(I);
@@ -6923,7 +6930,7 @@ static void infer_decl_dims_from_initializer(OfortInterpreter *I, OfortNode *n) 
     int has_unknown = 0;
     if (!n || n->n_dims <= 0 || n->n_children <= 0 || !n->children[0]) return;
     for (int i = 0; i < n->n_dims; i++) {
-        if (n->dims[i] == 0 && !n->has_lower_bound[i]) {
+        if (n->dims[i] == 0) {
             has_unknown = 1;
             break;
         }
@@ -6940,8 +6947,18 @@ static void infer_decl_dims_from_initializer(OfortInterpreter *I, OfortNode *n) 
         return;
     }
     for (int i = 0; i < n->n_dims; i++) {
-        if (n->dims[i] == 0 && !n->has_lower_bound[i]) {
-            n->dims[i] = init.v.arr.dims[i];
+        if (n->dims[i] == 0) {
+            if (n->has_lower_bound[i]) {
+                int lower = n->lower_bounds[i];
+                if (n->lower_bound_exprs[i]) {
+                    OfortValue lv = eval_node(I, n->lower_bound_exprs[i]);
+                    lower = (int)val_to_int(lv);
+                    free_value(&lv);
+                }
+                n->dims[i] = lower + init.v.arr.dims[i] - 1;
+            } else {
+                n->dims[i] = init.v.arr.dims[i];
+            }
         }
     }
     free_value(&init);
