@@ -1,2 +1,0 @@
-write (*,fmt=*) "hello"
-end
