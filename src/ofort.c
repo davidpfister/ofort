@@ -1294,14 +1294,16 @@ static OfortFunc *register_func(OfortInterpreter *I, const char *name, OfortNode
     return f;
 }
 
-static void register_contained_procedures(OfortInterpreter *I, OfortNode *body) {
+static void register_contained_procedures(OfortInterpreter *I, OfortNode *body, const char *module_name) {
     if (!body || body->type != FND_BLOCK) return;
     for (int i = 0; i < body->n_stmts; i++) {
         OfortNode *s = body->stmts[i];
         if (s && (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION ||
                   s->type == FND_STMT_FUNCTION)) {
-            (void)register_func(I, s->name, s,
-                                s->type == FND_FUNCTION || s->type == FND_STMT_FUNCTION);
+            OfortFunc *func = register_func(I, s->name, s,
+                                            s->type == FND_FUNCTION || s->type == FND_STMT_FUNCTION);
+            if (module_name && module_name[0])
+                copy_cstr(func->module_name, sizeof(func->module_name), module_name);
         }
     }
 }
@@ -1403,6 +1405,58 @@ static void store_saved_vars(OfortFunc *func, OfortScope *scope) {
 }
 
 /* ── Type definition lookup ──────────────────── */
+static void copy_imported_var_attrs(OfortVar *dst, const OfortVar *src) {
+    if (!dst || !src) return;
+    dst->is_parameter = src->is_parameter;
+    dst->intent = src->intent;
+    dst->char_len = src->char_len;
+    dst->present = src->present;
+    dst->is_allocatable = src->is_allocatable;
+    dst->scalar_allocated = src->scalar_allocated;
+    dst->declared_type = src->declared_type;
+    dst->declared_kind = src->declared_kind;
+    copy_cstr(dst->declared_type_name, sizeof(dst->declared_type_name),
+              src->declared_type_name);
+    dst->is_pointer = src->is_pointer;
+    dst->is_target = src->is_target;
+    dst->is_protected = src->is_protected;
+    dst->is_save = src->is_save;
+    dst->is_implicit_save = src->is_implicit_save;
+    dst->is_alias = src->is_alias;
+    dst->pointer_associated = src->pointer_associated;
+    copy_cstr(dst->pointer_target, sizeof(dst->pointer_target), src->pointer_target);
+    dst->pointer_has_slice = src->pointer_has_slice;
+    dst->pointer_slice_start = src->pointer_slice_start;
+    dst->pointer_slice_end = src->pointer_slice_end;
+}
+
+static void copy_var_payload_and_attrs(OfortVar *dst, const OfortVar *src) {
+    if (!dst || !src) return;
+    if (!dst->is_alias) free_value(&dst->val);
+    dst->val = copy_value(src->val);
+    copy_imported_var_attrs(dst, src);
+}
+
+static void sync_module_vars_from_scope(OfortInterpreter *I, const char *module_name) {
+    if (!module_name || !module_name[0] || !I->current_scope) return;
+    OfortModule *mod = find_module(I, module_name);
+    if (!mod) return;
+    for (int i = 0; i < mod->n_vars; i++) {
+        OfortVar *local = find_var_in_current_scope(I, mod->vars[i].name);
+        if (local) copy_var_payload_and_attrs(&mod->vars[i], local);
+    }
+}
+
+static void sync_module_vars_to_scope(OfortInterpreter *I, const char *module_name) {
+    if (!module_name || !module_name[0] || !I->current_scope) return;
+    OfortModule *mod = find_module(I, module_name);
+    if (!mod) return;
+    for (int i = 0; i < mod->n_vars; i++) {
+        OfortVar *local = find_var_in_current_scope(I, mod->vars[i].name);
+        if (local) copy_var_payload_and_attrs(local, &mod->vars[i]);
+    }
+}
+
 static OfortTypeDef *find_type_def(OfortInterpreter *I, const char *name) {
     char upper[256];
     str_upper(upper, name, 256);
@@ -9844,7 +9898,8 @@ static OfortValue execute_user_function_with_args(OfortInterpreter *I, OfortFunc
     OfortModule *mod = find_module(I, func->module_name);
     if (mod) {
         for (int i = 0; i < mod->n_vars; i++) {
-            declare_var(I, mod->vars[i].name, copy_value(mod->vars[i].val));
+            OfortVar *mv = declare_var(I, mod->vars[i].name, copy_value(mod->vars[i].val));
+                    copy_imported_var_attrs(mv, &mod->vars[i]);
         }
     }
     for (int i = 0; i < fn->n_params; i++) {
@@ -10674,7 +10729,8 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             OfortModule *mod = find_module(I, func->module_name);
             if (mod) {
                 for (int i = 0; i < mod->n_vars; i++) {
-                    declare_var(I, mod->vars[i].name, copy_value(mod->vars[i].val));
+                    OfortVar *mv = declare_var(I, mod->vars[i].name, copy_value(mod->vars[i].val));
+                    copy_imported_var_attrs(mv, &mod->vars[i]);
                 }
             }
             /* Bind parameters */
@@ -10696,7 +10752,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
 
             /* Execute body */
             I->procedure_depth++;
-            register_contained_procedures(I, fn->children[0]);
+            register_contained_procedures(I, fn->children[0], func->module_name);
             exec_node(I, fn->children[0]);
             I->procedure_depth--;
             if (I->goto_active) {
@@ -10720,7 +10776,9 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             }
 
             store_saved_vars(func, I->current_scope);
+            sync_module_vars_from_scope(I, func->module_name);
             pop_scope(I);
+            sync_module_vars_to_scope(I, func->module_name);
 
             /* Write back OUT/INOUT args */
             for (int i = 0; i < fn->n_params && i < nargs; i++) {
@@ -11082,7 +11140,8 @@ static int execute_elemental_function_call(OfortInterpreter *I, OfortNode *call,
         OfortModule *mod = find_module(I, func->module_name);
         if (mod) {
             for (int i = 0; i < mod->n_vars; i++) {
-                declare_var(I, mod->vars[i].name, copy_value(mod->vars[i].val));
+                OfortVar *mv = declare_var(I, mod->vars[i].name, copy_value(mod->vars[i].val));
+                    copy_imported_var_attrs(mv, &mod->vars[i]);
             }
         }
         for (int i = 0; i < fn->n_params; i++) {
@@ -11104,7 +11163,7 @@ static int execute_elemental_function_call(OfortInterpreter *I, OfortNode *call,
         }
 
         I->procedure_depth++;
-        register_contained_procedures(I, fn->children[0]);
+        register_contained_procedures(I, fn->children[0], func->module_name);
         exec_node(I, fn->children[0]);
         I->procedure_depth--;
         if (I->goto_active) {
@@ -13074,7 +13133,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         for (int i = 0; i < mod->n_vars; i++) {
             if (!mod->var_public[i]) continue;
             OfortVar *v = declare_var(I, mod->vars[i].name, copy_value(mod->vars[i].val));
-            v->is_protected = mod->vars[i].is_protected;
+            copy_imported_var_attrs(v, &mod->vars[i]);
         }
         break;
     }
@@ -14870,7 +14929,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 OfortModule *mod = find_module(I, func->module_name);
                 if (mod) {
                     for (int i = 0; i < mod->n_vars; i++) {
-                        declare_var(I, mod->vars[i].name, copy_value(mod->vars[i].val));
+                        OfortVar *mv = declare_var(I, mod->vars[i].name, copy_value(mod->vars[i].val));
+                    copy_imported_var_attrs(mv, &mod->vars[i]);
                     }
                 }
             }
@@ -14956,7 +15016,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             OfortModule *mod = find_module(I, func->module_name);
             if (mod) {
                 for (int mi = 0; mi < mod->n_vars; mi++) {
-                    declare_var(I, mod->vars[mi].name, copy_value(mod->vars[mi].val));
+                    OfortVar *mv = declare_var(I, mod->vars[mi].name, copy_value(mod->vars[mi].val));
+                    copy_imported_var_attrs(mv, &mod->vars[mi]);
                 }
             }
         }
@@ -14978,6 +15039,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         restore_saved_vars(I, func);
 
         I->procedure_depth++;
+        register_contained_procedures(I, fn->children[0], func->module_name);
         exec_node(I, fn->children[0]);
         I->procedure_depth--;
         I->returning = 0;
@@ -14987,6 +15049,15 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (!arg_alias[i] && fn->param_intents[i] != 1) {
                 if (procedure_ref_name(&args[i])) continue;
                 OfortVar *pv = find_var(I, fn->param_names[i]);
+                if (pv && pv->present && n->stmts[i]->type == FND_FUNC_CALL) {
+                    for (int vi = 0; vi < I->current_scope->n_vars; vi++) {
+                        OfortVar *candidate = &I->current_scope->vars[vi];
+                        if (candidate->is_pointer && candidate->pointer_associated) {
+                            if (!candidate->is_alias) free_value(&candidate->val);
+                            candidate->val = copy_value(pv->val);
+                        }
+                    }
+                }
                 if (pv && pv->present &&
                     (n->stmts[i]->type == FND_IDENT || n->stmts[i]->type == FND_MEMBER)) {
                     free_value(&args[i]);
@@ -14996,7 +15067,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         }
 
         store_saved_vars(func, I->current_scope);
+        sync_module_vars_from_scope(I, func->module_name);
         pop_scope(I);
+        sync_module_vars_to_scope(I, func->module_name);
         for (int i = 0; i < fn->n_params && i < nargs; i++) {
             if (!arg_alias[i] && n->stmts[i]->type == FND_IDENT && fn->param_intents[i] != 1 &&
                 args[i].type != FVAL_VOID && !procedure_ref_name(&args[i])) {
