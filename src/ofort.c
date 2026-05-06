@@ -4887,6 +4887,97 @@ static OfortNode *parse_common_statement(OfortInterpreter *I) {
     return block;
 }
 
+static OfortNode *parse_dimension_statement(OfortInterpreter *I) {
+    OfortToken *dt = advance(I); /* DIMENSION */
+    OfortNode *block = alloc_node(I, FND_BLOCK);
+    int cap = 0;
+    block->line = dt->line;
+
+    if (check(I, FTOK_DCOLON)) advance(I);
+
+    while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
+        OfortToken *name;
+        OfortNode *decl;
+        int dim_cap = 0;
+        if (check(I, FTOK_COMMA)) {
+            advance(I);
+            continue;
+        }
+        if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+        name = advance(I);
+        decl = alloc_node(I, FND_VARDECL);
+        copy_cstr(decl->name, sizeof(decl->name), token_name_text(name));
+        decl->line = name->line;
+        decl->val_type = FVAL_VOID; /* apply dimensions to an existing declaration if present */
+
+        expect(I, FTOK_LPAREN);
+        while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+            int dim_index = decl->n_dims;
+            OfortNode *de = NULL;
+            if (decl->n_dims >= 7) ofort_error(I, "Too many DIMENSION dimensions");
+            if (check(I, FTOK_COLON) || check(I, FTOK_STAR)) {
+                advance(I);
+                decl->dims[decl->n_dims++] = 0;
+            } else {
+                int de_value = 0;
+                de = parse_dimension_bound_expr(I);
+                if (int_constant_node(de, &de_value))
+                    decl->dims[decl->n_dims++] = de_value;
+                else
+                    decl->dims[decl->n_dims++] = 0;
+                if (decl->n_stmts >= dim_cap) {
+                    dim_cap = dim_cap ? dim_cap * 2 : 4;
+                    decl->stmts = (OfortNode **)realloc(decl->stmts,
+                                                        sizeof(OfortNode *) * (size_t)dim_cap);
+                    if (!decl->stmts) ofort_error(I, "Out of memory parsing DIMENSION");
+                }
+                decl->stmts[decl->n_stmts++] = de;
+                if (check(I, FTOK_COLON)) {
+                    int lower_value = 0;
+                    advance(I);
+                    if (int_constant_node(de, &lower_value)) {
+                        decl->lower_bounds[dim_index] = lower_value;
+                    } else {
+                        decl->lower_bounds[dim_index] = 1;
+                        decl->lower_bound_exprs[dim_index] = de;
+                    }
+                    decl->has_lower_bound[dim_index] = 1;
+                    if (check(I, FTOK_STAR)) {
+                        advance(I);
+                        decl->dims[dim_index] = 0;
+                    } else if (check(I, FTOK_RPAREN) || check(I, FTOK_COMMA)) {
+                        decl->dims[dim_index] = 0;
+                    } else {
+                        OfortNode *hi = parse_expr(I);
+                        int hi_value = 0;
+                        if (int_constant_node(hi, &hi_value)) {
+                            decl->dims[dim_index] = hi_value;
+                        } else if (dim_index < decl->n_stmts) {
+                            decl->stmts[dim_index] = hi;
+                            decl->dims[dim_index] = 0;
+                        }
+                    }
+                }
+            }
+            if (check(I, FTOK_COMMA)) advance(I);
+            else break;
+        }
+        expect(I, FTOK_RPAREN);
+
+        if (block->n_stmts >= cap) {
+            cap = cap ? cap * 2 : 4;
+            block->stmts = (OfortNode **)realloc(block->stmts,
+                                                 sizeof(OfortNode *) * (size_t)cap);
+            if (!block->stmts) ofort_error(I, "Out of memory parsing DIMENSION");
+        }
+        block->stmts[block->n_stmts++] = decl;
+        if (check(I, FTOK_COMMA)) advance(I);
+        else break;
+    }
+
+    return block;
+}
+
 static OfortNode *parse_bind_statement(OfortInterpreter *I) {
     OfortToken *bt = advance(I); /* BIND */
     OfortNode *n = alloc_node(I, FND_CONTINUE);
@@ -6330,6 +6421,10 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     /* Generic INTERFACE blocks are skipped for now. */
     if (token_ident_upper(t, "INTERFACE")) {
         return parse_interface_block(I);
+    }
+
+    if (t->type == FTOK_DIMENSION) {
+        return parse_dimension_statement(I);
     }
 
     /* Standalone PARAMETER statement: PARAMETER (name = expr, ...) */
@@ -12765,6 +12860,59 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         int decl_char_len = n->val_type == FVAL_CHARACTER ? eval_character_length(I, n) : 0;
         OfortVar *existing = find_var(I, n->name);
         OfortVar *existing_current = find_var_in_current_scope(I, n->name);
+        if (n->val_type == FVAL_VOID && n->n_dims > 0) {
+            if (existing && existing == existing_current) {
+                int has_assumed_shape = 0;
+                OfortValType elem_type = existing->declared_type;
+                if (existing->val.type == FVAL_ARRAY) elem_type = existing->val.v.arr.elem_type;
+                if (elem_type == FVAL_VOID) elem_type = existing->val.type;
+                if (elem_type == FVAL_VOID) {
+                    int has_type = 0;
+                    elem_type = implicit_type_for_name(I, n->name, &has_type);
+                    if (!has_type) elem_type = FVAL_REAL;
+                }
+                n->val_type = elem_type;
+                n->kind = existing->declared_kind;
+                if (existing->declared_type_name[0])
+                    copy_cstr(n->str_val, sizeof(n->str_val), existing->declared_type_name);
+                for (int i = 0; i < n->n_dims; i++) {
+                    if (n->dims[i] == 0) { has_assumed_shape = 1; break; }
+                }
+                existing->declared_type = elem_type;
+                existing->declared_kind = n->kind;
+                if (n->str_val[0])
+                    copy_cstr(existing->declared_type_name,
+                              sizeof(existing->declared_type_name), n->str_val);
+                if (existing->is_allocatable || existing->is_pointer || has_assumed_shape) {
+                    if (existing->val.type != FVAL_ARRAY) {
+                        free_value(&existing->val);
+                        existing->val.type = FVAL_ARRAY;
+                        memset(&existing->val.v.arr, 0, sizeof(existing->val.v.arr));
+                    }
+                    existing->val.v.arr.elem_type = elem_type;
+                    if (n->str_val[0])
+                        copy_cstr(existing->val.v.arr.elem_type_name,
+                                  sizeof(existing->val.v.arr.elem_type_name), n->str_val);
+                    existing->val.v.arr.n_dims = n->n_dims;
+                    for (int i = 0; i < n->n_dims && i < 7; i++) {
+                        existing->val.v.arr.dims[i] = 0;
+                        existing->val.v.arr.lower_bounds[i] =
+                            n->has_lower_bound[i] ? n->lower_bounds[i] : 1;
+                    }
+                    existing->val.v.arr.allocated = 0;
+                } else {
+                    OfortValue arr = make_array_from_decl(I, n);
+                    free_value(&existing->val);
+                    existing->val = arr;
+                }
+                break;
+            } else {
+                int has_type = 0;
+                n->val_type = implicit_type_for_name(I, n->name, &has_type);
+                if (!has_type) n->val_type = FVAL_REAL;
+                decl_char_len = n->val_type == FVAL_CHARACTER ? eval_character_length(I, n) : 0;
+            }
+        }
         if (existing && existing == existing_current &&
             existing->val.type == FVAL_ARRAY && n->n_dims > 0) {
             for (int i = 0; i < n->n_dims && i < existing->val.v.arr.n_dims && i < 7; i++) {
