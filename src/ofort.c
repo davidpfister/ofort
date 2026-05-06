@@ -5180,6 +5180,48 @@ static OfortNode *parse_common_statement(OfortInterpreter *I) {
     return block;
 }
 
+static OfortNode *parse_save_statement(OfortInterpreter *I) {
+    OfortToken *st = advance(I); /* SAVE */
+    OfortNode *block = alloc_node(I, FND_BLOCK);
+    int cap = 0;
+    block->line = st->line;
+
+    while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
+        if (check(I, FTOK_COMMA)) {
+            advance(I);
+            continue;
+        }
+        if (check(I, FTOK_SLASH)) {
+            advance(I);
+            while (!check(I, FTOK_SLASH) && !check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
+                advance(I);
+            }
+            if (check(I, FTOK_SLASH)) advance(I);
+            continue;
+        }
+        if (token_can_be_name(peek(I))) {
+            OfortToken *name = advance(I);
+            OfortNode *decl = alloc_node(I, FND_VARDECL);
+            int has_type = 0;
+            OfortValType type;
+            copy_cstr(decl->name, sizeof(decl->name), token_name_text(name));
+            type = implicit_type_for_name(I, decl->name, &has_type);
+            decl->val_type = has_type ? type : FVAL_REAL;
+            decl->is_save = 1;
+            decl->line = name->line;
+            if (block->n_stmts >= cap) {
+                cap = cap ? cap * 2 : 4;
+                block->stmts = (OfortNode **)realloc(block->stmts, sizeof(OfortNode *) * (size_t)cap);
+                if (!block->stmts) ofort_error(I, "Out of memory parsing SAVE");
+            }
+            block->stmts[block->n_stmts++] = decl;
+            continue;
+        }
+        advance(I);
+    }
+    return block;
+}
+
 static OfortNode *parse_dimension_statement(OfortInterpreter *I) {
     OfortToken *dt = advance(I); /* DIMENSION */
     OfortNode *block = alloc_node(I, FND_BLOCK);
@@ -7222,6 +7264,10 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     /* DATA statement: DATA var /value/ — simplified */
     if (t->type == FTOK_DATA && data_statement_follows(I)) {
         return parse_data_statement(I);
+    }
+
+    if (t->type == FTOK_SAVE) {
+        return parse_save_statement(I);
     }
 
 expression_statement:
