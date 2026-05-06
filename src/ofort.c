@@ -2828,6 +2828,7 @@ static OfortNode *parse_procedure_declaration(OfortInterpreter *I) {
     OfortToken *pt = advance(I); /* PROCEDURE */
     OfortNode *block = alloc_node(I, FND_BLOCK);
     int cap = 0;
+    int is_pointer = 0;
     block->line = pt->line;
 
     if (check(I, FTOK_LPAREN)) {
@@ -2838,6 +2839,9 @@ static OfortNode *parse_procedure_declaration(OfortInterpreter *I) {
         if (check(I, FTOK_INTENT)) {
             advance(I);
             if (check(I, FTOK_LPAREN)) skip_balanced_parens(I);
+        } else if (token_ident_upper(peek(I), "POINTER")) {
+            advance(I);
+            is_pointer = 1;
         } else {
             advance(I);
         }
@@ -2856,6 +2860,7 @@ static OfortNode *parse_procedure_declaration(OfortInterpreter *I) {
             copy_cstr(decl->name, sizeof(decl->name), token_name_text(name_tok));
             decl->val_type = FVAL_CHARACTER;
             decl->char_len = 256;
+            decl->is_pointer = is_pointer;
             decl->line = name_tok->line;
             if (make_procedure_ref_text(token_name_text(name_tok), proc_ref, sizeof(proc_ref))) {
                 OfortNode *init = alloc_node(I, FND_STRING_LIT);
@@ -3678,6 +3683,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
     int is_implicit_save = 0;
     int is_parameter = 0;
     int is_optional = 0;
+    int is_external = 0;
     int intent = 0;
     int decl_dims[7] = {0};
     int decl_lower_bounds[7] = {0};
@@ -3885,6 +3891,9 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
         } else if (check(I, FTOK_IDENT) && str_eq_nocase(peek(I)->str_val, "optional")) {
             advance(I);
             is_optional = 1;
+        } else if (check(I, FTOK_IDENT) && str_eq_nocase(peek(I)->str_val, "external")) {
+            advance(I);
+            is_external = 1;
         } else if (check(I, FTOK_INTENT)) {
             advance(I);
             expect(I, FTOK_LPAREN);
@@ -3938,6 +3947,18 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
         decl->is_optional = is_optional;
         decl->intent = intent;
         decl->line = name_tok->line;
+        if (is_external) {
+            char proc_ref[OFORT_MAX_STRLEN];
+            decl->val_type = FVAL_CHARACTER;
+            decl->char_len = 256;
+            if (make_procedure_ref_text(token_name_text(name_tok), proc_ref, sizeof(proc_ref))) {
+                OfortNode *init = alloc_node(I, FND_STRING_LIT);
+                copy_cstr(init->str_val, sizeof(init->str_val), proc_ref);
+                init->line = name_tok->line;
+                decl->children[0] = init;
+                decl->n_children = 1;
+            }
+        }
         memcpy(decl->dims, decl_dims, sizeof(decl_dims));
         memcpy(decl->lower_bounds, decl_lower_bounds, sizeof(decl_lower_bounds));
         memcpy(decl->has_lower_bound, decl_has_lower_bound, sizeof(decl_has_lower_bound));
@@ -5423,6 +5444,40 @@ static OfortNode *parse_intent_statement(OfortInterpreter *I) {
         }
     }
     return block;
+}
+
+static OfortNode *parse_attribute_name_list_statement(OfortInterpreter *I) {
+    OfortToken *et = advance(I); /* attribute keyword */
+    int create_decl = token_ident_upper(et, "TARGET");
+    OfortNode *n = alloc_node(I, create_decl ? FND_BLOCK : FND_CONTINUE);
+    int cap = 0;
+    n->line = et->line;
+
+    if (check(I, FTOK_DCOLON)) advance(I);
+    while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
+        if (check(I, FTOK_COMMA)) {
+            advance(I);
+            continue;
+        }
+        if (create_decl && token_can_be_name(peek(I))) {
+            int has_type = 0;
+            OfortToken *name = advance(I);
+            OfortNode *decl = alloc_node(I, FND_VARDECL);
+            copy_cstr(decl->name, sizeof(decl->name), token_name_text(name));
+            decl->line = name->line;
+            decl->val_type = implicit_type_for_name(I, decl->name, &has_type);
+            if (!has_type) decl->val_type = FVAL_REAL;
+            if (n->n_stmts >= cap) {
+                cap = cap ? cap * 2 : 4;
+                n->stmts = (OfortNode **)realloc(n->stmts, sizeof(OfortNode *) * (size_t)cap);
+                if (!n->stmts) ofort_error(I, "Out of memory parsing attribute statement");
+            }
+            n->stmts[n->n_stmts++] = decl;
+        } else {
+            advance(I);
+        }
+    }
+    return n;
 }
 
 static OfortNode *parse_bind_statement(OfortInterpreter *I) {
@@ -7064,7 +7119,12 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         return parse_intent_statement(I);
     }
 
-    if (token_ident_upper(t, "POINTER") && token_can_be_name(peek_ahead(I, 1))) {
+    if (token_ident_upper(t, "EXTERNAL") || token_ident_upper(t, "TARGET")) {
+        return parse_attribute_name_list_statement(I);
+    }
+
+    if (token_ident_upper(t, "POINTER") &&
+        (token_can_be_name(peek_ahead(I, 1)) || peek_ahead(I, 1)->type == FTOK_DCOLON)) {
         return parse_pointer_statement(I);
     }
 
