@@ -3260,6 +3260,30 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
         return parse_primary(I);
     }
     /* identifier — could be variable, function call, or array ref */
+    /* BOZ literal constants: B'1010', O'17', Z'ff'. The lexer leaves these
+       as an identifier prefix followed by a string literal. */
+    if (t->type == FTOK_IDENT && peek_ahead(I, 1)->type == FTOK_STRING_LIT &&
+        t->str_val[1] == '\0' &&
+        (t->str_val[0] == 'B' || t->str_val[0] == 'b' ||
+         t->str_val[0] == 'O' || t->str_val[0] == 'o' ||
+         t->str_val[0] == 'Z' || t->str_val[0] == 'z')) {
+        int base = (t->str_val[0] == 'B' || t->str_val[0] == 'b') ? 2 :
+                   ((t->str_val[0] == 'O' || t->str_val[0] == 'o') ? 8 : 16);
+        OfortToken *digits = peek_ahead(I, 1);
+        unsigned long long raw = strtoull(digits->str_val, NULL, base);
+        long long signed_value = (long long)raw;
+        advance(I);
+        advance(I);
+        if (raw > 2147483647ULL && raw <= 4294967295ULL) {
+            signed_value = (long long)raw - 4294967296LL;
+        }
+        OfortNode *n = alloc_node(I, FND_INT_LIT);
+        n->int_val = signed_value;
+        n->num_val = (double)signed_value;
+        n->kind = 4;
+        n->line = t->line;
+        return n;
+    }
     if (type_token_intrinsic_name(t->type) && peek_ahead(I, 1)->type == FTOK_LPAREN) {
         const char *intrinsic_name = type_token_intrinsic_name(t->type);
         advance(I);
@@ -7119,7 +7143,8 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         return parse_intent_statement(I);
     }
 
-    if (token_ident_upper(t, "EXTERNAL") || token_ident_upper(t, "TARGET")) {
+    if (token_ident_upper(t, "EXTERNAL") || token_ident_upper(t, "INTRINSIC") ||
+        token_ident_upper(t, "TARGET")) {
         return parse_attribute_name_list_statement(I);
     }
 
