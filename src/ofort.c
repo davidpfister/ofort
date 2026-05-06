@@ -4551,6 +4551,21 @@ static OfortNode *parse_data_value_list(OfortInterpreter *I) {
     return list;
 }
 
+static int data_statement_follows(OfortInterpreter *I) {
+    int depth = 0;
+    if (!check(I, FTOK_DATA)) return 0;
+    if (peek_ahead(I, 1)->type == FTOK_ASSIGN) return 0;
+    for (int pos = I->tok_pos + 1; pos < I->n_tokens; pos++) {
+        OfortTokenType type = I->tokens[pos].type;
+        if (type == FTOK_NEWLINE || type == FTOK_EOF) return 0;
+        if (type == FTOK_LPAREN) depth++;
+        else if (type == FTOK_RPAREN && depth > 0) depth--;
+        else if (type == FTOK_SLASH) return 1;
+        else if (type == FTOK_ASSIGN && depth == 0) return 0;
+    }
+    return 0;
+}
+
 static OfortNode *parse_data_statement(OfortInterpreter *I) {
     OfortToken *data_tok = advance(I);
     OfortNode *stmt = alloc_node(I, FND_DATA);
@@ -7033,8 +7048,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     }
 
     /* DATA statement: DATA var /value/ — simplified */
-    if (t->type == FTOK_DATA && peek_ahead(I, 1)->type != FTOK_ASSIGN &&
-        peek_ahead(I, 1)->type != FTOK_LPAREN) {
+    if (t->type == FTOK_DATA && data_statement_follows(I)) {
         return parse_data_statement(I);
     }
 
