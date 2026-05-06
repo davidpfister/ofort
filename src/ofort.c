@@ -94,6 +94,7 @@ typedef struct {
     int field_dims[OFORT_MAX_FIELDS][7];
     OfortNode *field_dim_exprs[OFORT_MAX_FIELDS][7];
     int field_n_dims[OFORT_MAX_FIELDS];
+    int field_is_pointer[OFORT_MAX_FIELDS];
     int n_fields;
     char type_param_names[OFORT_MAX_PARAMS][64];
     int n_type_params;
@@ -5739,12 +5740,69 @@ static OfortNode *parse_allocate(OfortInterpreter *I) {
             int has_type_spec = 0;
             OfortValType parsed_type = FVAL_VOID;
             n->val_type = FVAL_VOID;
-            if (is_type_keyword(peek(I)->type) ||
+            if ((check(I, FTOK_TYPE) || (check(I, FTOK_IDENT) && check_ident_upper(I, "CLASS"))) &&
+                peek_ahead(I, 1)->type == FTOK_LPAREN) {
+                advance(I); /* TYPE or CLASS */
+                advance(I); /* ( */
+                if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+                OfortToken *type_name = advance(I);
+                copy_cstr(n->str_val, sizeof(n->str_val), token_name_text(type_name));
+                if (check(I, FTOK_LPAREN)) {
+                    advance(I);
+                    while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+                        if (n->n_type_param_exprs >= OFORT_MAX_PARAMS)
+                            too_many_params_error(I, "ALLOCATE type parameters");
+                        n->type_param_exprs[n->n_type_param_exprs++] = parse_expr(I);
+                        if (check(I, FTOK_COMMA)) advance(I);
+                        else break;
+                    }
+                    expect(I, FTOK_RPAREN);
+                }
+                expect(I, FTOK_RPAREN);
+                parsed_type = FVAL_DERIVED;
+                n->val_type = parsed_type;
+                has_type_spec = 1;
+                expect(I, FTOK_DCOLON);
+            } else if (token_can_be_name(peek(I)) && !is_type_keyword(peek(I)->type)) {
+                int pos = I->tok_pos + 1;
+                int depth = 0;
+                int has_derived_type_spec = 0;
+                if (I->tokens[pos].type == FTOK_LPAREN) {
+                    depth = 1;
+                    pos++;
+                    while (pos < I->n_tokens && depth > 0) {
+                        if (I->tokens[pos].type == FTOK_LPAREN) depth++;
+                        else if (I->tokens[pos].type == FTOK_RPAREN) depth--;
+                        pos++;
+                    }
+                }
+                has_derived_type_spec = I->tokens[pos].type == FTOK_DCOLON;
+                if (has_derived_type_spec) {
+                    OfortToken *type_name = advance(I);
+                    copy_cstr(n->str_val, sizeof(n->str_val), token_name_text(type_name));
+                    if (check(I, FTOK_LPAREN)) {
+                        advance(I);
+                        while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+                            if (n->n_type_param_exprs >= OFORT_MAX_PARAMS)
+                                too_many_params_error(I, "ALLOCATE type parameters");
+                            n->type_param_exprs[n->n_type_param_exprs++] = parse_expr(I);
+                            if (check(I, FTOK_COMMA)) advance(I);
+                            else break;
+                        }
+                        expect(I, FTOK_RPAREN);
+                    }
+                    parsed_type = FVAL_DERIVED;
+                    n->val_type = parsed_type;
+                    has_type_spec = 1;
+                    expect(I, FTOK_DCOLON);
+                }
+            }
+            if (!has_type_spec && (is_type_keyword(peek(I)->type) ||
                 (peek(I)->type == FTOK_IDENT &&
                  (check_ident_upper(I, "INTEGER") || check_ident_upper(I, "REAL") ||
                   check_ident_upper(I, "DOUBLE") || check_ident_upper(I, "CHARACTER") ||
                   check_ident_upper(I, "LOGICAL") || check_ident_upper(I, "COMPLEX") ||
-                  check_ident_upper(I, "PRECISION")))) {
+                  check_ident_upper(I, "PRECISION"))))) {
                 if (is_type_keyword(peek(I)->type)) {
                     parsed_type = token_to_valtype(advance(I)->type);
                 } else {
@@ -5853,11 +5911,12 @@ static OfortNode *parse_allocate(OfortInterpreter *I) {
                 n->char_len_expr = len_expr;
                 if (has_type_spec) expect(I, FTOK_DCOLON);
             }
-            OfortToken *name = expect(I, FTOK_IDENT);
+            if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+            OfortToken *name = advance(I);
             OfortNode *target = alloc_node(I, FND_IDENT);
             n->line = name->line;
-            copy_cstr(n->name, sizeof(n->name), name->str_val);
-            copy_cstr(target->name, sizeof(target->name), name->str_val);
+            copy_cstr(n->name, sizeof(n->name), token_name_text(name));
+            copy_cstr(target->name, sizeof(target->name), token_name_text(name));
             target->line = name->line;
             target = parse_component_target_postfix(I, target);
             if (target->type != FND_IDENT) n->children[OFORT_ALLOC_TARGET_CHILD] = target;
@@ -6937,7 +6996,9 @@ static OfortValue default_derived_value(OfortInterpreter *I, const char *type_na
             }
         }
         copy_cstr(v.v.dt.field_names[i], sizeof(v.v.dt.field_names[i]), td->field_names[i]);
-        if (td->field_n_dims[i] > 0) {
+        if (td->field_is_pointer[i] && field_type == FVAL_DERIVED) {
+            v.v.dt.fields[i] = make_void_val();
+        } else if (td->field_n_dims[i] > 0) {
             if (field_type == FVAL_DERIVED && td->field_type_names[i][0]) {
                 v.v.dt.fields[i] = make_derived_array(I, td->field_type_names[i],
                                                        field_dims, td->field_n_dims[i]);
@@ -12772,6 +12833,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         td->field_init_exprs[td->n_fields] =
                             (d->n_children > 0 && d->children[0]) ? d->children[0] : NULL;
                         td->field_n_dims[td->n_fields] = d->n_dims;
+                        td->field_is_pointer[td->n_fields] = d->is_pointer;
                         memcpy(td->field_dims[td->n_fields], d->dims, sizeof(td->field_dims[td->n_fields]));
                         for (int fd = 0; fd < d->n_dims && fd < 7 && fd < d->n_stmts; fd++) {
                             td->field_dim_exprs[td->n_fields][fd] = d->stmts ? d->stmts[fd] : NULL;
@@ -12817,6 +12879,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 td->field_init_exprs[td->n_fields] =
                     (s->n_children > 0 && s->children[0]) ? s->children[0] : NULL;
                 td->field_n_dims[td->n_fields] = s->n_dims;
+                td->field_is_pointer[td->n_fields] = s->is_pointer;
                 memcpy(td->field_dims[td->n_fields], s->dims, sizeof(td->field_dims[td->n_fields]));
                 for (int fd = 0; fd < s->n_dims && fd < 7 && fd < s->n_stmts; fd++) {
                     td->field_dim_exprs[td->n_fields][fd] = s->stmts ? s->stmts[fd] : NULL;
@@ -14727,6 +14790,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 copy_cstr(elem_type_name, sizeof(elem_type_name), target->v.arr.elem_type_name);
             else if (target->type == FVAL_DERIVED)
                 copy_cstr(elem_type_name, sizeof(elem_type_name), target->v.dt.type_name);
+            if (n->val_type == FVAL_DERIVED && n->str_val[0])
+                copy_cstr(elem_type_name, sizeof(elem_type_name), n->str_val);
             for (int i = 0; i < 7; i++) lower_bounds[i] = 1;
 
             if (ndims > 0) {
@@ -14781,16 +14846,19 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 *target = copy_value(source);
                 free_value(&source);
             } else {
-                if (target->type == FVAL_VOID)
-                    ofort_error(I, "ALLOCATE component target has no declared type");
                 OfortValType target_type = n->val_type != FVAL_VOID ? n->val_type : target->type;
+                if (target->type == FVAL_VOID && target_type != FVAL_DERIVED)
+                    ofort_error(I, "ALLOCATE component target has no declared type");
                 int char_len = 1;
                 if (target_type == FVAL_CHARACTER) {
                     if (n->val_type == FVAL_CHARACTER) char_len = alloc_char_len;
                     else char_len = target->type == FVAL_CHARACTER && target->v.s ? (int)strlen(target->v.s) : 1;
                 }
                 free_value(target);
-                *target = default_value(target_type, char_len);
+                if (target_type == FVAL_DERIVED && elem_type_name[0])
+                    *target = default_derived_value(I, elem_type_name);
+                else
+                    *target = default_value(target_type, char_len);
             }
             break;
         }
@@ -14830,6 +14898,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             copy_cstr(elem_type_name, sizeof(elem_type_name), var->val.v.arr.elem_type_name);
         else if (var->val.type == FVAL_DERIVED)
             copy_cstr(elem_type_name, sizeof(elem_type_name), var->val.v.dt.type_name);
+        if (explicit_type == FVAL_DERIVED && n->str_val[0])
+            copy_cstr(elem_type_name, sizeof(elem_type_name), n->str_val);
 
         for (int i = 0; i < 7; i++) lower_bounds[i] = 1;
         if (ndims == 0 && var->is_allocatable && var->val.type != FVAL_ARRAY) {
