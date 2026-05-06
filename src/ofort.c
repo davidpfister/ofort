@@ -3811,7 +3811,11 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
             expect(I, FTOK_LPAREN);
             /* parse dimension spec */
             while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
-                if (check(I, FTOK_COLON)) {
+                if (check(I, FTOK_USER_OP) && strcmp(peek(I)->str_val, "..") == 0) {
+                    advance(I);
+                    n_decl_dims = -1; /* assumed-rank dummy */
+                    break;
+                } else if (check(I, FTOK_COLON)) {
                     /* allocatable dimension (:) */
                     advance(I);
                     decl_dims[n_decl_dims++] = 0; /* unknown size */
@@ -5261,7 +5265,11 @@ static OfortNode *parse_dimension_statement(OfortInterpreter *I) {
             int dim_index = decl->n_dims;
             OfortNode *de = NULL;
             if (decl->n_dims >= 7) ofort_error(I, "Too many DIMENSION dimensions");
-            if (check(I, FTOK_COLON) || check(I, FTOK_STAR)) {
+            if (check(I, FTOK_USER_OP) && strcmp(peek(I)->str_val, "..") == 0) {
+                advance(I);
+                decl->n_dims = -1; /* assumed-rank dummy */
+                break;
+            } else if (check(I, FTOK_COLON) || check(I, FTOK_STAR)) {
                 advance(I);
                 decl->dims[decl->n_dims++] = 0;
             } else {
