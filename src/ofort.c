@@ -5578,6 +5578,9 @@ static OfortNode *parse_subroutine(OfortInterpreter *I) {
         advance(I);
         while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
             if (n->n_params >= OFORT_MAX_PARAMS) too_many_params_error(I, "subroutine parameters");
+            if (check(I, FTOK_STAR)) {
+                ofort_error(I, "alternate returns are obsolescent and are not supported");
+            }
             if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
             OfortToken *param = advance(I);
             copy_cstr(n->param_names[n->n_params], sizeof(n->param_names[n->n_params]), token_name_text(param));

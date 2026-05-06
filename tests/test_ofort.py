@@ -58,6 +58,7 @@ def case_files():
             "xsave.f90",
             "xentry_obsolescent.f90",
             "xalternate_return_obsolescent.f90",
+            "xalternate_return_dummy_obsolescent.f90",
             "xallocate_already_allocated.f90",
         }
     )
@@ -96,6 +97,21 @@ def test_entry_statement_is_reported_obsolescent():
 
 def test_alternate_return_is_reported_obsolescent():
     source = CASES / "xalternate_return_obsolescent.f90"
+    result = subprocess.run(
+        [str(OFORT), str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode != 0
+    expected = source.with_suffix(".out").read_text(encoding="utf-8").strip()
+    assert expected in result.stderr
+
+
+def test_alternate_return_dummy_is_reported_obsolescent():
+    source = CASES / "xalternate_return_dummy_obsolescent.f90"
     result = subprocess.run(
         [str(OFORT), str(source)],
         cwd=ROOT,
