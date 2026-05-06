@@ -5364,6 +5364,56 @@ static OfortNode *parse_pointer_statement(OfortInterpreter *I) {
     return block;
 }
 
+static OfortNode *parse_intent_statement(OfortInterpreter *I) {
+    OfortToken *it = advance(I); /* INTENT */
+    OfortNode *block = alloc_node(I, FND_BLOCK);
+    int cap = 0;
+    int intent = 0;
+    block->line = it->line;
+
+    expect(I, FTOK_LPAREN);
+    if (check(I, FTOK_IN)) {
+        advance(I);
+        intent = 1;
+        if (check(I, FTOK_OUT)) {
+            advance(I);
+            intent = 3;
+        }
+    } else if (check(I, FTOK_OUT)) {
+        advance(I);
+        intent = 2;
+    } else if (check(I, FTOK_INOUT)) {
+        advance(I);
+        intent = 3;
+    }
+    expect(I, FTOK_RPAREN);
+    if (check(I, FTOK_DCOLON)) advance(I);
+
+    while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
+        if (check(I, FTOK_COMMA)) {
+            advance(I);
+            continue;
+        }
+        if (token_can_be_name(peek(I))) {
+            OfortToken *name = advance(I);
+            OfortNode *decl = alloc_node(I, FND_VARDECL);
+            copy_cstr(decl->name, sizeof(decl->name), token_name_text(name));
+            decl->val_type = FVAL_VOID;
+            decl->intent = intent;
+            decl->line = name->line;
+            if (block->n_stmts >= cap) {
+                cap = cap ? cap * 2 : 4;
+                block->stmts = (OfortNode **)realloc(block->stmts, sizeof(OfortNode *) * (size_t)cap);
+                if (!block->stmts) ofort_error(I, "Out of memory parsing INTENT");
+            }
+            block->stmts[block->n_stmts++] = decl;
+        } else {
+            advance(I);
+        }
+    }
+    return block;
+}
+
 static OfortNode *parse_bind_statement(OfortInterpreter *I) {
     OfortToken *bt = advance(I); /* BIND */
     OfortNode *n = alloc_node(I, FND_CONTINUE);
@@ -6997,6 +7047,10 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
 
     if (t->type == FTOK_DIMENSION) {
         return parse_dimension_statement(I);
+    }
+
+    if (t->type == FTOK_INTENT) {
+        return parse_intent_statement(I);
     }
 
     if (token_ident_upper(t, "POINTER") && token_can_be_name(peek_ahead(I, 1))) {
