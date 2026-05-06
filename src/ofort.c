@@ -5385,9 +5385,10 @@ static OfortNode *parse_associate_construct(OfortInterpreter *I) {
     n->line = at->line;
     expect(I, FTOK_LPAREN);
     while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
-        OfortToken *name = expect(I, FTOK_IDENT);
+        if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+        OfortToken *name = advance(I);
         if (n->n_params >= OFORT_MAX_PARAMS) too_many_params_error(I, "associate names");
-        copy_cstr(n->param_names[n->n_params++], sizeof(n->param_names[0]), name->str_val);
+        copy_cstr(n->param_names[n->n_params++], sizeof(n->param_names[0]), token_name_text(name));
         expect(I, FTOK_POINTER_ASSIGN);
         if (n->n_stmts >= cap) {
             cap = cap ? cap * 2 : 4;
@@ -6891,9 +6892,10 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
             if (check(I, FTOK_DCOLON)) break;
         }
         if (check(I, FTOK_DCOLON)) advance(I);
-        OfortToken *mn = expect(I, FTOK_IDENT);
+        if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+        OfortToken *mn = advance(I);
         OfortNode *n = alloc_node(I, FND_USE);
-        copy_cstr(n->name, sizeof(n->name), mn->str_val);
+        copy_cstr(n->name, sizeof(n->name), token_name_text(mn));
         n->line = t->line;
         while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
             if (check(I, FTOK_COMMA)) {
