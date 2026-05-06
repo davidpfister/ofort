@@ -1294,6 +1294,18 @@ static OfortFunc *register_func(OfortInterpreter *I, const char *name, OfortNode
     return f;
 }
 
+static void register_contained_procedures(OfortInterpreter *I, OfortNode *body) {
+    if (!body || body->type != FND_BLOCK) return;
+    for (int i = 0; i < body->n_stmts; i++) {
+        OfortNode *s = body->stmts[i];
+        if (s && (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION ||
+                  s->type == FND_STMT_FUNCTION)) {
+            (void)register_func(I, s->name, s,
+                                s->type == FND_FUNCTION || s->type == FND_STMT_FUNCTION);
+        }
+    }
+}
+
 static void remember_module_proc_spec(OfortInterpreter *I, OfortNode *node) {
     if (!node || (node->type != FND_FUNCTION && node->type != FND_SUBROUTINE)) return;
     for (int i = 0; i < I->n_module_proc_specs; i++) {
@@ -5136,6 +5148,49 @@ static OfortNode *parse_dimension_statement(OfortInterpreter *I) {
     return block;
 }
 
+static OfortNode *parse_pointer_statement(OfortInterpreter *I) {
+    OfortToken *pt = advance(I); /* POINTER */
+    OfortNode *block = alloc_node(I, FND_BLOCK);
+    int cap = 0;
+    block->line = pt->line;
+
+    if (check(I, FTOK_DCOLON)) advance(I);
+
+    while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
+        OfortToken *name;
+        OfortNode *decl;
+        int has_type = 0;
+        if (check(I, FTOK_COMMA)) {
+            advance(I);
+            continue;
+        }
+        if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+        name = advance(I);
+        decl = alloc_node(I, FND_VARDECL);
+        copy_cstr(decl->name, sizeof(decl->name), token_name_text(name));
+        decl->line = name->line;
+        decl->val_type = implicit_type_for_name(I, decl->name, &has_type);
+        if (!has_type) decl->val_type = FVAL_REAL;
+        decl->is_pointer = 1;
+
+        if (check(I, FTOK_LPAREN)) {
+            skip_balanced_parens(I);
+        }
+
+        if (block->n_stmts >= cap) {
+            cap = cap ? cap * 2 : 4;
+            block->stmts = (OfortNode **)realloc(block->stmts,
+                                                 sizeof(OfortNode *) * (size_t)cap);
+            if (!block->stmts) ofort_error(I, "Out of memory parsing POINTER");
+        }
+        block->stmts[block->n_stmts++] = decl;
+        if (check(I, FTOK_COMMA)) advance(I);
+        else break;
+    }
+
+    return block;
+}
+
 static OfortNode *parse_bind_statement(OfortInterpreter *I) {
     OfortToken *bt = advance(I); /* BIND */
     OfortNode *n = alloc_node(I, FND_CONTINUE);
@@ -6700,6 +6755,10 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         return parse_dimension_statement(I);
     }
 
+    if (token_ident_upper(t, "POINTER") && token_can_be_name(peek_ahead(I, 1))) {
+        return parse_pointer_statement(I);
+    }
+
     /* Standalone PARAMETER statement: PARAMETER (name = expr, ...) */
     if (t->type == FTOK_PARAMETER) {
         OfortToken *pt = advance(I);
@@ -6766,6 +6825,19 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
             return parse_type_def(I);
         }
         if (next->type == FTOK_LPAREN) {
+            int pos = I->tok_pos + 2;
+            int depth = 1;
+            while (pos < I->n_tokens && depth > 0) {
+                if (I->tokens[pos].type == FTOK_LPAREN) depth++;
+                else if (I->tokens[pos].type == FTOK_RPAREN) depth--;
+                pos++;
+            }
+            if (pos < I->n_tokens &&
+                (I->tokens[pos].type == FTOK_ASSIGN ||
+                 I->tokens[pos].type == FTOK_POINTER_ASSIGN ||
+                 I->tokens[pos].type == FTOK_PERCENT)) {
+                goto expression_statement;
+            }
             if (normalize_intrinsic_type_wrapper_declaration(I)) {
                 return parse_declaration(I);
             }
@@ -6966,6 +7038,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         return parse_data_statement(I);
     }
 
+expression_statement:
     /* Expression statement or assignment: ident = expr, ident(args) = expr, or bare expr */
     if (token_can_be_name(t) ||
         t->type == FTOK_INT_LIT || t->type == FTOK_REAL_LIT ||
@@ -10609,6 +10682,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
 
             /* Execute body */
             I->procedure_depth++;
+            register_contained_procedures(I, fn->children[0]);
             exec_node(I, fn->children[0]);
             I->procedure_depth--;
             if (I->goto_active) {
@@ -11016,6 +11090,7 @@ static int execute_elemental_function_call(OfortInterpreter *I, OfortNode *call,
         }
 
         I->procedure_depth++;
+        register_contained_procedures(I, fn->children[0]);
         exec_node(I, fn->children[0]);
         I->procedure_depth--;
         if (I->goto_active) {
