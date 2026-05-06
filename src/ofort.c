@@ -693,6 +693,11 @@ static OfortValue coerce_assignment_value(OfortInterpreter *I, const char *name,
     if (is_numeric_type(target_type) && is_numeric_type(val.type)) {
         OfortValue converted;
         memset(&converted, 0, sizeof(converted));
+        if (val.type == FVAL_COMPLEX && target_type != FVAL_COMPLEX) {
+            ofort_warning(I, I ? I->current_line : 0,
+                          "warning: assigning COMPLEX to %s variable '%s' discards the imaginary part",
+                          value_type_name(target_type), name ? name : "");
+        }
         switch (target_type) {
             case FVAL_INTEGER:
                 converted = make_integer(val_to_int(val));
@@ -2046,7 +2051,8 @@ static int token_can_be_name(OfortToken *t) {
                  t->type == FTOK_OUT || t->type == FTOK_INOUT ||
                  t->type == FTOK_CALL || t->type == FTOK_DEFAULT ||
                  t->type == FTOK_SELECT || t->type == FTOK_DATA ||
-                 t->type == FTOK_RESULT);
+                 t->type == FTOK_RESULT || t->type == FTOK_PRINT ||
+                 t->type == FTOK_INTEGER);
 }
 
 static const char *token_name_text(OfortToken *t) {
@@ -2059,6 +2065,8 @@ static const char *token_name_text(OfortToken *t) {
     if (t->type == FTOK_SELECT) return "select";
     if (t->type == FTOK_DATA) return "data";
     if (t->type == FTOK_RESULT) return "result";
+    if (t->type == FTOK_PRINT) return "print";
+    if (t->type == FTOK_INTEGER) return "integer";
     return t->str_val;
 }
 
@@ -2240,6 +2248,26 @@ static int is_simple_identifier_call(const OfortNode *call) {
         if (!call->stmts || !call->stmts[i] || call->stmts[i]->type != FND_IDENT) return 0;
     }
     return 1;
+}
+
+static OfortNode *parse_keyword_assignment_statement(OfortInterpreter *I) {
+    OfortToken *name_tok = advance(I);
+    OfortNode *lhs = alloc_node(I, FND_IDENT);
+    OfortNode *rhs;
+    OfortNode *n;
+    copy_cstr(lhs->name, sizeof(lhs->name), token_name_text(name_tok));
+    lhs->line = name_tok->line;
+    ofort_warning(I, name_tok->line,
+                  "warning: keyword '%s' used as an implicit variable name",
+                  token_name_text(name_tok));
+    expect(I, FTOK_ASSIGN);
+    rhs = parse_expr(I);
+    n = alloc_node(I, FND_ASSIGN);
+    n->children[0] = lhs;
+    n->children[1] = rhs;
+    n->n_children = 2;
+    n->line = name_tok->line;
+    return n;
 }
 
 static OfortNode *parse_statement_function_from_call(OfortInterpreter *I, OfortNode *call) {
@@ -5915,6 +5943,12 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         }
         expect(I, FTOK_RPAREN);
         return block;
+    }
+
+    if (peek_ahead(I, 1)->type == FTOK_ASSIGN &&
+        (t->type == FTOK_PRINT || is_type_keyword(t->type))) {
+        leave_spec_section(I);
+        return parse_keyword_assignment_statement(I);
     }
 
     /* declarations */
