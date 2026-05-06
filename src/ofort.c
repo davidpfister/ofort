@@ -2252,7 +2252,22 @@ static int token_can_be_name(OfortToken *t) {
                  t->type == FTOK_CALL || t->type == FTOK_DEFAULT ||
                  t->type == FTOK_SELECT || t->type == FTOK_DATA ||
                  t->type == FTOK_RESULT || t->type == FTOK_PRINT ||
-                 t->type == FTOK_INTEGER);
+                 t->type == FTOK_INTEGER || t->type == FTOK_REAL ||
+                 t->type == FTOK_DOUBLE_PRECISION || t->type == FTOK_CHARACTER ||
+                 t->type == FTOK_LOGICAL || t->type == FTOK_COMPLEX ||
+                 t->type == FTOK_ALLOCATE || t->type == FTOK_DEALLOCATE ||
+                 t->type == FTOK_IF || t->type == FTOK_SAVE ||
+                 t->type == FTOK_TYPE || t->type == FTOK_PARAMETER ||
+                 t->type == FTOK_DIMENSION || t->type == FTOK_ALLOCATABLE ||
+                 t->type == FTOK_INTENT || t->type == FTOK_PROGRAM ||
+                 t->type == FTOK_MODULE || t->type == FTOK_FUNCTION ||
+                 t->type == FTOK_SUBROUTINE || t->type == FTOK_USE ||
+                 t->type == FTOK_READ || t->type == FTOK_WRITE ||
+                 t->type == FTOK_OPEN || t->type == FTOK_CLOSE ||
+                 t->type == FTOK_REWIND || t->type == FTOK_INQUIRE ||
+                 t->type == FTOK_STOP || t->type == FTOK_RETURN ||
+                 t->type == FTOK_EXIT || t->type == FTOK_CYCLE ||
+                 t->type == FTOK_ENTRY);
 }
 
 static const char *token_name_text(OfortToken *t) {
@@ -2267,6 +2282,36 @@ static const char *token_name_text(OfortToken *t) {
     if (t->type == FTOK_RESULT) return "result";
     if (t->type == FTOK_PRINT) return "print";
     if (t->type == FTOK_INTEGER) return "integer";
+    if (t->type == FTOK_REAL) return "real";
+    if (t->type == FTOK_DOUBLE_PRECISION) return "double";
+    if (t->type == FTOK_CHARACTER) return "character";
+    if (t->type == FTOK_LOGICAL) return "logical";
+    if (t->type == FTOK_COMPLEX) return "complex";
+    if (t->type == FTOK_ALLOCATE) return "allocate";
+    if (t->type == FTOK_DEALLOCATE) return "deallocate";
+    if (t->type == FTOK_IF) return "if";
+    if (t->type == FTOK_SAVE) return "save";
+    if (t->type == FTOK_TYPE) return "type";
+    if (t->type == FTOK_PARAMETER) return "parameter";
+    if (t->type == FTOK_DIMENSION) return "dimension";
+    if (t->type == FTOK_ALLOCATABLE) return "allocatable";
+    if (t->type == FTOK_INTENT) return "intent";
+    if (t->type == FTOK_PROGRAM) return "program";
+    if (t->type == FTOK_MODULE) return "module";
+    if (t->type == FTOK_FUNCTION) return "function";
+    if (t->type == FTOK_SUBROUTINE) return "subroutine";
+    if (t->type == FTOK_USE) return "use";
+    if (t->type == FTOK_READ) return "read";
+    if (t->type == FTOK_WRITE) return "write";
+    if (t->type == FTOK_OPEN) return "open";
+    if (t->type == FTOK_CLOSE) return "close";
+    if (t->type == FTOK_REWIND) return "rewind";
+    if (t->type == FTOK_INQUIRE) return "inquire";
+    if (t->type == FTOK_STOP) return "stop";
+    if (t->type == FTOK_RETURN) return "return";
+    if (t->type == FTOK_EXIT) return "exit";
+    if (t->type == FTOK_CYCLE) return "cycle";
+    if (t->type == FTOK_ENTRY) return "entry";
     return t->str_val;
 }
 
@@ -2457,9 +2502,6 @@ static OfortNode *parse_keyword_assignment_statement(OfortInterpreter *I) {
     OfortNode *n;
     copy_cstr(lhs->name, sizeof(lhs->name), token_name_text(name_tok));
     lhs->line = name_tok->line;
-    ofort_warning(I, name_tok->line,
-                  "warning: keyword '%s' used as an implicit variable name",
-                  token_name_text(name_tok));
     expect(I, FTOK_ASSIGN);
     rhs = parse_expr(I);
     n = alloc_node(I, FND_ASSIGN);
@@ -5054,10 +5096,11 @@ static OfortNode *parse_close_stmt(OfortInterpreter *I) {
 
 static OfortNode *parse_subroutine(OfortInterpreter *I) {
     OfortToken *st = advance(I); /* SUBROUTINE */
-    OfortToken *name = expect(I, FTOK_IDENT);
+    if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+    OfortToken *name = advance(I);
 
     OfortNode *n = alloc_node(I, FND_SUBROUTINE);
-    copy_cstr(n->name, sizeof(n->name), name->str_val);
+    copy_cstr(n->name, sizeof(n->name), token_name_text(name));
     n->line = st->line;
     n->n_params = 0;
 
@@ -5181,10 +5224,11 @@ static OfortNode *parse_typed_function(OfortInterpreter *I) {
 
 static OfortNode *parse_module(OfortInterpreter *I) {
     OfortToken *mt = advance(I); /* MODULE */
-    OfortToken *name = expect(I, FTOK_IDENT);
+    if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+    OfortToken *name = advance(I);
 
     OfortNode *n = alloc_node(I, FND_MODULE);
-    copy_cstr(n->name, sizeof(n->name), name->str_val);
+    copy_cstr(n->name, sizeof(n->name), token_name_text(name));
     n->line = mt->line;
     skip_newlines(I);
 
@@ -5206,10 +5250,11 @@ static OfortNode *parse_submodule(OfortInterpreter *I) {
     if (check(I, FTOK_LPAREN)) {
         skip_balanced_parens(I);
     }
-    name = expect(I, FTOK_IDENT);
+    if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+    name = advance(I);
 
     OfortNode *n = alloc_node(I, FND_MODULE);
-    copy_cstr(n->name, sizeof(n->name), name->str_val);
+    copy_cstr(n->name, sizeof(n->name), token_name_text(name));
     n->line = st->line;
     skip_newlines(I);
 
@@ -6297,9 +6342,10 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         block->n_stmts = 0;
         expect(I, FTOK_LPAREN);
         while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
-            OfortToken *name = expect(I, FTOK_IDENT);
+            if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+            OfortToken *name = advance(I);
             OfortNode *param = alloc_node(I, FND_PARAMDECL);
-            copy_cstr(param->name, sizeof(param->name), name->str_val);
+            copy_cstr(param->name, sizeof(param->name), token_name_text(name));
             param->line = name->line;
             expect(I, FTOK_ASSIGN);
             param->children[0] = parse_expr(I);
@@ -6317,7 +6363,8 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     }
 
     if (peek_ahead(I, 1)->type == FTOK_ASSIGN &&
-        (t->type == FTOK_PRINT || is_type_keyword(t->type))) {
+        ((t->type != FTOK_IDENT && token_can_be_name(t)) ||
+         t->type == FTOK_PRINT || is_type_keyword(t->type))) {
         leave_spec_section(I);
         return parse_keyword_assignment_statement(I);
     }
@@ -6418,13 +6465,14 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     if (t->type == FTOK_INQUIRE) { leave_spec_section(I); return parse_inquire_stmt(I); }
 
     /* CALL */
-    if (t->type == FTOK_CALL && peek_ahead(I, 1)->type == FTOK_IDENT) {
+    if (t->type == FTOK_CALL && token_can_be_name(peek_ahead(I, 1))) {
         leave_spec_section(I);
         OfortToken *ct = advance(I);
-        OfortToken *base = expect(I, FTOK_IDENT);
+        if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+        OfortToken *base = advance(I);
         OfortNode *callee = alloc_node(I, FND_IDENT);
         OfortNode *n = alloc_node(I, FND_CALL);
-        copy_cstr(callee->name, sizeof(callee->name), base->str_val);
+        copy_cstr(callee->name, sizeof(callee->name), token_name_text(base));
         callee->line = base->line;
         callee = parse_component_target_postfix(I, callee);
         if (callee->type == FND_MEMBER) {
