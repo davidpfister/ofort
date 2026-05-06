@@ -6018,32 +6018,44 @@ static OfortNode *parse_allocate(OfortInterpreter *I) {
                     }
                 } else if (parsed_type == FVAL_CHARACTER && check(I, FTOK_LPAREN)) {
                     advance(I);
-                    if (check(I, FTOK_IDENT) && check_ident_upper(I, "LEN") && peek_ahead(I, 1)->type == FTOK_ASSIGN) {
-                        advance(I);
-                        expect(I, FTOK_ASSIGN);
-                        if (check(I, FTOK_STAR)) {
+                    int positional_selector = 0;
+                    while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+                        int is_len_selector = 0;
+                        int is_kind_selector = 0;
+                        if (check(I, FTOK_IDENT) && peek_ahead(I, 1)->type == FTOK_ASSIGN) {
+                            is_len_selector = check_ident_upper(I, "LEN");
+                            is_kind_selector = check_ident_upper(I, "KIND");
                             advance(I);
-                            char_len = OFORT_MAX_STRLEN - 1;
-                        } else if (check(I, FTOK_COLON)) {
-                            advance(I);
-                            char_len = 0;
-                        } else if (!check(I, FTOK_RPAREN)) {
-                            OfortNode *len_expr_node = parse_expr(I);
-                            len_expr = len_expr_node;
-                            if (len_expr_node->type == FND_INT_LIT)
-                                char_len = (int)len_expr_node->int_val;
+                            expect(I, FTOK_ASSIGN);
+                        } else {
+                            positional_selector++;
+                            is_len_selector = positional_selector == 1;
+                            is_kind_selector = positional_selector == 2;
                         }
-                    } else if (check(I, FTOK_STAR)) {
-                        advance(I);
-                        char_len = OFORT_MAX_STRLEN - 1;
-                    } else if (check(I, FTOK_COLON)) {
-                        advance(I);
-                        char_len = 0;
-                    } else if (!check(I, FTOK_RPAREN)) {
-                        OfortNode *len_expr_node = parse_expr(I);
-                        len_expr = len_expr_node;
-                        if (len_expr_node->type == FND_INT_LIT)
-                            char_len = (int)len_expr_node->int_val;
+
+                        if (is_len_selector) {
+                            if (check(I, FTOK_STAR)) {
+                                advance(I);
+                                char_len = OFORT_MAX_STRLEN - 1;
+                            } else if (check(I, FTOK_COLON)) {
+                                advance(I);
+                                char_len = 0;
+                            } else {
+                                OfortNode *len_expr_node = parse_expr(I);
+                                len_expr = len_expr_node;
+                                if (len_expr_node->type == FND_INT_LIT)
+                                    char_len = (int)len_expr_node->int_val;
+                            }
+                        } else if (is_kind_selector) {
+                            kind_expr = parse_expr(I);
+                            if (kind_expr->type == FND_INT_LIT)
+                                kind = (int)kind_expr->int_val;
+                        } else {
+                            parse_expr(I);
+                        }
+
+                        if (check(I, FTOK_COMMA)) advance(I);
+                        else break;
                     }
                     expect(I, FTOK_RPAREN);
                 } else if ((parsed_type == FVAL_INTEGER || parsed_type == FVAL_REAL || parsed_type == FVAL_DOUBLE ||
@@ -15108,7 +15120,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             copy_cstr(elem_type_name, sizeof(elem_type_name), n->str_val);
 
         for (int i = 0; i < 7; i++) lower_bounds[i] = 1;
-        if (ndims == 0 && var->is_allocatable && var->val.type != FVAL_ARRAY) {
+        if (ndims == 0 && (var->is_allocatable || var->is_pointer) && var->val.type != FVAL_ARRAY) {
             OfortValue new_val;
             if (n->children[0]) {
                 OfortValue source = eval_node(I, n->children[0]);
