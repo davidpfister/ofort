@@ -1411,6 +1411,156 @@ typedef struct {
     OfortTokenType token;
 } KeywordEntry;
 
+typedef struct {
+    char name[128];
+    char replacement[512];
+} OfortMacro;
+
+static void append_text(char **buf, size_t *len, size_t *cap, const char *text, size_t n) {
+    if (*len + n + 1 > *cap) {
+        size_t new_cap = *cap ? *cap : 1024;
+        while (*len + n + 1 > new_cap) new_cap *= 2;
+        char *new_buf = (char *)realloc(*buf, new_cap);
+        if (!new_buf) return;
+        *buf = new_buf;
+        *cap = new_cap;
+    }
+    memcpy(*buf + *len, text, n);
+    *len += n;
+    (*buf)[*len] = '\0';
+}
+
+static void append_char_text(char **buf, size_t *len, size_t *cap, char c) {
+    append_text(buf, len, cap, &c, 1);
+}
+
+static int macro_index(OfortMacro *macros, int n_macros, const char *name, size_t name_len) {
+    for (int i = n_macros - 1; i >= 0; i--) {
+        if (strlen(macros[i].name) == name_len &&
+            strncmp(macros[i].name, name, name_len) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static char *preprocess_source(OfortInterpreter *I, const char *source) {
+    OfortMacro macros[128];
+    int n_macros = 0;
+    char *out = NULL;
+    size_t out_len = 0, out_cap = 0;
+    const char *p = source;
+
+    while (*p) {
+        const char *line_start = p;
+        const char *line_end = p;
+        const char *q;
+        int has_newline = 0;
+        while (*line_end && *line_end != '\n' && *line_end != '\r') line_end++;
+        q = line_start;
+        while (q < line_end && (*q == ' ' || *q == '\t')) q++;
+
+        if (q < line_end && *q == '#') {
+            q++;
+            while (q < line_end && (*q == ' ' || *q == '\t')) q++;
+            if ((size_t)(line_end - q) >= 6 && strncmp(q, "define", 6) == 0 &&
+                (q + 6 == line_end || isspace((unsigned char)q[6]))) {
+                const char *name_start;
+                const char *name_end;
+                const char *rep_start;
+                const char *rep_end;
+                q += 6;
+                while (q < line_end && (*q == ' ' || *q == '\t')) q++;
+                name_start = q;
+                if (!(q < line_end && (isalpha((unsigned char)*q) || *q == '_')))
+                    ofort_error(I, "Invalid #define macro name");
+                q++;
+                while (q < line_end && (isalnum((unsigned char)*q) || *q == '_')) q++;
+                name_end = q;
+                if (q < line_end && *q == '(')
+                    ofort_error(I, "Unsupported function-like #define");
+                while (q < line_end && (*q == ' ' || *q == '\t')) q++;
+                rep_start = q;
+                rep_end = line_end;
+                while (rep_end > rep_start && (rep_end[-1] == ' ' || rep_end[-1] == '\t')) rep_end--;
+                if (n_macros >= (int)(sizeof(macros) / sizeof(macros[0])))
+                    ofort_error(I, "Too many #define macros");
+                {
+                    size_t name_len = (size_t)(name_end - name_start);
+                    size_t rep_len = (size_t)(rep_end - rep_start);
+                    if (name_len >= sizeof(macros[0].name) || rep_len >= sizeof(macros[0].replacement))
+                        ofort_error(I, "#define macro is too long");
+                    memcpy(macros[n_macros].name, name_start, name_len);
+                    macros[n_macros].name[name_len] = '\0';
+                    memcpy(macros[n_macros].replacement, rep_start, rep_len);
+                    macros[n_macros].replacement[rep_len] = '\0';
+                    n_macros++;
+                }
+                append_char_text(&out, &out_len, &out_cap, '\n');
+            } else if (q >= line_end) {
+                append_char_text(&out, &out_len, &out_cap, '\n');
+            } else {
+                ofort_error(I, "Unsupported preprocessor directive");
+            }
+        } else {
+            q = line_start;
+            while (q < line_end) {
+                if (*q == '\'' || *q == '"') {
+                    char quote = *q;
+                    append_char_text(&out, &out_len, &out_cap, *q++);
+                    while (q < line_end) {
+                        append_char_text(&out, &out_len, &out_cap, *q);
+                        if (*q == quote) {
+                            if (q + 1 < line_end && q[1] == quote) {
+                                q++;
+                                append_char_text(&out, &out_len, &out_cap, *q++);
+                                continue;
+                            }
+                            q++;
+                            break;
+                        }
+                        q++;
+                    }
+                } else if (*q == '!') {
+                    append_text(&out, &out_len, &out_cap, q, (size_t)(line_end - q));
+                    q = line_end;
+                } else if (isalpha((unsigned char)*q) || *q == '_') {
+                    const char *id_start = q;
+                    int mi;
+                    q++;
+                    while (q < line_end && (isalnum((unsigned char)*q) || *q == '_')) q++;
+                    mi = macro_index(macros, n_macros, id_start, (size_t)(q - id_start));
+                    if (mi >= 0) {
+                        append_text(&out, &out_len, &out_cap, macros[mi].replacement,
+                                    strlen(macros[mi].replacement));
+                    } else {
+                        append_text(&out, &out_len, &out_cap, id_start, (size_t)(q - id_start));
+                    }
+                } else {
+                    append_char_text(&out, &out_len, &out_cap, *q++);
+                }
+            }
+            append_char_text(&out, &out_len, &out_cap, '\n');
+        }
+
+        p = line_end;
+        if (*p == '\r') {
+            p++;
+            if (*p == '\n') p++;
+            has_newline = 1;
+        } else if (*p == '\n') {
+            p++;
+            has_newline = 1;
+        }
+        (void)has_newline;
+    }
+
+    if (!out) {
+        out = (char *)calloc(1, 1);
+    }
+    return out;
+}
+
 static const KeywordEntry fortran_keywords[] = {
     {"PROGRAM", FTOK_PROGRAM}, {"END", FTOK_END},
     {"SUBROUTINE", FTOK_SUBROUTINE}, {"FUNCTION", FTOK_FUNCTION},
@@ -4695,6 +4845,24 @@ static OfortNode *parse_common_statement(OfortInterpreter *I) {
     return block;
 }
 
+static OfortNode *parse_bind_statement(OfortInterpreter *I) {
+    OfortToken *bt = advance(I); /* BIND */
+    OfortNode *n = alloc_node(I, FND_CONTINUE);
+    n->line = bt->line;
+    if (check(I, FTOK_LPAREN)) {
+        skip_balanced_parens(I);
+    }
+    if (check(I, FTOK_DCOLON)) {
+        advance(I);
+        while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
+            advance(I);
+        }
+    } else {
+        skip_to_next_line(I);
+    }
+    return n;
+}
+
 static OfortNode *parse_associate_construct(OfortInterpreter *I) {
     OfortToken *at = advance(I); /* ASSOCIATE */
     OfortNode *n = alloc_node(I, FND_ASSOCIATE);
@@ -6363,6 +6531,10 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
 
     if (token_ident_upper(t, "COMMON")) {
         return parse_common_statement(I);
+    }
+
+    if (token_ident_upper(t, "BIND")) {
+        return parse_bind_statement(I);
     }
 
     /* END (bare) — shouldn't be reached normally */
@@ -12376,6 +12548,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (strcmp(upper, "IEEE_ARITHMETIC") == 0) {
                 break;
             }
+            if (strcmp(upper, "ISO_C_BINDING") == 0) {
+                break;
+            }
             ofort_error(I, "Module '%s' not found", n->name);
         }
         /* import variables */
@@ -16990,6 +17165,7 @@ void ofort_destroy(OfortInterpreter *interp) {
 int ofort_execute(OfortInterpreter *interp, const char *source) {
     double total_start;
     double stage_start;
+    char *processed_source = NULL;
     if (!interp || !source) return -1;
     total_start = ofort_monotonic_seconds();
     clear_timing(interp);
@@ -17018,9 +17194,17 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
         return -1;
     }
 
+    processed_source = preprocess_source(interp, source);
+    if (!processed_source) {
+        snprintf(interp->error, sizeof(interp->error), "Out of memory preprocessing source");
+        interp->has_error = 1;
+        return -1;
+    }
+    interp->source = processed_source;
+
     /* Tokenize */
     stage_start = ofort_monotonic_seconds();
-    tokenize(interp, source);
+    tokenize(interp, processed_source);
     interp->timing.lex = ofort_monotonic_seconds() - stage_start;
     interp->tok_pos = 0;
 
@@ -17064,12 +17248,17 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
     interp->timing.execute = ofort_monotonic_seconds() - stage_start;
     interp->timing.total = ofort_monotonic_seconds() - total_start;
 
-    return interp->has_error ? -1 : 0;
+    {
+        int rc = interp->has_error ? -1 : 0;
+        free(processed_source);
+        return rc;
+    }
 }
 
 int ofort_check(OfortInterpreter *interp, const char *source) {
     double total_start;
     double stage_start;
+    char *processed_source = NULL;
     if (!interp || !source) return -1;
     total_start = ofort_monotonic_seconds();
     clear_timing(interp);
@@ -17091,15 +17280,27 @@ int ofort_check(OfortInterpreter *interp, const char *source) {
         return -1;
     }
 
+    processed_source = preprocess_source(interp, source);
+    if (!processed_source) {
+        snprintf(interp->error, sizeof(interp->error), "Out of memory preprocessing source");
+        interp->has_error = 1;
+        return -1;
+    }
+    interp->source = processed_source;
+
     stage_start = ofort_monotonic_seconds();
-    tokenize(interp, source);
+    tokenize(interp, processed_source);
     interp->timing.lex = ofort_monotonic_seconds() - stage_start;
     interp->tok_pos = 0;
     stage_start = ofort_monotonic_seconds();
     interp->ast = parse_program(interp);
     interp->timing.parse = ofort_monotonic_seconds() - stage_start;
     interp->timing.total = ofort_monotonic_seconds() - total_start;
-    return interp->has_error ? -1 : 0;
+    {
+        int rc = interp->has_error ? -1 : 0;
+        free(processed_source);
+        return rc;
+    }
 }
 
 void ofort_set_print_expr_statements(OfortInterpreter *interp, int enabled) {
