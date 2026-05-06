@@ -2667,6 +2667,9 @@ static int is_statement_function_header(OfortInterpreter *I) {
                 return 0;
             }
         }
+        if (t == FTOK_LPAREN && depth == 1) {
+            return 0;
+        }
         if (t == FTOK_LPAREN) {
             depth++;
         } else if (depth == 1 && t != FTOK_COMMA && t != FTOK_IDENT && t != FTOK_RPAREN) {
