@@ -3070,7 +3070,7 @@ static void reject_nonstandard_star_kind(OfortInterpreter *I, const char *type_n
 static int parse_kind_selector_ex(OfortInterpreter *I, OfortNode **kind_expr_out) {
     int kind = 0;
     expect(I, FTOK_LPAREN);
-    if (check_ident_upper(I, "KIND")) {
+    if (check_ident_upper(I, "KIND") && peek_ahead(I, 1)->type == FTOK_ASSIGN) {
         advance(I);
         expect(I, FTOK_ASSIGN);
     }
@@ -3196,35 +3196,50 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
         }
     }
 
-    /* optional (LEN=n) or (KIND=n) for CHARACTER */
+    /* optional selectors for CHARACTER:
+       CHARACTER(LEN=n), CHARACTER(n), CHARACTER(LEN=n,KIND=k),
+       CHARACTER(n,KIND=k), CHARACTER(n,k), CHARACTER(KIND=k,LEN=n) */
     if (vtype == FVAL_CHARACTER && check(I, FTOK_LPAREN)) {
+        int selector_pos = 0;
         advance(I);
-        /* CHARACTER(LEN=20) or CHARACTER(20) */
-        if (check_ident_upper(I, "LEN") && peek_ahead(I, 1)->type == FTOK_ASSIGN) {
-            advance(I); /* LEN */
-            expect(I, FTOK_ASSIGN); /* = */
-            if (check(I, FTOK_STAR)) {
+        while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+            int is_len = check_ident_upper(I, "LEN") && peek_ahead(I, 1)->type == FTOK_ASSIGN;
+            int is_kind = check_ident_upper(I, "KIND") && peek_ahead(I, 1)->type == FTOK_ASSIGN;
+            if (is_len) {
                 advance(I);
-                char_len = OFORT_MAX_STRLEN - 1;
-            } else if (check(I, FTOK_COLON)) {
+                expect(I, FTOK_ASSIGN);
+            } else if (is_kind) {
                 advance(I);
-                char_len = 0;
-            } else {
-                char_len_expr = parse_expr(I);
-                if (char_len_expr->type == FND_INT_LIT)
-                    char_len = (int)char_len_expr->int_val;
+                expect(I, FTOK_ASSIGN);
             }
-        } else if (check(I, FTOK_STAR)) {
-            advance(I);
-            char_len = OFORT_MAX_STRLEN - 1;
-        } else if (check(I, FTOK_COLON)) {
-            advance(I);
-            char_len = 0;
-            char_len_expr = NULL;
-        } else {
-            char_len_expr = parse_expr(I);
-            if (char_len_expr->type == FND_INT_LIT)
-                char_len = (int)char_len_expr->int_val;
+
+            if (!is_kind && selector_pos == 0) {
+                if (check(I, FTOK_STAR)) {
+                    advance(I);
+                    char_len = OFORT_MAX_STRLEN - 1;
+                    char_len_expr = NULL;
+                } else if (check(I, FTOK_COLON)) {
+                    advance(I);
+                    char_len = 0;
+                    char_len_expr = NULL;
+                } else {
+                    char_len_expr = parse_expr(I);
+                    if (char_len_expr->type == FND_INT_LIT)
+                        char_len = (int)char_len_expr->int_val;
+                }
+            } else {
+                OfortNode *kexpr = parse_expr(I);
+                if (kexpr && kexpr->type == FND_INT_LIT)
+                    decl_kind = (int)kexpr->int_val;
+                else if (kexpr)
+                    kind_expr = kexpr;
+            }
+            selector_pos++;
+            if (check(I, FTOK_COMMA)) {
+                advance(I);
+            } else {
+                break;
+            }
         }
         expect(I, FTOK_RPAREN);
     }
