@@ -3506,6 +3506,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
 
 /* ── Statement parsing ──────────────────────── */
 static OfortNode *parse_block_until_end(OfortInterpreter *I, const char *end_keyword);
+static OfortNode *parse_block_until_label(OfortInterpreter *I, long long terminal_label);
 
 static OfortNode *parse_if(OfortInterpreter *I) {
     OfortToken *ift = advance(I); /* consume IF */
@@ -3709,9 +3710,15 @@ static OfortNode *parse_do(OfortInterpreter *I) {
         return n;
     }
 
-    /* DO i = start, end [, step] */
+    /* DO [label] i = start, end [, step] */
     OfortNode *n = alloc_node(I, FND_DO_LOOP);
     n->line = dot->line;
+
+    long long terminal_label = 0;
+    if (check(I, FTOK_INT_LIT)) {
+        terminal_label = peek(I)->int_val;
+        advance(I);
+    }
 
     /* loop variable */
     OfortToken *var_tok = expect(I, FTOK_IDENT);
@@ -3732,10 +3739,12 @@ static OfortNode *parse_do(OfortInterpreter *I) {
     }
     skip_newlines(I);
 
-    OfortNode *body = parse_block_until_end(I, "DO");
+    OfortNode *body = terminal_label ?
+        parse_block_until_label(I, terminal_label) :
+        parse_block_until_end(I, "DO");
     n->children[3] = body;
     n->n_children = 4;
-    consume_end(I, "DO");
+    if (!terminal_label) consume_end(I, "DO");
     return n;
 }
 
@@ -6158,6 +6167,37 @@ static OfortNode *parse_block_until_end(OfortInterpreter *I, const char *end_key
         }
         skip_newlines(I);
     }
+    return block;
+}
+
+static OfortNode *parse_block_until_label(OfortInterpreter *I, long long terminal_label) {
+    OfortNode *block = alloc_node(I, FND_BLOCK);
+    block->stmts = NULL;
+    block->n_stmts = 0;
+    int cap = 0;
+
+    while (peek(I)->type != FTOK_EOF) {
+        skip_newlines(I);
+        if (peek(I)->type == FTOK_EOF) break;
+
+        int is_terminal = check(I, FTOK_INT_LIT) && peek(I)->int_val == terminal_label;
+        int before_pos = I->tok_pos;
+        OfortNode *s = parse_statement(I);
+        if (s) {
+            if (block->n_stmts >= cap) {
+                cap = cap ? cap * 2 : 8;
+                block->stmts = (OfortNode **)realloc(block->stmts, sizeof(OfortNode *) * cap);
+                if (!block->stmts) ofort_error(I, "Out of memory");
+            }
+            block->stmts[block->n_stmts++] = s;
+        }
+        if (is_terminal) break;
+        if (I->tok_pos == before_pos && !check(I, FTOK_EOF)) {
+            skip_to_next_line(I);
+        }
+        skip_newlines(I);
+    }
+
     return block;
 }
 
