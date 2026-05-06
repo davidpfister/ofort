@@ -2781,6 +2781,7 @@ static OfortNode *parse_interface_block(OfortInterpreter *I) {
                 char ignored[256];
                 if (!parse_operator_designator(I, ignored, sizeof(ignored)) && token_can_be_name(peek(I))) {
                     advance(I); /* optional generic name */
+                    if (check(I, FTOK_LPAREN)) skip_balanced_parens(I);
                 }
             }
             skip_newlines(I);
