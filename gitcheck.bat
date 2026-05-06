@@ -1,8 +1,27 @@
 @echo off
+rem Local Windows clone/build/test sanity check for this working copy.
+rem This script is intentionally machine- and cmd.exe-oriented; it is not
+rem required for normal portable builds. It clones the committed HEAD into
+rem ofort_build_check, then runs "make gcc" and "pytest -q" there, so it
+rem catches files that were edited locally but not committed.
 setlocal
 
 cd /d "%~dp0" || exit /b 1
 set "checkdir=ofort_build_check"
+
+git diff --quiet
+if errorlevel 1 (
+    echo gitcheck.bat clones committed HEAD, but the working tree has uncommitted tracked changes.
+    echo Commit or revert tracked changes before running this clone check.
+    exit /b 1
+)
+
+git diff --cached --quiet
+if errorlevel 1 (
+    echo gitcheck.bat clones committed HEAD, but the index has staged changes.
+    echo Commit staged changes before running this clone check.
+    exit /b 1
+)
 
 for %%F in (Makefile include/ofort.h src/main.c src/ofort.c src/ofort_internal.h src/ofort_values.c) do (
     git ls-files --error-unmatch "%%F" >nul 2>nul

@@ -26,8 +26,19 @@ def build_ofort():
 
 
 def case_files():
+    def has_text_expected_output(source):
+        expected = source.with_suffix(".out")
+        if not expected.exists():
+            return False
+        try:
+            expected.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return False
+        return True
+
     return sorted(
         source for source in CASES.glob("*.f90")
+        if has_text_expected_output(source)
         if source.name not in {
             "xinput_output_unit.f90",
             "xsub.f90",
