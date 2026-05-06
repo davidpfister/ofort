@@ -168,6 +168,9 @@ struct OfortInterpreter {
     /* simple external-unit file table */
     OfortUnitFile unit_files[32];
     int n_unit_files;
+    int format_labels[256];
+    char format_strings[256][512];
+    int n_formats;
     /* control flow */
     int returning;
     OfortValue return_val;
@@ -1103,6 +1106,29 @@ static OfortGeneric *find_generic(OfortInterpreter *I, const char *name) {
     return NULL;
 }
 
+static void register_format_label(OfortInterpreter *I, int label, const char *fmt) {
+    if (!I || label <= 0 || !fmt) return;
+    for (int i = 0; i < I->n_formats; i++) {
+        if (I->format_labels[i] == label) {
+            copy_cstr(I->format_strings[i], sizeof(I->format_strings[i]), fmt);
+            return;
+        }
+    }
+    if (I->n_formats >= (int)(sizeof(I->format_labels) / sizeof(I->format_labels[0])))
+        ofort_error(I, "Too many FORMAT statements");
+    I->format_labels[I->n_formats] = label;
+    copy_cstr(I->format_strings[I->n_formats], sizeof(I->format_strings[0]), fmt);
+    I->n_formats++;
+}
+
+static const char *find_format_label(OfortInterpreter *I, int label) {
+    if (!I || label <= 0) return NULL;
+    for (int i = I->n_formats - 1; i >= 0; i--) {
+        if (I->format_labels[i] == label) return I->format_strings[i];
+    }
+    return NULL;
+}
+
 static __int128 parse_int128_text(const char *text) {
     __int128 value = 0;
     int neg = 0;
@@ -2019,7 +2045,8 @@ static int token_can_be_name(OfortToken *t) {
     return t && (t->type == FTOK_IDENT || t->type == FTOK_IN ||
                  t->type == FTOK_OUT || t->type == FTOK_INOUT ||
                  t->type == FTOK_CALL || t->type == FTOK_DEFAULT ||
-                 t->type == FTOK_SELECT || t->type == FTOK_DATA);
+                 t->type == FTOK_SELECT || t->type == FTOK_DATA ||
+                 t->type == FTOK_RESULT);
 }
 
 static const char *token_name_text(OfortToken *t) {
@@ -2031,6 +2058,7 @@ static const char *token_name_text(OfortToken *t) {
     if (t->type == FTOK_DEFAULT) return "default";
     if (t->type == FTOK_SELECT) return "select";
     if (t->type == FTOK_DATA) return "data";
+    if (t->type == FTOK_RESULT) return "result";
     return t->str_val;
 }
 
@@ -3587,6 +3615,7 @@ static OfortNode *parse_if(OfortInterpreter *I) {
 
 static OfortNode *parse_do(OfortInterpreter *I) {
     OfortToken *dot = advance(I); /* consume DO */
+    long long terminal_label = 0;
 
     /* DO CONCURRENT, executed serially by ofort */
     if (token_ident_upper(peek(I), "CONCURRENT")) {
@@ -3679,6 +3708,11 @@ static OfortNode *parse_do(OfortInterpreter *I) {
         return n;
     }
 
+    if (check(I, FTOK_INT_LIT)) {
+        terminal_label = peek(I)->int_val;
+        advance(I);
+    }
+
     /* DO WHILE */
     if (check(I, FTOK_WHILE)) {
         advance(I);
@@ -3691,10 +3725,12 @@ static OfortNode *parse_do(OfortInterpreter *I) {
         n->children[0] = cond;
         n->line = dot->line;
 
-        OfortNode *body = parse_block_until_end(I, "DO");
+        OfortNode *body = terminal_label ?
+            parse_block_until_label(I, terminal_label) :
+            parse_block_until_end(I, "DO");
         n->children[1] = body;
         n->n_children = 2;
-        consume_end(I, "DO");
+        if (!terminal_label) consume_end(I, "DO");
         return n;
     }
 
@@ -3713,12 +3749,6 @@ static OfortNode *parse_do(OfortInterpreter *I) {
     /* DO [label] i = start, end [, step] */
     OfortNode *n = alloc_node(I, FND_DO_LOOP);
     n->line = dot->line;
-
-    long long terminal_label = 0;
-    if (check(I, FTOK_INT_LIT)) {
-        terminal_label = peek(I)->int_val;
-        advance(I);
-    }
 
     /* loop variable */
     OfortToken *var_tok = expect(I, FTOK_IDENT);
@@ -4157,6 +4187,9 @@ static OfortNode *parse_print(OfortInterpreter *I) {
     } else if (check(I, FTOK_STRING_LIT)) {
         copy_cstr(n->format_str, sizeof(n->format_str), peek(I)->str_val);
         advance(I);
+    } else if (check(I, FTOK_INT_LIT)) {
+        n->int_val = peek(I)->int_val;
+        advance(I);
     } else {
         n->format_str[0] = '\0';
     }
@@ -4174,6 +4207,37 @@ static OfortNode *parse_print(OfortInterpreter *I) {
         n->stmts[n->n_stmts++] = item;
         if (check(I, FTOK_COMMA)) advance(I);
         else break;
+    }
+    return n;
+}
+
+static OfortNode *parse_format_statement(OfortInterpreter *I, long long label) {
+    OfortToken *ft = advance(I); /* FORMAT */
+    OfortNode *n = alloc_node(I, FND_FORMAT);
+    n->line = ft->line;
+    n->int_val = label;
+    if (check(I, FTOK_LPAREN)) {
+        OfortToken *lp = advance(I);
+        const char *start = lp->start;
+        const char *end = lp->start + lp->length;
+        int depth = 1;
+        while (!check(I, FTOK_EOF) && depth > 0) {
+            OfortToken *tok = advance(I);
+            end = tok->start + tok->length;
+            if (tok->type == FTOK_LPAREN) depth++;
+            else if (tok->type == FTOK_RPAREN) depth--;
+            if (tok->type == FTOK_NEWLINE && depth > 0)
+                ofort_error(I, "Unterminated FORMAT statement");
+        }
+        {
+            size_t len = (size_t)(end - start);
+            if (len >= sizeof(n->format_str)) len = sizeof(n->format_str) - 1;
+            memcpy(n->format_str, start, len);
+            n->format_str[len] = '\0';
+        }
+        if (label > 0) register_format_label(I, (int)label, n->format_str);
+    } else {
+        ofort_error(I, "FORMAT statement requires a parenthesized format");
     }
     return n;
 }
@@ -4222,7 +4286,8 @@ static OfortNode *parse_write(OfortInterpreter *I) {
                         advance(I);
                     }
                 } else if (check(I, FTOK_INT_LIT)) {
-                    advance(I); /* format label number, ignore */
+                    n->int_val = peek(I)->int_val;
+                    advance(I);
                 } else {
                     n->children[1] = parse_expr(I);
                     if (n->n_children < 2) n->n_children = 2;
@@ -4264,7 +4329,8 @@ static OfortNode *parse_write(OfortInterpreter *I) {
             n->n_children = 1;
         } else if (check(I, FTOK_INT_LIT)) {
             saw_fmt = 1;
-            advance(I); /* format label number, ignore */
+            n->int_val = peek(I)->int_val;
+            advance(I);
         } else {
             if (positional > 0) {
                 saw_fmt = 1;
@@ -5654,6 +5720,9 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         stmt_label = t->int_val;
         advance(I);
         t = peek(I);
+        if (token_ident_upper(t, "FORMAT")) {
+            return parse_format_statement(I, stmt_label);
+        }
         if (t->type == FTOK_EOF || t->type == FTOK_NEWLINE) {
             OfortNode *n = alloc_node(I, FND_CONTINUE);
             n->int_val = stmt_label;
@@ -5663,6 +5732,10 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         OfortNode *n = parse_statement(I);
         if (n && stmt_label) n->int_val = stmt_label;
         return n;
+    }
+
+    if (token_ident_upper(t, "FORMAT")) {
+        return parse_format_statement(I, 0);
     }
 
     /* Statement label/name prefix, e.g. "outer: do ..." */
@@ -8562,6 +8635,11 @@ static const char *write_format_string(OfortInterpreter *I, OfortNode *n,
         value_to_string(I, fmt_val, buf, bufsize);
         free_value(&fmt_val);
         return buf;
+    }
+    if (n->int_val > 0) {
+        const char *fmt = find_format_label(I, (int)n->int_val);
+        if (!fmt) ofort_error(I, "FORMAT label %d not found", (int)n->int_val);
+        return fmt;
     }
     return n->format_str;
 }
@@ -12814,12 +12892,18 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
     case FND_PRINT: {
         int nvals = 0;
         OfortValue *vals = eval_io_list(I, n, &nvals);
-        format_output(I, n->format_str, vals, nvals);
+        char fmt_buf[OFORT_MAX_STRLEN];
+        const char *fmt = write_format_string(I, n, fmt_buf, sizeof(fmt_buf));
+        format_output(I, fmt, vals, nvals);
         flush_live_stdout_if_needed(I);
         for (int i = 0; i < nvals; i++) free_value(&vals[i]);
         free(vals);
         break;
     }
+
+    case FND_FORMAT:
+        if (n->int_val > 0) register_format_label(I, (int)n->int_val, n->format_str);
+        break;
 
     case FND_WRITE: {
         int nvals = 0;
