@@ -662,6 +662,7 @@ static OfortValType implicit_type_for_name(OfortInterpreter *I, const char *name
                 case 'I': return FVAL_INTEGER;
                 case 'R': return FVAL_REAL;
                 case 'D': return FVAL_DOUBLE;
+                case 'X': return FVAL_COMPLEX;
                 case 'L': return FVAL_LOGICAL;
                 case 'C': return FVAL_CHARACTER;
                 default: break;
@@ -6451,6 +6452,7 @@ static char implicit_type_code(OfortValType type) {
         case FVAL_INTEGER: return 'I';
         case FVAL_REAL: return 'R';
         case FVAL_DOUBLE: return 'D';
+        case FVAL_COMPLEX: return 'X';
         case FVAL_LOGICAL: return 'L';
         case FVAL_CHARACTER: return 'C';
         default: return 0;
@@ -6599,7 +6601,8 @@ static OfortNode *parse_implicit_stmt(OfortInterpreter *I) {
             while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) advance(I);
             expect(I, FTOK_RPAREN);
         } else if (check(I, FTOK_LPAREN) &&
-                   (vtype == FVAL_INTEGER || vtype == FVAL_REAL || vtype == FVAL_DOUBLE)) {
+                   (vtype == FVAL_INTEGER || vtype == FVAL_REAL || vtype == FVAL_DOUBLE ||
+                    vtype == FVAL_COMPLEX || vtype == FVAL_LOGICAL)) {
             if (!implicit_letter_list_follows(I)) {
                 skip_balanced_parens(I);
             }
