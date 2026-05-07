@@ -138,6 +138,7 @@ struct OfortInterpreter {
     OfortStandardMode standard_mode;
     int fast_mode;
     int specialized_fast_paths;
+    int trace_assign;
     uint64_t fast_rng_state;
     int line_profile_enabled;
     double *line_profile_seconds;
@@ -239,6 +240,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
                                 char arg_names[OFORT_MAX_PARAMS][256]);
 static int storage_size_bits(OfortValue *v);
 static int is_intrinsic(const char *name);
+static void check_semantics_node(OfortInterpreter *I, OfortNode *n);
 static void value_to_string(OfortInterpreter *I, OfortValue v, char *buf, int bufsize);
 static int assign_token_to_read_target(OfortInterpreter *I, OfortNode *target, const char *tok);
 static int paren_item_is_implied_do(OfortInterpreter *I);
@@ -4446,9 +4448,43 @@ static OfortNode *parse_do(OfortInterpreter *I) {
     return n;
 }
 
+static OfortNode *parse_case_selector(OfortInterpreter *I) {
+    OfortNode *lo = NULL;
+    OfortNode *hi = NULL;
+    OfortNode *range;
+    int line = peek(I)->line;
+    if (check(I, FTOK_COLON)) {
+        advance(I);
+        if (!check(I, FTOK_COMMA) && !check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+            hi = parse_expr_until_colon(I);
+        }
+        range = alloc_node(I, FND_CASE_BLOCK);
+        range->children[0] = NULL;
+        range->children[1] = hi;
+        range->n_children = 2;
+        range->line = line;
+        return range;
+    }
+
+    lo = parse_expr_until_colon(I);
+    if (check(I, FTOK_COLON)) {
+        advance(I);
+        if (!check(I, FTOK_COMMA) && !check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+            hi = parse_expr_until_colon(I);
+        }
+        range = alloc_node(I, FND_CASE_BLOCK);
+        range->children[0] = lo;
+        range->children[1] = hi;
+        range->n_children = 2;
+        range->line = line;
+        return range;
+    }
+    return lo;
+}
+
 static OfortNode *parse_select_case(OfortInterpreter *I) {
     OfortToken *st = advance(I); /* SELECT */
-    expect(I, FTOK_CASE);
+    if (!token_ident_upper(st, "SELECTCASE")) expect(I, FTOK_CASE);
     expect(I, FTOK_LPAREN);
     OfortNode *expr = parse_expr(I);
     expect(I, FTOK_RPAREN);
@@ -4476,38 +4512,21 @@ static OfortNode *parse_select_case(OfortInterpreter *I) {
                 cb->children[0] = NULL; /* default case */
             } else {
                 expect(I, FTOK_LPAREN);
-                if (check(I, FTOK_COLON)) {
-                    /* open lower bound: case (:hi) */
-                    advance(I);
-                    cb->children[0] = NULL;
-                    cb->children[1] = check(I, FTOK_RPAREN) ? NULL : parse_expr(I);
-                    cb->n_children = 2;
-                } else {
-                    cb->children[0] = parse_expr(I);
+                cb->stmts = NULL;
+                cb->n_stmts = 0;
+                int sel_cap = 0;
+                while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+                    OfortNode *sel = parse_case_selector(I);
+                    if (cb->n_stmts >= sel_cap) {
+                        sel_cap = sel_cap ? sel_cap * 2 : 4;
+                        cb->stmts = (OfortNode **)realloc(cb->stmts, sizeof(OfortNode *) * sel_cap);
+                    }
+                    cb->stmts[cb->n_stmts++] = sel;
                     if (check(I, FTOK_COMMA)) {
-                        OfortNode *items = alloc_node(I, FND_ARRAY_CONSTRUCTOR);
-                        int item_cap = 0;
-                        items->line = cb->children[0] ? cb->children[0]->line : cb->line;
-                        items->stmts = NULL;
-                        items->n_stmts = 0;
-                        while (1) {
-                            if (items->n_stmts >= item_cap) {
-                                item_cap = item_cap ? item_cap * 2 : 4;
-                                items->stmts = (OfortNode **)realloc(items->stmts, sizeof(OfortNode *) * item_cap);
-                            }
-                            items->stmts[items->n_stmts++] = cb->children[0];
-                            if (!check(I, FTOK_COMMA)) break;
-                            advance(I);
-                            cb->children[0] = parse_expr(I);
-                        }
-                        cb->children[0] = items;
-                    }
-                    /* check for range: case (lo:hi) or case (lo:) */
-                    if (check(I, FTOK_COLON)) {
                         advance(I);
-                        cb->children[1] = check(I, FTOK_RPAREN) ? NULL : parse_expr(I);
-                        cb->n_children = 2;
+                        continue;
                     }
+                    break;
                 }
                 expect(I, FTOK_RPAREN);
             }
@@ -4530,7 +4549,6 @@ static OfortNode *parse_select_case(OfortInterpreter *I) {
                 }
                 skip_newlines(I);
             }
-            if (cb->n_children < 1) cb->n_children = 1;
             cb->children[cb->n_children] = body;
             cb->n_children++;
 
@@ -5071,6 +5089,14 @@ static OfortNode *parse_write(OfortInterpreter *I) {
     expect(I, FTOK_RPAREN);
     if (n->children[0] && !saw_fmt && positional == 1) {
         n->bool_val = 1;
+    }
+    if (check(I, FTOK_COMMA)) {
+        if (I->standard_mode == OFORT_STD_F2023) {
+            ofort_error(I, "nonstandard comma between WRITE control list and I/O list is not allowed with --std=f2023");
+        }
+        ofort_warning(I, peek(I)->line,
+                      "warning: nonstandard comma between WRITE control list and I/O list");
+        advance(I);
     }
 
     /* output items */
@@ -7492,6 +7518,10 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
             ofort_error(I, "Unsupported OOP feature at line %d: SELECT TYPE is not supported yet", t->line);
         return parse_select_case(I);
     }
+    if (token_ident_upper(t, "SELECTCASE")) {
+        leave_spec_section(I);
+        return parse_select_case(I);
+    }
 
     /* PRINT */
     if (t->type == FTOK_PRINT) { leave_spec_section(I); return parse_print(I); }
@@ -9159,6 +9189,25 @@ static void value_to_string(OfortInterpreter *I, OfortValue v, char *buf, int bu
             buf[0] = '\0';
             break;
     }
+}
+
+static void trace_assignment_value(OfortInterpreter *I, OfortNode *lhs, OfortValue value) {
+    char vbuf[1024];
+    int written;
+
+    if (!I || !I->trace_assign || I->warn_len >= (int)sizeof(I->warnings) - 1) return;
+    (void)lhs;
+    value_to_string(I, value, vbuf, sizeof(vbuf));
+    written = snprintf(I->warnings + I->warn_len,
+                       sizeof(I->warnings) - (size_t)I->warn_len,
+                       "%s\n", vbuf);
+    if (written < 0) return;
+    if (written >= (int)sizeof(I->warnings) - I->warn_len) {
+        I->warn_len = (int)sizeof(I->warnings) - 1;
+        I->warnings[I->warn_len] = '\0';
+        return;
+    }
+    I->warn_len += written;
 }
 
 static int string_equal_fortran(const char *a, const char *b) {
@@ -13344,6 +13393,106 @@ static const char *extract_forall_lhs_name(OfortNode *lhs) {
     return NULL;
 }
 
+static int check_semantics_is_spec_node(OfortNode *n) {
+    if (!n) return 0;
+    switch (n->type) {
+        case FND_IMPLICIT_NONE:
+        case FND_VARDECL:
+        case FND_PARAMDECL:
+        case FND_TYPE_DEF:
+        case FND_USE:
+        case FND_INTERFACE:
+        case FND_MODULE:
+        case FND_SUBROUTINE:
+        case FND_FUNCTION:
+        case FND_STMT_FUNCTION:
+        case FND_BLOCK_DATA:
+        case FND_FORMAT:
+        case FND_DATA:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static void check_semantics_identifier(OfortInterpreter *I, OfortNode *n) {
+    int has_implicit_type = 0;
+
+    if (!I || !n || !n->name[0]) return;
+    if (find_var(I, n->name) || find_func(I, n->name) || find_generic(I, n->name)) return;
+    if (!current_scope_has_implicit_none(I)) {
+        (void)implicit_type_for_name(I, n->name, &has_implicit_type);
+        if (has_implicit_type) return;
+    }
+    ofort_error(I, "Undefined variable '%s' at line %d", n->name, n->line);
+}
+
+static void check_semantics_block(OfortInterpreter *I, OfortNode *block) {
+    if (!block) return;
+    for (int i = 0; i < block->n_stmts; i++) {
+        OfortNode *s = block->stmts[i];
+        if (!s) continue;
+        if (check_semantics_is_spec_node(s)) {
+            exec_node(I, s);
+        } else {
+            check_semantics_node(I, s);
+        }
+    }
+}
+
+static void check_semantics_node(OfortInterpreter *I, OfortNode *n) {
+    if (!I || !n) return;
+    if (n->line > 0) I->current_line = n->line;
+
+    switch (n->type) {
+        case FND_PROGRAM: {
+            OfortNode *body = n->children[0];
+            push_scope(I);
+            check_semantics_block(I, body);
+            pop_scope(I);
+            return;
+        }
+        case FND_BLOCK:
+            check_semantics_block(I, n);
+            return;
+        case FND_BLOCK_CONSTRUCT:
+            push_scope(I);
+            check_semantics_node(I, n->children[0]);
+            pop_scope(I);
+            return;
+        case FND_IDENT:
+            check_semantics_identifier(I, n);
+            return;
+        case FND_FUNC_CALL:
+            if (!find_var(I, n->name) && !find_func(I, n->name) &&
+                !find_generic(I, n->name) && !is_intrinsic(n->name) &&
+                current_scope_has_implicit_none(I)) {
+                ofort_error(I, "Undefined variable '%s' at line %d", n->name, n->line);
+            }
+            for (int i = 0; i < n->n_stmts; i++) {
+                check_semantics_node(I, n->stmts[i]);
+            }
+            for (int i = 0; i < n->n_children; i++) {
+                check_semantics_node(I, n->children[i]);
+            }
+            return;
+        case FND_CALL:
+            for (int i = 0; i < n->n_stmts; i++) {
+                check_semantics_node(I, n->stmts[i]);
+            }
+            return;
+        default:
+            break;
+    }
+
+    for (int i = 0; i < n->n_children; i++) {
+        check_semantics_node(I, n->children[i]);
+    }
+    for (int i = 0; i < n->n_stmts; i++) {
+        check_semantics_node(I, n->stmts[i]);
+    }
+}
+
 static void collect_forall_target_var(OfortInterpreter *I, OfortVar ***vars_ptr, int *n_vars, int *cap_vars, OfortVar *var) {
     if (!var) return;
     for (int i = 0; i < *n_vars; i++) {
@@ -14360,6 +14509,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             rhs = eval_node(I, rhs_node);
             free_value(target);
             *target = rhs;
+            trace_assignment_value(I, lhs, rhs);
             break;
         }
         if (lhs->type != FND_IDENT)
@@ -14378,6 +14528,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         ptr->pointer_has_slice = has_slice;
         ptr->pointer_slice_start = slice_start;
         ptr->pointer_slice_end = slice_end;
+        trace_assignment_value(I, lhs, ptr->val);
         break;
     }
 
@@ -14468,8 +14619,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         }
                     }
                 }
+                trace_assignment_value(I, lhs, rhs);
                 free_value(&rhs);
             } else {
+                trace_assignment_value(I, lhs, rhs);
                 set_var(I, lhs->name, rhs);
             }
         } else if (lhs->type == FND_FUNC_CALL) {
@@ -14479,6 +14632,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (var->is_protected) ofort_error(I, "Cannot assign to PROTECTED variable '%s'", lhs->name);
             if (var->val.type == FVAL_CHARACTER) {
                 assign_character_substring(I, var, lhs, &rhs);
+                trace_assignment_value(I, lhs, rhs);
                 free_value(&rhs);
                 break;
             }
@@ -14486,6 +14640,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 ofort_error(I, "'%s' is not an array", lhs->name);
 
             assign_array_ref(I, var, lhs, &rhs);
+            trace_assignment_value(I, lhs, rhs);
             free_value(&rhs);
         } else if (lhs->type == FND_ARRAY_REF) {
             OfortValue *target = member_lvalue(I, lhs);
@@ -14495,6 +14650,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
             free_value(target);
             *target = rhs;
+            trace_assignment_value(I, lhs, rhs);
         } else if (lhs->type == FND_MEMBER) {
             /* Derived type member assignment: obj%field = val */
             if ((str_eq_nocase(lhs->name, "re") || str_eq_nocase(lhs->name, "im")) &&
@@ -14505,6 +14661,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 if (v->val.type == FVAL_COMPLEX) {
                     if (want_re) v->val.v.cx.re = val_to_real(rhs);
                     else v->val.v.cx.im = val_to_real(rhs);
+                    trace_assignment_value(I, lhs, rhs);
                     free_value(&rhs);
                     break;
                 }
@@ -14520,11 +14677,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         if (want_re) v->val.v.arr.data[i].v.cx.re = part;
                         else v->val.v.arr.data[i].v.cx.im = part;
                     }
+                    trace_assignment_value(I, lhs, rhs);
                     free_value(&rhs);
                     break;
                 }
             }
             if (assign_derived_array_member(I, lhs, &rhs)) {
+                trace_assignment_value(I, lhs, rhs);
                 free_value(&rhs);
                 break;
             }
@@ -14558,11 +14717,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                             }
                         }
                     }
+                    trace_assignment_value(I, lhs, rhs);
                     free_value(&rhs);
                     break;
                 }
                 free_value(target);
                 *target = rhs;
+                trace_assignment_value(I, lhs, rhs);
                 break;
             }
             free_value(&rhs);
@@ -14751,47 +14912,49 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 matched = 1;
             } else {
                 int match = 0;
-                if (cb->n_children >= 3) {
-                    /* range: lo:hi, :hi, or lo: */
-                    long long sv = val_to_int(sel);
-                    int lower_ok = 1;
-                    int upper_ok = 1;
-                    if (cb->children[0]) {
-                        OfortValue lo = eval_node(I, cb->children[0]);
-                        lower_ok = (sv >= val_to_int(lo));
-                        free_value(&lo);
-                    }
-                    if (cb->children[1]) {
-                        OfortValue hi = eval_node(I, cb->children[1]);
-                        upper_ok = (sv <= val_to_int(hi));
-                        free_value(&hi);
-                    }
-                    match = lower_ok && upper_ok;
-                } else {
-                    /* single value */
-                    OfortValue case_val = eval_node(I, cb->children[0]);
-                    if (case_val.type == FVAL_ARRAY) {
-                        for (int ci = 0; ci < case_val.v.arr.len && !match; ci++) {
-                            OfortValue elem = array_element_value(&case_val, ci);
-                            if (sel.type == FVAL_CHARACTER || elem.type == FVAL_CHARACTER) {
-                                char sb[OFORT_MAX_STRLEN], cb2[OFORT_MAX_STRLEN];
-                                value_to_string(I, sel, sb, sizeof(sb));
-                                value_to_string(I, elem, cb2, sizeof(cb2));
-                                match = (string_compare_fortran(sb, cb2) == 0);
-                            } else {
-                                match = (val_to_int(sel) == val_to_int(elem));
-                            }
-                            free_value(&elem);
+                for (int si = 0; si < cb->n_stmts && !match; si++) {
+                    OfortNode *selector = cb->stmts[si];
+                    if (selector && selector->type == FND_CASE_BLOCK && selector->n_children == 2) {
+                        /* range selector: lo:hi, :hi, or lo: */
+                        long long sv = val_to_int(sel);
+                        int lower_ok = 1;
+                        int upper_ok = 1;
+                        if (selector->children[0]) {
+                            OfortValue lo = eval_node(I, selector->children[0]);
+                            lower_ok = (sv >= val_to_int(lo));
+                            free_value(&lo);
                         }
-                    } else if (sel.type == FVAL_CHARACTER || case_val.type == FVAL_CHARACTER) {
-                        char sb[OFORT_MAX_STRLEN], cb2[OFORT_MAX_STRLEN];
-                        value_to_string(I, sel, sb, sizeof(sb));
-                        value_to_string(I, case_val, cb2, sizeof(cb2));
-                        match = (string_compare_fortran(sb, cb2) == 0);
+                        if (selector->children[1]) {
+                            OfortValue hi = eval_node(I, selector->children[1]);
+                            upper_ok = (sv <= val_to_int(hi));
+                            free_value(&hi);
+                        }
+                        match = lower_ok && upper_ok;
                     } else {
-                        match = (val_to_int(sel) == val_to_int(case_val));
+                        OfortValue case_val = eval_node(I, selector);
+                        if (case_val.type == FVAL_ARRAY) {
+                            for (int ci = 0; ci < case_val.v.arr.len && !match; ci++) {
+                                OfortValue elem = array_element_value(&case_val, ci);
+                                if (sel.type == FVAL_CHARACTER || elem.type == FVAL_CHARACTER) {
+                                    char sb[OFORT_MAX_STRLEN], cb2[OFORT_MAX_STRLEN];
+                                    value_to_string(I, sel, sb, sizeof(sb));
+                                    value_to_string(I, elem, cb2, sizeof(cb2));
+                                    match = (string_compare_fortran(sb, cb2) == 0);
+                                } else {
+                                    match = (val_to_int(sel) == val_to_int(elem));
+                                }
+                                free_value(&elem);
+                            }
+                        } else if (sel.type == FVAL_CHARACTER || case_val.type == FVAL_CHARACTER) {
+                            char sb[OFORT_MAX_STRLEN], cb2[OFORT_MAX_STRLEN];
+                            value_to_string(I, sel, sb, sizeof(sb));
+                            value_to_string(I, case_val, cb2, sizeof(cb2));
+                            match = (string_compare_fortran(sb, cb2) == 0);
+                        } else {
+                            match = (val_to_int(sel) == val_to_int(case_val));
+                        }
+                        free_value(&case_val);
                     }
-                    free_value(&case_val);
                 }
                 if (match) {
                     int body_idx = cb->n_children - 1;
@@ -18730,6 +18893,11 @@ int ofort_check(OfortInterpreter *interp, const char *source) {
     stage_start = ofort_monotonic_seconds();
     interp->ast = parse_program(interp);
     interp->timing.parse = ofort_monotonic_seconds() - stage_start;
+    stage_start = ofort_monotonic_seconds();
+    if (interp->ast && interp->ast->type == FND_BLOCK) {
+        check_semantics_block(interp, interp->ast);
+    }
+    interp->timing.register_time = ofort_monotonic_seconds() - stage_start;
     interp->timing.total = ofort_monotonic_seconds() - total_start;
     {
         int rc = interp->has_error ? -1 : 0;
@@ -18793,6 +18961,12 @@ void ofort_set_line_profile_enabled(OfortInterpreter *interp, int enabled) {
     if (interp) {
         interp->line_profile_enabled = enabled ? 1 : 0;
         if (!enabled) clear_line_profile(interp);
+    }
+}
+
+void ofort_set_trace_assign(OfortInterpreter *interp, int enabled) {
+    if (interp) {
+        interp->trace_assign = enabled ? 1 : 0;
     }
 }
 
