@@ -1310,6 +1310,23 @@ static void register_generic(OfortInterpreter *I, OfortNode *node) {
     }
 }
 
+static void register_generic_procedure(OfortInterpreter *I, const char *generic_name, const char *procedure_name) {
+    OfortGeneric *g;
+    if (!generic_name || !generic_name[0] || !procedure_name || !procedure_name[0]) return;
+    g = find_generic(I, generic_name);
+    if (!g) {
+        ensure_generic_capacity(I, 1);
+        g = &I->generics[I->n_generics++];
+        memset(g, 0, sizeof(*g));
+        copy_cstr(g->name, sizeof(g->name), generic_name);
+    }
+    for (int i = 0; i < g->n_procedures; i++) {
+        if (str_eq_nocase(g->procedures[i], procedure_name)) return;
+    }
+    if (g->n_procedures >= OFORT_MAX_PARAMS) too_many_params_error(I, "generic interface procedures");
+    copy_cstr(g->procedures[g->n_procedures++], sizeof(g->procedures[0]), procedure_name);
+}
+
 static OfortFunc *register_func(OfortInterpreter *I, const char *name, OfortNode *node, int is_function) {
     for (int i = 0; i < I->n_funcs; i++) {
         if (str_eq_nocase(I->funcs[i].name, name)) {
@@ -2000,10 +2017,11 @@ static void tokenize(OfortInterpreter *I, const char *src) {
         if (*p == '.') {
             const char *start = p;
             p++;
-            char dotword[20];
+            char dotword[256];
             int dlen = 0;
-            while (*p && *p != '.' && dlen < 18) {
-                dotword[dlen++] = (char)toupper((unsigned char)*p);
+            while (*p && *p != '.') {
+                if (dlen < (int)sizeof(dotword) - 1)
+                    dotword[dlen++] = (char)toupper((unsigned char)*p);
                 p++;
             }
             dotword[dlen] = '\0';
@@ -6106,6 +6124,41 @@ static OfortNode *parse_type_def(OfortInterpreter *I) {
                         n->n_params++;
                         if (check(I, FTOK_COMMA)) advance(I);
                         else break;
+                    }
+                    skip_to_next_line(I);
+                    continue;
+                } else if (token_ident_upper(peek(I), "GENERIC")) {
+                    char generic_name[256];
+                    advance(I);
+                    generic_name[0] = '\0';
+                    while (!check(I, FTOK_DCOLON) && !check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
+                        advance(I);
+                    }
+                    if (check(I, FTOK_DCOLON)) advance(I);
+                    if (parse_operator_designator(I, generic_name, sizeof(generic_name))) {
+                        /* operator name copied */
+                    } else if (token_can_be_name(peek(I))) {
+                        copy_cstr(generic_name, sizeof(generic_name), token_name_text(advance(I)));
+                    }
+                    if (check(I, FTOK_POINTER_ASSIGN)) advance(I);
+                    while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
+                        if (check(I, FTOK_COMMA)) {
+                            advance(I);
+                            continue;
+                        }
+                        if (token_can_be_name(peek(I))) {
+                            OfortToken *proc = advance(I);
+                            if (n->n_params >= OFORT_MAX_PARAMS) too_many_params_error(I, "type-bound generics");
+                            copy_cstr(n->param_names[n->n_params],
+                                      sizeof(n->param_names[n->n_params]),
+                                      generic_name);
+                            copy_cstr(n->binding_proc_names[n->n_params],
+                                      sizeof(n->binding_proc_names[n->n_params]),
+                                      token_name_text(proc));
+                            n->n_params++;
+                        } else {
+                            advance(I);
+                        }
                     }
                     skip_to_next_line(I);
                     continue;
@@ -13793,6 +13846,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                       sizeof(td->binding_proc_names[td->n_bindings]),
                       n->binding_proc_names[i]);
             td->n_bindings++;
+            if (n->param_names[i][0] == '.')
+                register_generic_procedure(I, n->param_names[i], n->binding_proc_names[i]);
         }
         /* Parse field declarations from stmts */
         for (int i = 0; i < n->n_stmts; i++) {
