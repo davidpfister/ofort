@@ -11,6 +11,7 @@ void ofort_c_reset(void *interp);
 
 int ofort_c_execute(void *interp, const char *source);
 int ofort_c_check(void *interp, const char *source);
+int ofort_c_call_real1(void *interp, const char *name, double x, double *result);
 
 void ofort_c_set_implicit_typing(void *interp, int enabled);
 void ofort_c_set_warnings_enabled(void *interp, int enabled);

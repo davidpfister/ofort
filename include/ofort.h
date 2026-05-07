@@ -334,6 +334,9 @@ int ofort_get_timing(OfortInterpreter *interp, OfortTiming *timing);
 int ofort_get_line_profile(OfortInterpreter *interp, OfortLineProfileEntry *entries,
                            int max_entries, int *n_entries);
 
+/* Call a registered interpreted function as REAL/DOUBLE PRECISION f(REAL). */
+int ofort_call_real1(OfortInterpreter *interp, const char *name, double x, double *result);
+
 /* Reset for next execution (clears output/errors but keeps state) */
 void ofort_reset(OfortInterpreter *interp);
 

@@ -296,7 +296,14 @@ call interp%destroy()
 
 The current demo is `bindings/fortran/demo_eval.f90`. It creates an
 interpreter, executes a small source string, prints captured `ofort` output,
-then enables assignment tracing and prints the captured trace output.
+then enables assignment tracing and prints the captured trace output. It also
+defines an interpreted Fortran function and calls it directly from compiled
+Fortran with the typed `call_real1` wrapper:
+
+```fortran
+rc = interp%execute("real function f(x); real :: x; f = x*x + 1; end")
+y = interp%call_real1("f", 3.0d0)
+```
 
 Build the demo from the repository root with:
 
@@ -315,12 +322,16 @@ Expected output:
 ```text
 32
 56
+10.000000000000000
 ```
 
 The binding is intended for embedding `ofort` in Fortran programs for
 experimentation, dynamic evaluation, and small interpreter-driven workflows. It
-does not currently expose a typed direct-call API for invoking interpreted
-Fortran functions as native callbacks.
+currently exposes a minimal typed direct-call API for invoking an interpreted
+`real`/`double precision` function of one real argument. Broader direct-call
+support, such as integer, logical, character, multi-argument, and array
+signatures, would require additional typed wrappers and argument/result
+marshalling.
 
 ## Benchmarks
 

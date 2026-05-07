@@ -3,6 +3,7 @@ program demo_eval
   implicit none
   type(ofort_interpreter) :: interp
   integer :: rc
+  real(8) :: y
 
   call interp%create()
   rc = interp%execute("integer :: n = 2; print*,n**5")
@@ -14,6 +15,12 @@ program demo_eval
   rc = interp%execute("integer :: x; x = 7 * 8")
   call check()
   write (*, '(a)', advance='no') interp%warnings()
+
+  call interp%reset()
+  rc = interp%execute("real function f(x); real :: x; f = x*x + 1; end")
+  call check()
+  y = interp%call_real1("f", 3.0d0)
+  write (*, '(g0)') y
   call interp%destroy()
   
   contains

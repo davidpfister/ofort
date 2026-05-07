@@ -19571,6 +19571,40 @@ int ofort_get_line_profile(OfortInterpreter *interp, OfortLineProfileEntry *entr
     return 0;
 }
 
+int ofort_call_real1(OfortInterpreter *interp, const char *name, double x, double *result) {
+    OfortFunc *func;
+    OfortValue args[1];
+    OfortValue ret;
+
+    if (!interp || !name || !result) return -1;
+    interp->error[0] = '\0';
+    interp->has_error = 0;
+    interp->returning = 0;
+    interp->exiting = 0;
+    interp->cycling = 0;
+    interp->stopping = 0;
+    interp->goto_active = 0;
+    interp->goto_label = 0;
+    interp->current_line = 0;
+
+    if (setjmp(interp->err_jmp) != 0) {
+        return -1;
+    }
+
+    func = find_func(interp, name);
+    if (!func || !func->is_function) {
+        snprintf(interp->error, sizeof(interp->error), "Function '%s' not found", name);
+        interp->has_error = 1;
+        return -1;
+    }
+    args[0] = make_double(x);
+    ret = execute_user_function_with_args(interp, func, args, 1);
+    free_value(&args[0]);
+    *result = val_to_real(ret);
+    free_value(&ret);
+    return 0;
+}
+
 void ofort_reset(OfortInterpreter *interp) {
     if (!interp) return;
     interp->output[0] = '\0';

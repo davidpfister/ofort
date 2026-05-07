@@ -16,6 +16,7 @@ module ofort_binding
      procedure :: reset => ofort_fortran_reset
      procedure :: execute => ofort_fortran_execute
      procedure :: check => ofort_fortran_check
+     procedure :: call_real1 => ofort_fortran_call_real1
      procedure :: output => ofort_fortran_output
      procedure :: error => ofort_fortran_error
      procedure :: warnings => ofort_fortran_warnings
@@ -55,6 +56,15 @@ module ofort_binding
        character(kind=c_char), dimension(*), intent(in) :: source
        integer(c_int) :: rc
      end function ofort_c_check
+
+     function ofort_c_call_real1(p, name, x, y) bind(c) result(rc)
+       import :: c_ptr, c_char, c_double, c_int
+       type(c_ptr), value :: p
+       character(kind=c_char), dimension(*), intent(in) :: name
+       real(c_double), value :: x
+       real(c_double), intent(out) :: y
+       integer(c_int) :: rc
+     end function ofort_c_call_real1
 
      subroutine ofort_c_set_implicit_typing(p, enabled) bind(c)
        import :: c_ptr, c_int
@@ -155,6 +165,20 @@ contains
     c_source = to_c_string(source)
     rc = ofort_c_check(this%handle, c_source)
   end function ofort_fortran_check
+
+  function ofort_fortran_call_real1(this, name, x) result(y)
+    class(ofort_interpreter), intent(inout) :: this
+    character(len=*), intent(in) :: name
+    real(c_double), intent(in) :: x
+    real(c_double) :: y
+    integer(c_int) :: rc
+    character(kind=c_char), allocatable :: c_name(:)
+
+    call ensure_created(this)
+    c_name = to_c_string(name)
+    rc = ofort_c_call_real1(this%handle, c_name, x, y)
+    if (rc /= 0_c_int) y = 0.0_c_double
+  end function ofort_fortran_call_real1
 
   function ofort_fortran_output(this) result(text)
     class(ofort_interpreter), intent(inout) :: this

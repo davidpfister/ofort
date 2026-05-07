@@ -39,6 +39,11 @@ int ofort_c_check(void *interp, const char *source) {
     return ofort_check((OfortInterpreter *)interp, source);
 }
 
+int ofort_c_call_real1(void *interp, const char *name, double x, double *result) {
+    if (!interp || !name || !result) return -1;
+    return ofort_call_real1((OfortInterpreter *)interp, name, x, result);
+}
+
 void ofort_c_set_implicit_typing(void *interp, int enabled) {
     ofort_set_implicit_typing((OfortInterpreter *)interp, enabled);
 }
