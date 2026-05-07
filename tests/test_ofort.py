@@ -60,6 +60,7 @@ def case_files():
             "xalternate_return_obsolescent.f90",
             "xalternate_return_dummy_obsolescent.f90",
             "xallocate_already_allocated.f90",
+            "ximplicit_derived_type.f90",
         }
     )
 
@@ -125,6 +126,23 @@ def test_alternate_return_dummy_is_reported_obsolescent():
     assert expected in result.stderr
 
 
+def test_implicit_derived_type_warns_but_runs():
+    source = CASES / "ximplicit_derived_type.f90"
+    expected = source.with_suffix(".out").read_text(encoding="utf-8")
+    result = subprocess.run(
+        [str(OFORT), str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected
+    assert "warning: derived-type implicit typing is legal but discouraged; prefer explicit declarations" in result.stderr
+    assert "line 4: implicit type(t) (a-b)" in result.stderr
+
+
 def test_allocate_rejects_already_allocated_variable():
     source = CASES / "xallocate_already_allocated.f90"
     result = subprocess.run(
@@ -156,6 +174,53 @@ def test_parser_expected_token_errors_are_readable(tmp_path):
     assert "Expected token type" not in result.stderr
     assert "Syntax error at line 1: expected identifier but found ':'" in result.stderr
     assert "line 1: integer : i" in result.stderr
+
+
+def test_check_reports_undeclared_identifier_with_implicit_none(tmp_path):
+    source = tmp_path / "xcheck_implicit_none.f90"
+    source.write_text(
+        "program main\n"
+        "  implicit none\n"
+        "  integer :: n\n"
+        "  n = 2**5\n"
+        "  print *, m\n"
+        "end program main\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [str(OFORT), "--check", str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode != 0
+    assert "Undefined variable 'm' at line 5" in result.stderr
+    assert "line 5:   print *, m" in result.stderr
+
+
+def test_trace_assign_reports_assignment_values(tmp_path):
+    source = tmp_path / "xtrace_assign.f90"
+    source.write_text(
+        "integer :: x\n"
+        "x = 1\n"
+        "x = x + 2\n"
+        "print *, x\n"
+        "end\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [str(OFORT), "--trace-assign", str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "3\n"
+    assert result.stderr == "1\n3\n"
 
 
 def test_xsub_random_statistics():
@@ -791,6 +856,46 @@ def test_w_option_suppresses_real_star_8_warning(tmp_path):
     assert result.returncode == 0, result.stderr
     assert result.stdout == "8 1.25\n"
     assert result.stderr == ""
+
+
+def test_write_extra_comma_warns_and_runs(tmp_path):
+    source = tmp_path / "xwrite_comma.f90"
+    source.write_text(
+        'write (*,*), "hello"\n'
+        "end\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [str(OFORT), str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "hello\n"
+    assert "warning: nonstandard comma between WRITE control list and I/O list" in result.stderr
+
+
+def test_write_extra_comma_rejected_by_f2023(tmp_path):
+    source = tmp_path / "xwrite_comma.f90"
+    source.write_text(
+        'write (*,*), "hello"\n'
+        "end\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [str(OFORT), "--std=f2023", str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "nonstandard comma between WRITE control list and I/O list is not allowed with --std=f2023" in result.stderr
 
 
 def test_fast_option_preserves_counted_do_loop_result():

@@ -27,6 +27,10 @@ development. It is not a production Fortran compiler.
 - `scripts/xofort.py` is a batch runner for trying many source files one at a
   time.
 - `ofort_gui.py` is a small Tkinter GUI wrapper around `ofort.exe`.
+- `include/ofort_c_api.h` and `src/ofort_c_api.c` provide a small C ABI wrapper
+  suitable for language bindings.
+- `bindings/fortran` contains a Fortran `iso_c_binding` wrapper and demo
+  program.
 - `examples` contains small demonstration programs when present.
 
 Generated files such as `ofort.exe`, `ofort.build`, `main*.f90`, compiler
@@ -265,6 +269,58 @@ The GUI should run on Windows, macOS, and Linux when Python includes Tkinter and
 an `ofort` executable is either next to `ofort_gui.py` or available on `PATH`.
 External compiler buttons require the corresponding compiler executable
 (`gfortran`, `ifx`, or `lfortran`) to be installed and available on `PATH`.
+
+## Fortran Binding
+
+`ofort` also includes an experimental Fortran binding. The binding is built in
+two layers:
+
+- `include/ofort_c_api.h` and `src/ofort_c_api.c` expose a small stable C ABI
+  with opaque interpreter handles.
+- `bindings/fortran/ofort_binding.f90` wraps that C ABI using
+  `iso_c_binding`.
+
+The Fortran wrapper provides an `ofort_interpreter` derived type with methods
+such as:
+
+```fortran
+use ofort_binding, only: ofort_interpreter
+type(ofort_interpreter) :: interp
+integer :: rc
+
+call interp%create()
+rc = interp%execute("integer :: n = 2; print*,n**5")
+write (*, '(a)', advance='no') interp%output()
+call interp%destroy()
+```
+
+The current demo is `bindings/fortran/demo_eval.f90`. It creates an
+interpreter, executes a small source string, prints captured `ofort` output,
+then enables assignment tracing and prints the captured trace output.
+
+Build the demo from the repository root with:
+
+```powershell
+make -f bindings\fortran\makefile
+```
+
+Run it with:
+
+```powershell
+.\bindings\fortran\demo_eval.exe
+```
+
+Expected output:
+
+```text
+32
+56
+```
+
+The binding is intended for embedding `ofort` in Fortran programs for
+experimentation, dynamic evaluation, and small interpreter-driven workflows. It
+does not currently expose a typed direct-call API for invoking interpreted
+Fortran functions as native callbacks.
 
 ## Benchmarks
 
