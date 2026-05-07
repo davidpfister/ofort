@@ -152,9 +152,9 @@ typedef struct OfortValue {
 typedef enum {
     FND_PROGRAM, FND_BLOCK, FND_BLOCK_CONSTRUCT, FND_ASSOCIATE, FND_IMPLICIT_NONE,
     FND_VARDECL, FND_PARAMDECL,
-    FND_SUBROUTINE, FND_FUNCTION, FND_MODULE,
+    FND_SUBROUTINE, FND_FUNCTION, FND_MODULE, FND_BLOCK_DATA,
     FND_TYPE_DEF,
-    FND_IF, FND_DO_LOOP, FND_DO_WHILE, FND_DO_FOREVER, FND_DO_CONCURRENT, FND_FORALL, FND_SELECT_CASE, FND_SELECT_RANK, FND_CASE_BLOCK,
+    FND_IF, FND_DO_LOOP, FND_DO_WHILE, FND_DO_FOREVER, FND_DO_CONCURRENT, FND_FORALL, FND_WHERE, FND_SELECT_CASE, FND_SELECT_RANK, FND_CASE_BLOCK,
     FND_RETURN, FND_EXIT, FND_CYCLE, FND_STOP, FND_GOTO, FND_CONTINUE,
     FND_CALL, FND_PRINT, FND_WRITE, FND_READ_STMT, FND_OPEN, FND_CLOSE, FND_REWIND, FND_INQUIRE,
     FND_ALLOCATE, FND_DEALLOCATE, FND_USE, FND_ACCESS, FND_INTERFACE,
@@ -189,6 +189,8 @@ typedef struct OfortNode {
     OfortValType val_type;
     int bool_val;
     char implicit_types[26];
+    int implicit_char_lens[26];
+    char implicit_type_names[26][64];
     int char_len;           /* CHARACTER(LEN=n) */
     int intent;             /* 0=none, 1=IN, 2=OUT, 3=INOUT */
     int is_allocatable;
@@ -283,6 +285,9 @@ void ofort_set_specialized_fast_paths(OfortInterpreter *interp, int enabled);
 
 /* If enabled, accumulate elapsed execution time by source line. */
 void ofort_set_line_profile_enabled(OfortInterpreter *interp, int enabled);
+
+/* If enabled, assignment statements emit trace diagnostics. */
+void ofort_set_trace_assign(OfortInterpreter *interp, int enabled);
 
 /* If enabled, PRINT/WRITE output to unit 6 is emitted as it is produced. */
 void ofort_set_live_stdout(OfortInterpreter *interp, int enabled);
