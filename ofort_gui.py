@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import tkinter as tk
+import time
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -53,6 +54,7 @@ class OfortGui(tk.Tk):
         self.std_f2023 = tk.BooleanVar(value=False)
         self.fast = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Ready")
+        self.timing = tk.StringVar(value="Time: -")
 
         self._build_ui()
         self.editor.insert("1.0", DEFAULT_SOURCE)
@@ -70,11 +72,21 @@ class OfortGui(tk.Tk):
         ttk.Button(toolbar, text="Browse", command=self.browse_ofort).grid(row=0, column=2, padx=(0, 8))
         ttk.Button(toolbar, text="Open", command=self.open_file).grid(row=0, column=3)
         ttk.Button(toolbar, text="Save", command=self.save_file).grid(row=0, column=4, padx=(4, 0))
-        ttk.Button(toolbar, text="Run", command=self.run_source).grid(row=0, column=5, padx=(12, 0))
-        ttk.Button(toolbar, text="Clear Output", command=self.clear_output).grid(row=0, column=6, padx=(4, 0))
+
+        actions = ttk.Frame(toolbar)
+        actions.grid(row=0, column=5, padx=(12, 0), sticky="w")
+        ttk.Button(actions, text="Run ofort", command=self.run_source).grid(row=0, column=0)
+        ttk.Button(actions, text="Run gfortran", command=lambda: self.run_external_compiler("gfortran", True)).grid(row=0, column=1, padx=(4, 0))
+        ttk.Button(actions, text="Run ifx", command=lambda: self.run_external_compiler("ifx", True)).grid(row=0, column=2, padx=(4, 0))
+        ttk.Button(actions, text="Run LFortran", command=lambda: self.run_external_compiler("lfortran", True)).grid(row=0, column=3, padx=(4, 0))
+        ttk.Button(actions, text="Check ofort", command=self.check_source).grid(row=1, column=0, pady=(4, 0))
+        ttk.Button(actions, text="Compile gfortran", command=lambda: self.run_external_compiler("gfortran", False)).grid(row=1, column=1, padx=(4, 0), pady=(4, 0))
+        ttk.Button(actions, text="Compile ifx", command=lambda: self.run_external_compiler("ifx", False)).grid(row=1, column=2, padx=(4, 0), pady=(4, 0))
+        ttk.Button(actions, text="Compile LFortran", command=lambda: self.run_external_compiler("lfortran", False)).grid(row=1, column=3, padx=(4, 0), pady=(4, 0))
+        ttk.Button(actions, text="Clear Output", command=self.clear_output).grid(row=0, column=4, rowspan=2, padx=(12, 0))
 
         options = ttk.Frame(toolbar)
-        options.grid(row=1, column=0, columnspan=6, sticky="w", pady=(8, 0))
+        options.grid(row=1, column=0, columnspan=5, sticky="w", pady=(8, 0))
         ttk.Checkbutton(options, text="--trace-assign", variable=self.trace_assign).grid(row=0, column=0)
         ttk.Checkbutton(options, text="--no-implicit-typing", variable=self.no_implicit).grid(row=0, column=1, padx=12)
         ttk.Checkbutton(options, text="--std=f2023", variable=self.std_f2023).grid(row=0, column=2)
@@ -104,15 +116,18 @@ class OfortGui(tk.Tk):
         self.configure_syntax_tags()
         paned.add(editor_frame, weight=3)
 
-        output_frame = ttk.Notebook(paned)
-        self.stdout = self._output_text(output_frame, "stdout")
-        self.stderr = self._output_text(output_frame, "stderr")
-        self.assignments = self._output_text(output_frame, "assignments")
-        self.problems = self._problems_table(output_frame)
-        paned.add(output_frame, weight=2)
+        self.output_tabs = ttk.Notebook(paned)
+        self.stdout = self._output_text(self.output_tabs, "stdout")
+        self.stderr = self._output_text(self.output_tabs, "stderr")
+        self.assignments = self._output_text(self.output_tabs, "assignments")
+        self.problems = self._problems_table(self.output_tabs)
+        paned.add(self.output_tabs, weight=2)
 
-        status = ttk.Label(self, textvariable=self.status, anchor="w", padding=(8, 4))
-        status.grid(row=2, column=0, sticky="ew")
+        status_frame = ttk.Frame(self, padding=(8, 4))
+        status_frame.grid(row=2, column=0, sticky="ew")
+        status_frame.columnconfigure(0, weight=1)
+        ttk.Label(status_frame, textvariable=self.status, anchor="w").grid(row=0, column=0, sticky="ew")
+        ttk.Label(status_frame, textvariable=self.timing, anchor="e").grid(row=0, column=1, sticky="e")
 
         self.bind("<Control-o>", lambda _event: self.open_file())
         self.bind("<Control-s>", lambda _event: self.save_file())
@@ -266,6 +281,9 @@ class OfortGui(tk.Tk):
         self.editor.tag_remove("problem_line", "1.0", "end")
         self.status.set("Output cleared")
 
+    def show_output_tab(self, widget: tk.Widget) -> None:
+        self.output_tabs.select(widget.master)
+
     def goto_selected_problem(self, _event: tk.Event | None = None) -> None:
         selection = self.problems.selection()
         if not selection:
@@ -338,13 +356,9 @@ class OfortGui(tk.Tk):
         return args
 
     def run_source(self) -> None:
-        self.stdout.delete("1.0", "end")
-        self.stderr.delete("1.0", "end")
-        self.assignments.delete("1.0", "end")
-        for item in self.problems.get_children():
-            self.problems.delete(item)
-        self.editor.tag_remove("problem_line", "1.0", "end")
+        self.clear_output()
         source = self.editor.get("1.0", "end-1c")
+        total_start = time.perf_counter()
 
         with tempfile.TemporaryDirectory(prefix="ofort_gui_") as tmp:
             source_path = Path(tmp) / "input.f90"
@@ -360,11 +374,14 @@ class OfortGui(tk.Tk):
             except FileNotFoundError:
                 messagebox.showerror(APP_TITLE, f"Could not find executable:\n{self.ofort_path.get()}")
                 self.status.set("Run failed")
+                self.timing.set("Time: -")
                 return
             except subprocess.TimeoutExpired:
                 messagebox.showerror(APP_TITLE, "ofort timed out after 30 seconds")
                 self.status.set("Run timed out")
+                self.timing.set("Time: >30.000 s")
                 return
+        total_elapsed = time.perf_counter() - total_start
 
         self.stdout.insert("1.0", result.stdout)
         self.stderr.insert("1.0", result.stderr)
@@ -375,8 +392,165 @@ class OfortGui(tk.Tk):
                     "1.0",
                     "\n".join(f"{index + 1}: {value}" for index, value in enumerate(values)) + "\n",
                 )
-        self.populate_problems(result.stderr)
+        self.populate_problems(result.stdout + "\n" + result.stderr)
+        if result.returncode == 0 and result.stdout:
+            self.show_output_tab(self.stdout)
+        elif result.stderr:
+            self.show_output_tab(self.stderr)
+        elif self.trace_assign.get():
+            self.show_output_tab(self.assignments)
         self.status.set(f"Exit code {result.returncode}")
+        self.timing.set(f"Run: {total_elapsed:.3f} s | Total: {total_elapsed:.3f} s")
+
+    def check_source(self) -> None:
+        self.clear_output()
+        source = self.editor.get("1.0", "end-1c")
+        total_start = time.perf_counter()
+
+        with tempfile.TemporaryDirectory(prefix="ofort_gui_check_") as tmp:
+            source_path = Path(tmp) / "input.f90"
+            source_path.write_text(source, encoding="utf-8")
+            args = [self.ofort_path.get()]
+            if self.no_implicit.get():
+                args.append("--no-implicit-typing")
+            if self.std_f2023.get():
+                args.append("--std=f2023")
+            args.extend(["--check", str(source_path)])
+            try:
+                check_start = time.perf_counter()
+                result = subprocess.run(
+                    args,
+                    cwd=Path(__file__).resolve().parent,
+                    text=True,
+                    capture_output=True,
+                    timeout=30,
+                )
+                check_elapsed = time.perf_counter() - check_start
+            except FileNotFoundError:
+                messagebox.showerror(APP_TITLE, f"Could not find executable:\n{self.ofort_path.get()}")
+                self.status.set("Check failed")
+                self.timing.set("Time: -")
+                return
+            except subprocess.TimeoutExpired:
+                messagebox.showerror(APP_TITLE, "ofort check timed out after 30 seconds")
+                self.status.set("Check timed out")
+                self.timing.set("Check: >30.000 s")
+                return
+        total_elapsed = time.perf_counter() - total_start
+
+        self.stdout.insert("1.0", result.stdout)
+        self.stderr.insert("1.0", result.stderr)
+        self.populate_problems(result.stdout + "\n" + result.stderr)
+        self.show_output_tab(self.stderr)
+        self.status.set(f"ofort check exit code {result.returncode}")
+        self.timing.set(f"Check: {check_elapsed:.3f} s | Total: {total_elapsed:.3f} s")
+
+    def run_external_compiler(self, compiler: str, run_after_compile: bool) -> None:
+        self.clear_output()
+        source = self.editor.get("1.0", "end-1c")
+        total_start = time.perf_counter()
+        compile_elapsed = 0.0
+        run_elapsed = 0.0
+
+        with tempfile.TemporaryDirectory(prefix=f"ofort_gui_{compiler}_") as tmp:
+            tmp_path = Path(tmp)
+            source_path = tmp_path / "input.f90"
+            exe_path = tmp_path / ("input.exe" if os.name == "nt" else "input")
+            source_path.write_text(source, encoding="utf-8")
+
+            if compiler == "ifx":
+                compile_args = [compiler, "-nologo", str(source_path), "-o", str(exe_path)]
+            else:
+                compile_args = [compiler, str(source_path), "-o", str(exe_path)]
+
+            try:
+                compile_start = time.perf_counter()
+                compile_result = subprocess.run(
+                    compile_args,
+                    cwd=tmp_path,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    timeout=30,
+                )
+                compile_elapsed = time.perf_counter() - compile_start
+            except FileNotFoundError:
+                messagebox.showerror(APP_TITLE, f"Could not find compiler on PATH:\n{compiler}")
+                self.status.set(f"{compiler} not found")
+                self.timing.set("Time: -")
+                return
+            except subprocess.TimeoutExpired:
+                messagebox.showerror(APP_TITLE, f"{compiler} compile timed out after 30 seconds")
+                self.status.set(f"{compiler} compile timed out")
+                self.timing.set("Compile: >30.000 s")
+                return
+
+            stderr = self.clean_compiler_output(self.filter_compiler_stdout(compiler, compile_result.stdout or ""))
+            stdout = ""
+            run_returncode = compile_result.returncode
+
+            if run_after_compile and compile_result.returncode == 0:
+                try:
+                    run_start = time.perf_counter()
+                    run_result = subprocess.run(
+                        [str(exe_path)],
+                        cwd=tmp_path,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        timeout=30,
+                    )
+                    run_elapsed = time.perf_counter() - run_start
+                except subprocess.TimeoutExpired:
+                    messagebox.showerror(APP_TITLE, f"{compiler} executable timed out after 30 seconds")
+                    self.status.set(f"{compiler} run timed out")
+                    self.timing.set(f"Compile: {compile_elapsed:.3f} s | Run: >30.000 s")
+                    return
+                stdout += self.clean_compiler_output(run_result.stdout or "")
+                run_returncode = run_result.returncode
+            if compile_result.returncode != 0 and not stderr.strip():
+                stderr = f"{compiler} exited with code {compile_result.returncode} and produced no captured diagnostics\n"
+        total_elapsed = time.perf_counter() - total_start
+
+        self.stdout.insert("1.0", stdout)
+        self.stderr.insert("1.0", stderr)
+        self.populate_problems(stdout + "\n" + stderr)
+        if not run_after_compile:
+            self.show_output_tab(self.stderr)
+        elif compile_result.returncode == 0 and run_returncode == 0 and stdout:
+            self.show_output_tab(self.stdout)
+        elif stderr:
+            self.show_output_tab(self.stderr)
+        if compile_result.returncode != 0:
+            self.status.set(f"{compiler} compile exit code {compile_result.returncode}")
+        elif run_after_compile:
+            self.status.set(f"{compiler} run exit code {run_returncode}")
+        else:
+            self.status.set(f"{compiler} compile exit code 0")
+        if run_after_compile:
+            self.timing.set(
+                f"Compile: {compile_elapsed:.3f} s | Run: {run_elapsed:.3f} s | Total: {total_elapsed:.3f} s"
+            )
+        else:
+            self.timing.set(f"Compile: {compile_elapsed:.3f} s | Total: {total_elapsed:.3f} s")
+
+    @staticmethod
+    def filter_compiler_stdout(compiler: str, stdout: str) -> str:
+        if compiler != "lfortran":
+            return stdout
+        kept: list[str] = []
+        for line in stdout.splitlines(keepends=True):
+            stripped = line.strip()
+            if stripped.startswith("Creating library ") and " and object " in stripped:
+                continue
+            kept.append(line)
+        return "".join(kept)
+
+    @staticmethod
+    def clean_compiler_output(text: str) -> str:
+        text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
+        text = re.sub(r"(?<!\S)\[[0-9;?]*[A-Za-z]", "", text)
+        return text
 
     def populate_problems(self, stderr: str) -> None:
         seen: set[tuple[int, str]] = set()
