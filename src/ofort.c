@@ -10,6 +10,7 @@
  */
 
 #include "ofort.h"
+#include "ofort_stats.h"
 #include "ofort_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -10883,8 +10884,8 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                     return arr_op;
                 }
                 for (int i = 0; i < left.v.arr.len; i++) {
-                    OfortValue lv = left.v.arr.data[i];
-                    OfortValue rv = right.v.arr.data[i];
+                    OfortValue lv = array_element_value(&left, i);
+                    OfortValue rv = array_element_value(&right, i);
                     double a = val_to_real(lv), b = val_to_real(rv);
                     double res;
                     switch (n->type) {
@@ -10895,11 +10896,21 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                         case FND_POWER: res = pow(a, b); break;
                         default: res = 0; break;
                     }
-                    free_value(&arr_op.v.arr.data[i]);
-                    if (arr_op.v.arr.elem_type == FVAL_INTEGER)
-                        arr_op.v.arr.data[i] = make_integer((long long)res);
-                    else
-                        arr_op.v.arr.data[i] = make_real(res);
+                    if (arr_op.v.arr.real_data) {
+                        arr_op.v.arr.real_data[i] = res;
+                    } else if (arr_op.v.arr.int_data) {
+                        arr_op.v.arr.int_data[i] = (long long)res;
+                    } else {
+                        free_value(&arr_op.v.arr.data[i]);
+                        if (arr_op.v.arr.elem_type == FVAL_INTEGER)
+                            arr_op.v.arr.data[i] = make_integer((long long)res);
+                        else if (arr_op.v.arr.elem_type == FVAL_DOUBLE)
+                            arr_op.v.arr.data[i] = make_double(res);
+                        else
+                            arr_op.v.arr.data[i] = make_real(res);
+                    }
+                    free_value(&lv);
+                    free_value(&rv);
                 }
                 free_value(&left); free_value(&right);
                 return arr_op;
@@ -13566,10 +13577,12 @@ static void validate_pure_procedure_tree(OfortInterpreter *I, OfortNode *proc, O
 }
 
 static void validate_pure_procedure_node(OfortInterpreter *I, OfortNode *n) {
-    char local_names[OFORT_MAX_VARS][256];
+    char (*local_names)[256] = NULL;
     int n_local_names = 0;
 
     if (!n || !n->is_pure) return;
+    local_names = (char (*)[256])calloc(OFORT_MAX_VARS, sizeof(*local_names));
+    if (!local_names) ofort_error(I, "Out of memory");
     for (int i = 0; i < n->n_params; i++) {
         add_pure_local_name(local_names, &n_local_names, n->param_names[i]);
     }
@@ -13579,6 +13592,7 @@ static void validate_pure_procedure_node(OfortInterpreter *I, OfortNode *n) {
     }
     collect_pure_local_names(n->children[0], local_names, &n_local_names);
     validate_pure_procedure_tree(I, n, n->children[0], local_names, n_local_names);
+    free(local_names);
 }
 
 static void check_semantics_identifier(OfortInterpreter *I, OfortNode *n) {
@@ -13607,12 +13621,22 @@ static void check_semantics_block(OfortInterpreter *I, OfortNode *block) {
 }
 
 static int ofort_extension_module_exists(const char *module_name) {
-    return str_eq_nocase(module_name, "ofort_random_mod");
+    return str_eq_nocase(module_name, "ofort_random_mod") ||
+           str_eq_nocase(module_name, "ofort_statistics_mod") ||
+           str_eq_nocase(module_name, "ofort_stats_mod");
 }
 
 static int ofort_extension_module_exports(const char *module_name, const char *name) {
     if (str_eq_nocase(module_name, "ofort_random_mod")) {
         return str_eq_nocase(name, "rnorm");
+    }
+    if (str_eq_nocase(module_name, "ofort_statistics_mod") ||
+        str_eq_nocase(module_name, "ofort_stats_mod")) {
+        return str_eq_nocase(name, "mean") ||
+               str_eq_nocase(name, "variance") ||
+               str_eq_nocase(name, "sd") ||
+               str_eq_nocase(name, "cov") ||
+               str_eq_nocase(name, "cor");
     }
     return 0;
 }
@@ -14060,9 +14084,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
     }
 
     case FND_ASSOCIATE: {
-        OfortValue assoc_vals[OFORT_MAX_PARAMS];
-        int assignable[OFORT_MAX_PARAMS];
+        OfortValue *assoc_vals = (OfortValue *)calloc(OFORT_MAX_PARAMS, sizeof(*assoc_vals));
+        int *assignable = (int *)calloc(OFORT_MAX_PARAMS, sizeof(*assignable));
         int n_assoc = n->n_params;
+        if (!assoc_vals || !assignable) ofort_error(I, "Out of memory");
         for (int i = 0; i < n_assoc; i++) {
             assoc_vals[i] = eval_node(I, n->stmts[i]);
             assignable[i] = associate_selector_is_assignable(I, n->stmts[i]);
@@ -14085,6 +14110,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         }
         pop_scope(I);
         for (int i = 0; i < n_assoc; i++) free_value(&assoc_vals[i]);
+        free(assoc_vals);
+        free(assignable);
         break;
     }
 
@@ -14164,10 +14191,11 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         /* Register module: execute declarations, collect functions */
         if (I->n_modules >= OFORT_MAX_MODULES) ofort_error(I, "Too many modules");
         OfortModule *mod = &I->modules[I->n_modules++];
-        char public_names[OFORT_MAX_PARAMS][256];
-        char private_names[OFORT_MAX_PARAMS][256];
+        char (*public_names)[256] = (char (*)[256])calloc(OFORT_MAX_PARAMS, sizeof(*public_names));
+        char (*private_names)[256] = (char (*)[256])calloc(OFORT_MAX_PARAMS, sizeof(*private_names));
         int n_public_names = 0;
         int n_private_names = 0;
+        if (!public_names || !private_names) ofort_error(I, "Out of memory");
         copy_cstr(mod->name, sizeof(mod->name), n->name);
         mod->n_vars = 0;
         mod->n_types = 0;
@@ -14225,6 +14253,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
         }
         pop_scope(I);
+        free(public_names);
+        free(private_names);
         break;
     }
 
@@ -14250,7 +14280,15 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         import_ofort_extension_intrinsic(I, local, remote);
                     }
                 } else {
-                    import_ofort_extension_intrinsic(I, "rnorm", "rnorm");
+                    if (str_eq_nocase(n->name, "ofort_random_mod")) {
+                        import_ofort_extension_intrinsic(I, "rnorm", "rnorm");
+                    } else {
+                        import_ofort_extension_intrinsic(I, "mean", "mean");
+                        import_ofort_extension_intrinsic(I, "variance", "variance");
+                        import_ofort_extension_intrinsic(I, "sd", "sd");
+                        import_ofort_extension_intrinsic(I, "cov", "cov");
+                        import_ofort_extension_intrinsic(I, "cor", "cor");
+                    }
                 }
                 break;
             }
@@ -15357,9 +15395,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             OfortVar *target = find_var(I, n->children[0]->name);
             if (target && target->val.type == FVAL_CHARACTER) {
                 int saved_len = I->out_len;
-                char saved_output[OFORT_MAX_OUTPUT];
+                char *saved_output = (char *)malloc(OFORT_MAX_OUTPUT);
                 OfortValue text;
-                copy_cstr(saved_output, sizeof(saved_output), I->output);
+                if (!saved_output) ofort_error(I, "Out of memory");
+                copy_cstr(saved_output, OFORT_MAX_OUTPUT, I->output);
                 I->out_len = 0;
                 I->output[0] = '\0';
                 format_output(I, fmt, vals, nvals);
@@ -15373,6 +15412,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 target->val = text;
                 I->out_len = saved_len;
                 copy_cstr(I->output, sizeof(I->output), saved_output);
+                free(saved_output);
             } else {
                 OfortValue uv = eval_node(I, n->children[0]);
                 int unit = (int)val_to_int(uv);
@@ -15966,6 +16006,42 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     }
                 }
                 if (full_section) harvest_val = member_lvalue(I, ref->children[0]);
+            } else if (n->stmts[0]->type == FND_FUNC_CALL) {
+                OfortNode *ref = n->stmts[0];
+                OfortVar *var = find_var(I, ref->name);
+                int has_slice = 0;
+                if (var && var->val.type == FVAL_ARRAY && ref->n_stmts > 0) {
+                    for (int si = 0; si < ref->n_stmts; si++) {
+                        OfortSubscriptRange range;
+                        int extent = si < var->val.v.arr.n_dims ? var->val.v.arr.dims[si] : var->val.v.arr.len;
+                        int lower = si < var->val.v.arr.n_dims ? var->val.v.arr.lower_bounds[si] : 1;
+                        if (eval_subscript_range(I, ref->stmts[si], lower, extent, &range)) {
+                            has_slice = 1;
+                            break;
+                        }
+                    }
+                    if (has_slice) {
+                        OfortValue section = eval_array_section(I, var, ref);
+                        if (section.type != FVAL_ARRAY ||
+                            (section.v.arr.elem_type != FVAL_REAL && section.v.arr.elem_type != FVAL_DOUBLE)) {
+                            free_value(&section);
+                            ofort_error(I, "RANDOM_NUMBER harvest array section must be REAL");
+                        }
+                        for (int i = 0; i < section.v.arr.len; i++) {
+                            OfortValue rv = section.v.arr.elem_type == FVAL_DOUBLE ?
+                                make_double(random_unit()) : make_real(random_unit());
+                            if (assign_packed_array_element(&section, i, rv)) {
+                                free_value(&rv);
+                            } else {
+                                free_value(&section.v.arr.data[i]);
+                                section.v.arr.data[i] = rv;
+                            }
+                        }
+                        assign_array_ref(I, var, ref, &section);
+                        free_value(&section);
+                        break;
+                    }
+                }
             }
             if (!harvest_val)
                 ofort_error(I, "RANDOM_NUMBER requires a variable argument");
@@ -16168,9 +16244,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             int nargs = n->n_stmts + 1;
             if (nargs > OFORT_MAX_PARAMS) too_many_params_error(I, "type-bound subroutine arguments");
             OfortValue *args = (OfortValue *)calloc(OFORT_MAX_PARAMS, sizeof(*args));
-            int actual_for_param[OFORT_MAX_PARAMS];
+            int *actual_for_param = (int *)calloc(OFORT_MAX_PARAMS, sizeof(*actual_for_param));
             int next_positional_actual = 0;
-            if (!args) ofort_error(I, "Out of memory");
+            if (!args || !actual_for_param) ofort_error(I, "Out of memory");
             args[0] = make_void_val();
             for (int i = 0; i < n->n_stmts; i++) {
                 args[i + 1] = eval_node(I, n->stmts[i]);
@@ -16229,6 +16305,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             pop_scope(I);
             for (int i = 0; i < nargs; i++) free_value(&args[i]);
             free(args);
+            free(actual_for_param);
             break;
         }
 
@@ -17109,6 +17186,83 @@ static double ofort_rnorm_sample(OfortInterpreter *I) {
     return sqrt(-2.0 * log(u1)) * cos(two_pi * u2);
 }
 
+static double *ofort_stats_array_arg(OfortInterpreter *I, OfortValue *arg, int *n_out) {
+    double *x;
+    if (!arg || arg->type != FVAL_ARRAY || arg->v.arr.n_dims != 1) {
+        ofort_error(I, "ofort statistics functions require rank-1 REAL arrays");
+    }
+    if (arg->v.arr.len <= 0) {
+        ofort_error(I, "ofort statistics functions require nonempty arrays");
+    }
+    x = (double *)calloc((size_t)arg->v.arr.len, sizeof(*x));
+    if (!x) ofort_error(I, "Out of memory");
+    for (int i = 0; i < arg->v.arr.len; i++) {
+        OfortValue elem = array_element_value(arg, i);
+        OfortValType t = elem.type;
+        if (t != FVAL_REAL && t != FVAL_DOUBLE && t != FVAL_INTEGER) {
+            free_value(&elem);
+            free(x);
+            ofort_error(I, "ofort statistics functions require numeric arrays");
+        }
+        x[i] = val_to_real(elem);
+        free_value(&elem);
+    }
+    if (n_out) *n_out = arg->v.arr.len;
+    return x;
+}
+
+static OfortValue call_ofort_stats_unary(OfortInterpreter *I, const char *name,
+                                         OfortValue *args, int nargs) {
+    double *x;
+    double result;
+    int n;
+    if (nargs != 1) ofort_error(I, "%s takes one array argument", name);
+    x = ofort_stats_array_arg(I, &args[0], &n);
+    if (str_eq_nocase(name, "mean")) {
+        result = ofort_stats_mean_r8(x, n);
+    } else if (str_eq_nocase(name, "variance")) {
+        result = ofort_stats_variance_r8(x, n);
+    } else if (str_eq_nocase(name, "sd")) {
+        result = ofort_stats_sd_r8(x, n);
+    } else {
+        free(x);
+        ofort_error(I, "Unknown unary ofort statistics function '%s'", name);
+    }
+    free(x);
+    if (isnan(result)) ofort_error(I, "%s is undefined for this input", name);
+    return make_double(result);
+}
+
+static OfortValue call_ofort_stats_binary(OfortInterpreter *I, const char *name,
+                                          OfortValue *args, int nargs) {
+    double *x;
+    double *y;
+    double result;
+    int nx;
+    int ny;
+    if (nargs != 2) ofort_error(I, "%s takes two array arguments", name);
+    x = ofort_stats_array_arg(I, &args[0], &nx);
+    y = ofort_stats_array_arg(I, &args[1], &ny);
+    if (nx != ny) {
+        free(x);
+        free(y);
+        ofort_error(I, "%s requires arrays of the same size", name);
+    }
+    if (str_eq_nocase(name, "cov")) {
+        result = ofort_stats_cov_r8(x, y, nx);
+    } else if (str_eq_nocase(name, "cor")) {
+        result = ofort_stats_cor_r8(x, y, nx);
+    } else {
+        free(x);
+        free(y);
+        ofort_error(I, "Unknown binary ofort statistics function '%s'", name);
+    }
+    free(x);
+    free(y);
+    if (isnan(result)) ofort_error(I, "%s is undefined for this input", name);
+    return make_double(result);
+}
+
 static OfortValue call_ofort_extension_intrinsic(OfortInterpreter *I, const char *name,
                                                 OfortValue *args, int nargs) {
     if (str_eq_nocase(name, "rnorm")) {
@@ -17128,6 +17282,15 @@ static OfortValue call_ofort_extension_intrinsic(OfortInterpreter *I, const char
             return result;
         }
         ofort_error(I, "RNORM takes zero or one argument");
+    }
+    if (str_eq_nocase(name, "mean") ||
+        str_eq_nocase(name, "variance") ||
+        str_eq_nocase(name, "sd")) {
+        return call_ofort_stats_unary(I, name, args, nargs);
+    }
+    if (str_eq_nocase(name, "cov") ||
+        str_eq_nocase(name, "cor")) {
+        return call_ofort_stats_binary(I, name, args, nargs);
     }
     ofort_error(I, "Unknown ofort extension intrinsic '%s'", name);
     return make_void_val();
@@ -18609,12 +18772,15 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             ofort_error(I, "MATMUL requires arrays");
         /* 2D matrix multiply: (m x k) * (k x n) = (m x n) */
         int m, k1, k2, nn;
+        OfortValType result_type = (args[0].v.arr.elem_type == FVAL_DOUBLE ||
+                                    args[1].v.arr.elem_type == FVAL_DOUBLE) ?
+                                   FVAL_DOUBLE : FVAL_REAL;
         if (args[0].v.arr.n_dims == 2 && args[1].v.arr.n_dims == 2) {
             m = args[0].v.arr.dims[0]; k1 = args[0].v.arr.dims[1];
             k2 = args[1].v.arr.dims[0]; nn = args[1].v.arr.dims[1];
             if (k1 != k2) ofort_error(I, "MATMUL: incompatible dimensions");
             int dims[2] = {m, nn};
-            OfortValue result = make_array(FVAL_REAL, dims, 2);
+            OfortValue result = make_array(result_type, dims, 2);
             for (int i = 0; i < m; i++) {
                 for (int j = 0; j < nn; j++) {
                     double sum = 0;
@@ -18624,8 +18790,49 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
                                val_to_real(args[1].v.arr.data[kk + j * k2]);
                     }
                     free_value(&result.v.arr.data[i + j * m]);
-                    result.v.arr.data[i + j * m] = make_real(sum);
+                    result.v.arr.data[i + j * m] =
+                        result_type == FVAL_DOUBLE ? make_double(sum) : make_real(sum);
                 }
+            }
+            return result;
+        }
+        /* Matrix-vector multiply: (m x k) * (k) = (m) */
+        if (args[0].v.arr.n_dims == 2 && args[1].v.arr.n_dims == 1) {
+            m = args[0].v.arr.dims[0];
+            k1 = args[0].v.arr.dims[1];
+            k2 = args[1].v.arr.dims[0];
+            if (k1 != k2) ofort_error(I, "MATMUL: incompatible dimensions");
+            int dims[1] = {m};
+            OfortValue result = make_array(result_type, dims, 1);
+            for (int i = 0; i < m; i++) {
+                double sum = 0;
+                for (int kk = 0; kk < k1; kk++) {
+                    sum += val_to_real(args[0].v.arr.data[i + kk * m]) *
+                           val_to_real(args[1].v.arr.data[kk]);
+                }
+                free_value(&result.v.arr.data[i]);
+                result.v.arr.data[i] =
+                    result_type == FVAL_DOUBLE ? make_double(sum) : make_real(sum);
+            }
+            return result;
+        }
+        /* Vector-matrix multiply: (k) * (k x n) = (n) */
+        if (args[0].v.arr.n_dims == 1 && args[1].v.arr.n_dims == 2) {
+            k1 = args[0].v.arr.dims[0];
+            k2 = args[1].v.arr.dims[0];
+            nn = args[1].v.arr.dims[1];
+            if (k1 != k2) ofort_error(I, "MATMUL: incompatible dimensions");
+            int dims[1] = {nn};
+            OfortValue result = make_array(result_type, dims, 1);
+            for (int j = 0; j < nn; j++) {
+                double sum = 0;
+                for (int kk = 0; kk < k1; kk++) {
+                    sum += val_to_real(args[0].v.arr.data[kk]) *
+                           val_to_real(args[1].v.arr.data[kk + j * k2]);
+                }
+                free_value(&result.v.arr.data[j]);
+                result.v.arr.data[j] =
+                    result_type == FVAL_DOUBLE ? make_double(sum) : make_real(sum);
             }
             return result;
         }
