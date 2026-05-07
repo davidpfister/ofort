@@ -1311,6 +1311,33 @@ static int validate_repl_line_before_append(const char *source, const char *line
     return 1;
 }
 
+static void rewrite_repl_print_shortcut(char *line, size_t line_size) {
+    const char *p;
+    const char *rest;
+    char rewritten[4096];
+    size_t leading_len;
+
+    if (!line || line_size == 0) return;
+
+    p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    leading_len = (size_t)(p - line);
+
+    if (!starts_with_word_nocase(p, "print")) return;
+    rest = p + 5;
+    while (*rest == ' ' || *rest == '\t') rest++;
+    if (*rest == '\0' || *rest == '\r' || *rest == '\n') return;
+
+    if (*rest == '*' || *rest == '(') return;
+
+    if (leading_len >= sizeof(rewritten)) return;
+    memcpy(rewritten, line, leading_len);
+    snprintf(rewritten + leading_len, sizeof(rewritten) - leading_len,
+             "print *, %s", rest);
+    rewritten[sizeof(rewritten) - 1] = '\0';
+    snprintf(line, line_size, "%s", rewritten);
+}
+
 static int line_defines_name(const char *line, const char *name) {
     const char *p = skip_space(line);
     size_t name_len = strlen(name);
@@ -1472,7 +1499,14 @@ static OfortInterpreter *create_repl_interpreter(void) {
     return interp;
 }
 
-static int repl_preflight_check_source(const char *source, const char *footer) {
+static int warnings_include_line(const char *warnings, int line) {
+    char needle[64];
+    if (!warnings || line <= 0) return 0;
+    snprintf(needle, sizeof(needle), "line %d:", line);
+    return strstr(warnings, needle) != NULL;
+}
+
+static int repl_preflight_check_source(const char *source, const char *footer, int latest_line) {
     char *effective = NULL;
     OfortInterpreter *checker = NULL;
     int rc;
@@ -1500,6 +1534,11 @@ static int repl_preflight_check_source(const char *source, const char *footer) {
     if (rc != 0) {
         error = ofort_get_error(checker);
         fprintf(stderr, "%s\n", (error && error[0] != '\0') ? error : "interactive check failed");
+    } else {
+        const char *warnings = ofort_get_warnings(checker);
+        if (warnings_include_line(warnings, latest_line)) {
+            fputs(warnings, stderr);
+        }
     }
 
     ofort_destroy(checker);
@@ -3166,6 +3205,8 @@ static int run_interactive(const char *load_path, int run_after_load) {
             continue;
         }
 
+        rewrite_repl_print_shortcut(line, sizeof(line));
+
         if (!validate_repl_line_before_append(buf ? buf : "", line)) {
             last_rc = 1;
             continue;
@@ -3207,7 +3248,8 @@ static int run_interactive(const char *load_path, int run_after_load) {
                     return 2;
                 }
             }
-            last_rc = repl_preflight_check_source(buf ? buf : "", footer);
+            last_rc = repl_preflight_check_source(buf ? buf : "", footer,
+                                                 source_line_count(buf ? buf : ""));
             if (last_rc != 0) {
                 continue;
             }
