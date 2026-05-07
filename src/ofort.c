@@ -470,6 +470,29 @@ static void ofort_error(OfortInterpreter *I, const char *fmt, ...) {
     longjmp(I->err_jmp, 1);
 }
 
+static void ofort_append_error(OfortInterpreter *I, int line, const char *fmt, ...) {
+    int used;
+    va_list ap;
+
+    if (!I) return;
+    used = (int)strlen(I->error);
+    if (used > 0 && used < (int)sizeof(I->error) - 1 && I->error[used - 1] != '\n') {
+        I->error[used++] = '\n';
+        I->error[used] = '\0';
+    }
+    if (used > 0 && used < (int)sizeof(I->error) - 2) {
+        I->error[used++] = '\n';
+        I->error[used] = '\0';
+    }
+    if (used < (int)sizeof(I->error) - 1) {
+        va_start(ap, fmt);
+        vsnprintf(I->error + used, sizeof(I->error) - (size_t)used, fmt, ap);
+        va_end(ap);
+    }
+    append_source_line_to_error(I, line);
+    I->has_error = 1;
+}
+
 static void too_many_params_error(OfortInterpreter *I, const char *what) {
     ofort_error(I, "Too many %s; maximum is %d", what, OFORT_MAX_PARAMS);
 }
@@ -756,6 +779,12 @@ static OfortValue coerce_assignment_value(OfortInterpreter *I, const char *name,
             ofort_warning(I, I ? I->current_line : 0,
                           "warning: assigning COMPLEX to %s variable '%s' discards the imaginary part",
                           value_type_name(target_type), name ? name : "");
+        }
+        if (target_type == FVAL_INTEGER &&
+            (val.type == FVAL_REAL || val.type == FVAL_DOUBLE)) {
+            ofort_warning(I, I ? I->current_line : 0,
+                          "warning: assigning %s to INTEGER variable '%s' truncates toward zero",
+                          value_type_name(val.type), name ? name : "");
         }
         switch (target_type) {
             case FVAL_INTEGER:
@@ -6068,6 +6097,8 @@ static OfortNode *parse_module_procedure_body(OfortInterpreter *I) {
     copy_cstr(n->name, sizeof(n->name), proc_name);
     n->line = mt->line;
     if (spec) {
+        n->is_pure = spec->is_pure;
+        n->is_elemental = spec->is_elemental;
         n->val_type = spec->val_type;
         copy_cstr(n->str_val, sizeof(n->str_val), spec->str_val);
         copy_cstr(n->result_name, sizeof(n->result_name), spec->result_name);
@@ -7205,10 +7236,15 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
 
     if (is_procedure_prefix_token(t)) {
         int is_elemental = 0;
+        int is_pure = 0;
+        int is_impure = 0;
         while (is_procedure_prefix_token(peek(I))) {
             if (token_ident_upper(peek(I), "ELEMENTAL")) is_elemental = 1;
+            if (token_ident_upper(peek(I), "PURE")) is_pure = 1;
+            if (token_ident_upper(peek(I), "IMPURE")) is_impure = 1;
             advance(I);
         }
+        if (is_elemental && !is_impure) is_pure = 1;
         if (check(I, FTOK_MODULE) &&
             (peek_ahead(I, 1)->type == FTOK_FUNCTION || peek_ahead(I, 1)->type == FTOK_SUBROUTINE)) {
             advance(I);
@@ -7217,16 +7253,19 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         if (t->type == FTOK_SUBROUTINE) {
             OfortNode *n = parse_subroutine(I);
             n->is_elemental = is_elemental;
+            n->is_pure = is_pure && !is_impure;
             return n;
         }
         if (t->type == FTOK_FUNCTION) {
             OfortNode *n = parse_function(I);
             n->is_elemental = is_elemental;
+            n->is_pure = is_pure && !is_impure;
             return n;
         }
         if ((is_type_keyword(t->type) || t->type == FTOK_TYPE) && typed_function_follows_type_prefix(I)) {
             OfortNode *n = parse_typed_function(I);
             n->is_elemental = is_elemental;
+            n->is_pure = is_pure && !is_impure;
             return n;
         }
     }
@@ -13437,6 +13476,111 @@ static int check_semantics_is_spec_node(OfortNode *n) {
     }
 }
 
+static const char *io_statement_name(OfortNodeType type) {
+    switch (type) {
+        case FND_PRINT: return "PRINT";
+        case FND_WRITE: return "WRITE";
+        case FND_READ_STMT: return "READ";
+        case FND_OPEN: return "OPEN";
+        case FND_CLOSE: return "CLOSE";
+        case FND_REWIND: return "REWIND";
+        case FND_INQUIRE: return "INQUIRE";
+        default: return NULL;
+    }
+}
+
+static int is_impure_intrinsic_subroutine_name(const char *name) {
+    return str_eq_nocase(name, "random_number") ||
+           str_eq_nocase(name, "random_seed");
+}
+
+static int pure_local_name_index(char names[][256], int n_names, const char *name) {
+    if (!name || !name[0]) return -1;
+    for (int i = 0; i < n_names; i++) {
+        if (str_eq_nocase(names[i], name)) return i;
+    }
+    return -1;
+}
+
+static void add_pure_local_name(char names[][256], int *n_names, const char *name) {
+    if (!name || !name[0] || !n_names) return;
+    if (*n_names >= OFORT_MAX_VARS) return;
+    if (pure_local_name_index(names, *n_names, name) >= 0) return;
+    copy_cstr(names[*n_names], sizeof(names[*n_names]), name);
+    (*n_names)++;
+}
+
+static void collect_pure_local_names(OfortNode *n, char names[][256], int *n_names) {
+    if (!n) return;
+    if (n->type == FND_SUBROUTINE || n->type == FND_FUNCTION || n->type == FND_STMT_FUNCTION) {
+        return;
+    }
+    if (n->type == FND_VARDECL || n->type == FND_PARAMDECL) {
+        add_pure_local_name(names, n_names, n->name);
+    }
+    for (int i = 0; i < n->n_children; i++) {
+        collect_pure_local_names(n->children[i], names, n_names);
+    }
+    for (int i = 0; i < n->n_stmts; i++) {
+        collect_pure_local_names(n->stmts[i], names, n_names);
+    }
+}
+
+static void validate_pure_assignment_target(OfortInterpreter *I, OfortNode *proc, OfortNode *n,
+                                            char local_names[][256], int n_local_names) {
+    const char *target_name;
+
+    if (!n || (n->type != FND_ASSIGN && n->type != FND_POINTER_ASSIGN)) return;
+    target_name = extract_forall_lhs_name(n->children[0]);
+    if (!target_name || !target_name[0]) return;
+    if (pure_local_name_index(local_names, n_local_names, target_name) >= 0) return;
+    if (!find_var(I, target_name)) return;
+    ofort_append_error(I, n->line > 0 ? n->line : proc->line,
+                       "Variable '%s' cannot appear in a variable definition context in PURE procedure '%s'",
+                       target_name, proc->name);
+}
+
+static void validate_pure_procedure_tree(OfortInterpreter *I, OfortNode *proc, OfortNode *n,
+                                         char local_names[][256], int n_local_names) {
+    const char *io_name;
+
+    if (!n) return;
+    io_name = io_statement_name(n->type);
+    if (io_name) {
+        ofort_append_error(I, n->line > 0 ? n->line : proc->line,
+                           "%s statement is not allowed in PURE procedure '%s'",
+                           io_name, proc->name);
+    }
+    if (n->type == FND_CALL && is_impure_intrinsic_subroutine_name(n->name)) {
+        ofort_append_error(I, n->line > 0 ? n->line : proc->line,
+                           "Impure intrinsic subroutine '%s' is not allowed in PURE procedure '%s'",
+                           n->name, proc->name);
+    }
+    validate_pure_assignment_target(I, proc, n, local_names, n_local_names);
+    for (int i = 0; i < n->n_children; i++) {
+        validate_pure_procedure_tree(I, proc, n->children[i], local_names, n_local_names);
+    }
+    for (int i = 0; i < n->n_stmts; i++) {
+        validate_pure_procedure_tree(I, proc, n->stmts[i], local_names, n_local_names);
+    }
+}
+
+static void validate_pure_procedure_node(OfortInterpreter *I, OfortNode *n) {
+    char local_names[OFORT_MAX_VARS][256];
+    int n_local_names = 0;
+
+    if (!n || !n->is_pure) return;
+    for (int i = 0; i < n->n_params; i++) {
+        add_pure_local_name(local_names, &n_local_names, n->param_names[i]);
+    }
+    if (n->type == FND_FUNCTION) {
+        add_pure_local_name(local_names, &n_local_names,
+                            n->result_name[0] ? n->result_name : n->name);
+    }
+    collect_pure_local_names(n->children[0], local_names, &n_local_names);
+    validate_pure_procedure_tree(I, n, n->children[0], local_names, n_local_names);
+}
+
 static void check_semantics_identifier(OfortInterpreter *I, OfortNode *n) {
     int has_implicit_type = 0;
 
@@ -13515,6 +13659,70 @@ static const char *resolve_imported_extension_intrinsic(OfortInterpreter *I, con
     return NULL;
 }
 
+static int static_expr_type(OfortInterpreter *I, OfortNode *n, OfortValType *type_out) {
+    OfortValType left_type;
+    OfortValType right_type;
+    OfortVar *v;
+
+    if (!n || !type_out) return 0;
+    switch (n->type) {
+        case FND_INT_LIT:
+        case FND_LOGICAL_LIT:
+            *type_out = n->type == FND_INT_LIT ? FVAL_INTEGER : FVAL_LOGICAL;
+            return 1;
+        case FND_REAL_LIT:
+            *type_out = n->val_type == FVAL_DOUBLE ? FVAL_DOUBLE : FVAL_REAL;
+            return 1;
+        case FND_COMPLEX_LIT:
+            *type_out = FVAL_COMPLEX;
+            return 1;
+        case FND_STRING_LIT:
+            *type_out = FVAL_CHARACTER;
+            return 1;
+        case FND_IDENT:
+            v = find_var(I, n->name);
+            if (!v) return 0;
+            *type_out = v->val.type;
+            return 1;
+        case FND_NEGATE:
+        case FND_NOT:
+            return static_expr_type(I, n->children[0], type_out);
+        case FND_ADD:
+        case FND_SUB:
+        case FND_MUL:
+        case FND_DIV:
+        case FND_POWER:
+            if (!static_expr_type(I, n->children[0], &left_type) ||
+                !static_expr_type(I, n->children[1], &right_type)) {
+                return 0;
+            }
+            if (left_type == FVAL_COMPLEX || right_type == FVAL_COMPLEX) *type_out = FVAL_COMPLEX;
+            else if (left_type == FVAL_DOUBLE || right_type == FVAL_DOUBLE) *type_out = FVAL_DOUBLE;
+            else if (left_type == FVAL_REAL || right_type == FVAL_REAL) *type_out = FVAL_REAL;
+            else if (left_type == FVAL_INTEGER && right_type == FVAL_INTEGER) *type_out = FVAL_INTEGER;
+            else return 0;
+            return 1;
+        case FND_FUNC_CALL:
+            if (str_eq_nocase(n->name, "real")) { *type_out = FVAL_REAL; return 1; }
+            if (str_eq_nocase(n->name, "dble") || str_eq_nocase(n->name, "dprod")) {
+                *type_out = FVAL_DOUBLE;
+                return 1;
+            }
+            if (str_eq_nocase(n->name, "int")) { *type_out = FVAL_INTEGER; return 1; }
+            if (str_eq_nocase(n->name, "cmplx")) { *type_out = FVAL_COMPLEX; return 1; }
+            {
+                OfortFunc *f = find_func(I, n->name);
+                if (f && f->node) {
+                    *type_out = f->node->val_type;
+                    return *type_out != FVAL_VOID;
+                }
+            }
+            return 0;
+        default:
+            return 0;
+    }
+}
+
 static void check_semantics_node(OfortInterpreter *I, OfortNode *n) {
     if (!I || !n) return;
     if (n->line > 0) I->current_line = n->line;
@@ -13547,6 +13755,29 @@ static void check_semantics_node(OfortInterpreter *I, OfortNode *n) {
             }
             for (int i = 0; i < n->n_stmts; i++) {
                 check_semantics_node(I, n->stmts[i]);
+            }
+            for (int i = 0; i < n->n_children; i++) {
+                check_semantics_node(I, n->children[i]);
+            }
+            return;
+        case FND_ASSIGN:
+            if (n->children[0] && n->children[0]->type == FND_IDENT) {
+                OfortVar *v = find_var(I, n->children[0]->name);
+                if (v && v->is_parameter) {
+                    ofort_error(I, "Cannot assign to PARAMETER '%s'", n->children[0]->name);
+                }
+                if (v && v->is_protected) {
+                    ofort_error(I, "Cannot assign to PROTECTED variable '%s'", n->children[0]->name);
+                }
+                if (v && v->val.type == FVAL_INTEGER && n->children[1]) {
+                    OfortValType rhs_type;
+                    if (static_expr_type(I, n->children[1], &rhs_type) &&
+                        (rhs_type == FVAL_REAL || rhs_type == FVAL_DOUBLE)) {
+                        ofort_warning(I, n->line,
+                                      "warning: assigning %s to INTEGER variable '%s' truncates toward zero",
+                                      value_type_name(rhs_type), n->children[0]->name);
+                    }
+                }
             }
             for (int i = 0; i < n->n_children; i++) {
                 check_semantics_node(I, n->children[i]);
@@ -13891,6 +14122,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 if (s && (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION ||
                           s->type == FND_STMT_FUNCTION)) {
                     annotate_procedure_params(s);
+                    validate_pure_procedure_node(I, s);
                     (void)register_func(I, s->name, s, s->type == FND_FUNCTION || s->type == FND_STMT_FUNCTION);
                 }
             }
@@ -13972,6 +14204,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                            s->type == FND_STMT_FUNCTION) {
                     OfortFunc *func;
                     annotate_procedure_params(s);
+                    validate_pure_procedure_node(I, s);
                     func = register_func(I, s->name, s, s->type == FND_FUNCTION || s->type == FND_STMT_FUNCTION);
                     copy_cstr(func->module_name, sizeof(func->module_name), mod->name);
                 } else if (s->type == FND_TYPE_DEF) {
@@ -16183,6 +16416,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 }
             }
         }
+        validate_pure_procedure_node(I, n);
         (void)register_func(I, n->name, n, n->type == FND_FUNCTION);
         break;
     }
@@ -18950,6 +19184,11 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
         }
     }
     interp->timing.register_time = ofort_monotonic_seconds() - stage_start;
+    if (interp->has_error) {
+        interp->timing.total = ofort_monotonic_seconds() - total_start;
+        free(processed_source);
+        return -1;
+    }
 
     /* Second pass: execute everything else */
     stage_start = ofort_monotonic_seconds();
