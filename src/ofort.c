@@ -4638,6 +4638,24 @@ static int paren_item_is_implied_do(OfortInterpreter *I) {
     return 0;
 }
 
+static int paren_item_has_top_level_comma(OfortInterpreter *I) {
+    int depth = 0;
+    for (int pos = I->tok_pos; pos < I->n_tokens; pos++) {
+        OfortTokenType type = I->tokens[pos].type;
+        if (type == FTOK_LPAREN) {
+            depth++;
+        } else if (type == FTOK_RPAREN) {
+            depth--;
+            if (depth == 0) return 0;
+        } else if (type == FTOK_COMMA && depth == 1) {
+            return 1;
+        } else if (type == FTOK_NEWLINE || type == FTOK_EOF) {
+            return 0;
+        }
+    }
+    return 0;
+}
+
 static OfortNode *parse_implied_do(OfortInterpreter *I) {
     OfortToken *lt = expect(I, FTOK_LPAREN);
     OfortNode *n = alloc_node(I, FND_IMPLIED_DO);
@@ -4825,6 +4843,9 @@ static OfortNode *parse_data_statement(OfortInterpreter *I) {
 static OfortNode *parse_io_item(OfortInterpreter *I) {
     if (check(I, FTOK_LPAREN) && paren_item_is_implied_do(I)) {
         return parse_implied_do(I);
+    }
+    if (check(I, FTOK_LPAREN) && !paren_item_has_top_level_comma(I)) {
+        return parse_expr(I);
     }
     if (check(I, FTOK_LPAREN)) {
         OfortToken *t = advance(I);
@@ -15341,6 +15362,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 if (n->stmts[i]->type != FND_IDENT) continue;
                 if (n->param_names[i][0] == '\0' && i == 0) {
                     set_var(I, n->stmts[i]->name, make_integer(now));
+                } else if (n->param_names[i][0] == '\0' && i == 1) {
+                    set_var(I, n->stmts[i]->name, make_integer(1));
+                } else if (n->param_names[i][0] == '\0' && i == 2) {
+                    set_var(I, n->stmts[i]->name, make_integer(LLONG_MAX));
                 } else if (str_eq_nocase(n->param_names[i], "count")) {
                     set_var(I, n->stmts[i]->name, make_integer(now));
                 } else if (str_eq_nocase(n->param_names[i], "count_rate")) {
