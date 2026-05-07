@@ -65,6 +65,9 @@ typedef struct OfortScope {
     char implicit_types[26];
     int implicit_char_lens[26];
     char implicit_type_names[26][64];
+    char extension_intrinsics[OFORT_MAX_PARAMS][64];
+    char extension_intrinsic_targets[OFORT_MAX_PARAMS][64];
+    int n_extension_intrinsics;
     struct OfortScope *parent;
 } OfortScope;
 
@@ -241,6 +244,14 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
 static int storage_size_bits(OfortValue *v);
 static int is_intrinsic(const char *name);
 static void check_semantics_node(OfortInterpreter *I, OfortNode *n);
+static int ofort_extension_module_exists(const char *module_name);
+static int ofort_extension_module_exports(const char *module_name, const char *name);
+static void import_ofort_extension_intrinsic(OfortInterpreter *I, const char *local_name,
+                                             const char *target_name);
+static int find_imported_extension_intrinsic(OfortInterpreter *I, const char *name);
+static const char *resolve_imported_extension_intrinsic(OfortInterpreter *I, const char *name);
+static OfortValue call_ofort_extension_intrinsic(OfortInterpreter *I, const char *name,
+                                                OfortValue *args, int nargs);
 static void value_to_string(OfortInterpreter *I, OfortValue v, char *buf, int bufsize);
 static int assign_token_to_read_target(OfortInterpreter *I, OfortNode *target, const char *tok);
 static int paren_item_is_implied_do(OfortInterpreter *I);
@@ -594,6 +605,9 @@ static OfortScope *push_scope(OfortInterpreter *I) {
         memcpy(s->implicit_types, s->parent->implicit_types, sizeof(s->implicit_types));
         memcpy(s->implicit_char_lens, s->parent->implicit_char_lens, sizeof(s->implicit_char_lens));
         memcpy(s->implicit_type_names, s->parent->implicit_type_names, sizeof(s->implicit_type_names));
+        memcpy(s->extension_intrinsics, s->parent->extension_intrinsics, sizeof(s->extension_intrinsics));
+        memcpy(s->extension_intrinsic_targets, s->parent->extension_intrinsic_targets, sizeof(s->extension_intrinsic_targets));
+        s->n_extension_intrinsics = s->parent->n_extension_intrinsics;
     }
     I->current_scope = s;
     return s;
@@ -11501,6 +11515,14 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         }
 
         /* Check for intrinsic after user/module procedures so names such as RANGE can be overridden. */
+        if (find_imported_extension_intrinsic(I, n->name)) {
+            const char *extension_name = resolve_imported_extension_intrinsic(I, n->name);
+            OfortValue result = call_ofort_extension_intrinsic(I, extension_name ? extension_name : n->name,
+                                                              args, nargs);
+            free_call_args(args, nargs); args = NULL;
+            return result;
+        }
+
         if (is_intrinsic(n->name)) {
             OfortValue result = call_intrinsic(I, n->name, args, nargs, n->param_names);
             free_call_args(args, nargs); args = NULL;
@@ -13440,6 +13462,59 @@ static void check_semantics_block(OfortInterpreter *I, OfortNode *block) {
     }
 }
 
+static int ofort_extension_module_exists(const char *module_name) {
+    return str_eq_nocase(module_name, "ofort_random_mod");
+}
+
+static int ofort_extension_module_exports(const char *module_name, const char *name) {
+    if (str_eq_nocase(module_name, "ofort_random_mod")) {
+        return str_eq_nocase(name, "rnorm");
+    }
+    return 0;
+}
+
+static void import_ofort_extension_intrinsic(OfortInterpreter *I, const char *local_name,
+                                             const char *target_name) {
+    OfortScope *s = I ? I->current_scope : NULL;
+    if (!s || !local_name || !local_name[0]) return;
+    for (int i = 0; i < s->n_extension_intrinsics; i++) {
+        if (str_eq_nocase(s->extension_intrinsics[i], local_name)) {
+            copy_cstr(s->extension_intrinsic_targets[i], sizeof(s->extension_intrinsic_targets[i]),
+                      target_name && target_name[0] ? target_name : local_name);
+            return;
+        }
+    }
+    if (s->n_extension_intrinsics >= OFORT_MAX_PARAMS) {
+        ofort_error(I, "Too many imported ofort extension intrinsics");
+    }
+    copy_cstr(s->extension_intrinsics[s->n_extension_intrinsics++],
+              sizeof(s->extension_intrinsics[0]), local_name);
+    copy_cstr(s->extension_intrinsic_targets[s->n_extension_intrinsics - 1],
+              sizeof(s->extension_intrinsic_targets[0]),
+              target_name && target_name[0] ? target_name : local_name);
+}
+
+static int find_imported_extension_intrinsic(OfortInterpreter *I, const char *name) {
+    for (OfortScope *s = I ? I->current_scope : NULL; s; s = s->parent) {
+        for (int i = 0; i < s->n_extension_intrinsics; i++) {
+            if (str_eq_nocase(s->extension_intrinsics[i], name)) return 1;
+        }
+    }
+    return 0;
+}
+
+static const char *resolve_imported_extension_intrinsic(OfortInterpreter *I, const char *name) {
+    for (OfortScope *s = I ? I->current_scope : NULL; s; s = s->parent) {
+        for (int i = 0; i < s->n_extension_intrinsics; i++) {
+            if (str_eq_nocase(s->extension_intrinsics[i], name)) {
+                return s->extension_intrinsic_targets[i][0] ? s->extension_intrinsic_targets[i]
+                                                            : s->extension_intrinsics[i];
+            }
+        }
+    }
+    return NULL;
+}
+
 static void check_semantics_node(OfortInterpreter *I, OfortNode *n) {
     if (!I || !n) return;
     if (n->line > 0) I->current_line = n->line;
@@ -13466,6 +13541,7 @@ static void check_semantics_node(OfortInterpreter *I, OfortNode *n) {
         case FND_FUNC_CALL:
             if (!find_var(I, n->name) && !find_func(I, n->name) &&
                 !find_generic(I, n->name) && !is_intrinsic(n->name) &&
+                !find_imported_extension_intrinsic(I, n->name) &&
                 current_scope_has_implicit_none(I)) {
                 ofort_error(I, "Undefined variable '%s' at line %d", n->name, n->line);
             }
@@ -13930,6 +14006,21 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (strcmp(upper, mu) == 0) { mod = &I->modules[i]; break; }
         }
         if (!mod) {
+            if (ofort_extension_module_exists(n->name)) {
+                if (n->n_params > 0) {
+                    for (int i = 0; i < n->n_params; i++) {
+                        const char *local = n->param_names[i];
+                        const char *remote = n->binding_proc_names[i][0] ? n->binding_proc_names[i] : local;
+                        if (!ofort_extension_module_exports(n->name, remote)) {
+                            ofort_error(I, "Module '%s' has no public name '%s'", n->name, remote);
+                        }
+                        import_ofort_extension_intrinsic(I, local, remote);
+                    }
+                } else {
+                    import_ofort_extension_intrinsic(I, "rnorm", "rnorm");
+                }
+                break;
+            }
             if (strcmp(upper, "ISO_FORTRAN_ENV") == 0) {
                 if (n->n_params > 0) {
                     for (int i = 0; i < n->n_params; i++) {
@@ -16772,6 +16863,40 @@ static OfortValue transfer_value_from_bytes(OfortValType type, int kind, int cha
     default:
         return make_void_val();
     }
+}
+
+static double ofort_rnorm_sample(OfortInterpreter *I) {
+    const double two_pi = 6.283185307179586476925286766559;
+    double u1, u2;
+    seed_fast_rng_if_needed(I);
+    u1 = fast_rng_unit_from_u32(fast_rng_next32(&I->fast_rng_state));
+    u2 = fast_rng_unit_from_u32(fast_rng_next32(&I->fast_rng_state));
+    if (u1 <= 0.0) u1 = 1.0 / 4294967296.0;
+    return sqrt(-2.0 * log(u1)) * cos(two_pi * u2);
+}
+
+static OfortValue call_ofort_extension_intrinsic(OfortInterpreter *I, const char *name,
+                                                OfortValue *args, int nargs) {
+    if (str_eq_nocase(name, "rnorm")) {
+        if (nargs == 0) {
+            return make_double(ofort_rnorm_sample(I));
+        }
+        if (nargs == 1) {
+            int n = (int)val_to_int(args[0]);
+            int dims[1];
+            OfortValue result;
+            if (n < 0) ofort_error(I, "RNORM argument must be nonnegative");
+            dims[0] = n;
+            result = make_array(FVAL_DOUBLE, dims, 1);
+            for (int i = 0; i < result.v.arr.len; i++) {
+                result.v.arr.data[i] = make_double(ofort_rnorm_sample(I));
+            }
+            return result;
+        }
+        ofort_error(I, "RNORM takes zero or one argument");
+    }
+    ofort_error(I, "Unknown ofort extension intrinsic '%s'", name);
+    return make_void_val();
 }
 
 static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortValue *args, int nargs,
