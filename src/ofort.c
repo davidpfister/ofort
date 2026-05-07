@@ -6712,12 +6712,13 @@ static OfortNode *parse_deallocate(OfortInterpreter *I) {
                 parse_expr(I);
             }
         } else {
-            OfortToken *name = expect(I, FTOK_IDENT);
+            if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+            OfortToken *name = advance(I);
             OfortNode *n = alloc_node(I, FND_DEALLOCATE);
             OfortNode *target = alloc_node(I, FND_IDENT);
             n->line = name->line;
-            copy_cstr(n->name, sizeof(n->name), name->str_val);
-            copy_cstr(target->name, sizeof(target->name), name->str_val);
+            copy_cstr(n->name, sizeof(n->name), token_name_text(name));
+            copy_cstr(target->name, sizeof(target->name), token_name_text(name));
             target->line = name->line;
             target = parse_component_target_postfix(I, target);
             if (target->type != FND_IDENT) n->children[OFORT_ALLOC_TARGET_CHILD] = target;
@@ -15428,15 +15429,39 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             break;
         }
         if (strcmp(call_upper, "RANDOM_NUMBER") == 0) {
-            if (n->n_stmts != 1 || n->stmts[0]->type != FND_IDENT)
+            OfortValue *harvest_val = NULL;
+            OfortVar *harvest = NULL;
+            if (n->n_stmts != 1)
                 ofort_error(I, "RANDOM_NUMBER requires a variable argument");
 
-            OfortVar *harvest = find_var(I, n->stmts[0]->name);
-            if (!harvest)
-                ofort_error(I, "Undefined variable '%s' in RANDOM_NUMBER", n->stmts[0]->name);
+            if (n->stmts[0]->type == FND_IDENT) {
+                harvest = find_var(I, n->stmts[0]->name);
+                if (!harvest)
+                    ofort_error(I, "Undefined variable '%s' in RANDOM_NUMBER", n->stmts[0]->name);
+                harvest_val = &harvest->val;
+            } else if (n->stmts[0]->type == FND_MEMBER) {
+                harvest_val = member_lvalue(I, n->stmts[0]);
+            } else if (n->stmts[0]->type == FND_ARRAY_REF) {
+                OfortNode *ref = n->stmts[0];
+                int full_section = ref->children[0] != NULL && ref->n_stmts > 0;
+                for (int si = 0; si < ref->n_stmts; si++) {
+                    OfortNode *sub = ref->stmts[si];
+                    if (!sub || sub->type != FND_SLICE ||
+                        sub->children[0] || sub->children[1] ||
+                        (sub->n_children > 2 && sub->children[2])) {
+                        full_section = 0;
+                        break;
+                    }
+                }
+                if (full_section) harvest_val = member_lvalue(I, ref->children[0]);
+            }
+            if (!harvest_val)
+                ofort_error(I, "RANDOM_NUMBER requires a variable argument");
 
-            if (harvest->val.type == FVAL_ARRAY) {
-                OfortValue *arr = &harvest->val;
+            if (harvest_val->type == FVAL_ARRAY) {
+                OfortValue *arr = harvest_val;
+                if (arr->v.arr.elem_type == FVAL_VOID)
+                    arr->v.arr.elem_type = FVAL_REAL;
                 if (arr->v.arr.elem_type != FVAL_REAL && arr->v.arr.elem_type != FVAL_DOUBLE)
                     ofort_error(I, "RANDOM_NUMBER harvest array must be REAL");
                 if (I->fast_mode && arr->v.arr.real_data) {
@@ -15470,14 +15495,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                             arr->v.arr.data[i] = make_real(random_unit());
                     }
                 }
-            } else if (harvest->val.type == FVAL_REAL || harvest->val.type == FVAL_DOUBLE) {
-                OfortValType t = harvest->val.type;
+            } else if (harvest_val->type == FVAL_REAL || harvest_val->type == FVAL_DOUBLE) {
+                OfortValType t = harvest_val->type;
                 if (I->fast_mode) {
                     seed_fast_rng_if_needed(I);
-                    harvest->val.v.r = fast_rng_unit_from_u32(fast_rng_next32(&I->fast_rng_state));
+                    harvest_val->v.r = fast_rng_unit_from_u32(fast_rng_next32(&I->fast_rng_state));
                 } else {
-                    free_value(&harvest->val);
-                    harvest->val = (t == FVAL_DOUBLE) ? make_double(random_unit()) : make_real(random_unit());
+                    free_value(harvest_val);
+                    *harvest_val = (t == FVAL_DOUBLE) ? make_double(random_unit()) : make_real(random_unit());
                 }
             } else {
                 ofort_error(I, "RANDOM_NUMBER harvest must be REAL");
