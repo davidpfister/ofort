@@ -252,7 +252,8 @@ static void import_ofort_extension_intrinsic(OfortInterpreter *I, const char *lo
 static int find_imported_extension_intrinsic(OfortInterpreter *I, const char *name);
 static const char *resolve_imported_extension_intrinsic(OfortInterpreter *I, const char *name);
 static OfortValue call_ofort_extension_intrinsic(OfortInterpreter *I, const char *name,
-                                                OfortValue *args, int nargs);
+                                                 OfortValue *args, int nargs);
+static int call_ofort_extension_subroutine(OfortInterpreter *I, OfortNode *n);
 static void value_to_string(OfortInterpreter *I, OfortValue v, char *buf, int bufsize);
 static int assign_token_to_read_target(OfortInterpreter *I, OfortNode *target, const char *tok);
 static int paren_item_is_implied_do(OfortInterpreter *I);
@@ -9191,6 +9192,88 @@ static void seed_fast_rng_if_needed(OfortInterpreter *I) {
     if (I->fast_rng_state == 0) I->fast_rng_state = UINT64_C(0x9e3779b97f4a7c15);
 }
 
+static double random_number_next(OfortInterpreter *I, uint64_t *rng_state) {
+    if (I->fast_mode) {
+        return fast_rng_unit_from_u32(fast_rng_next32(rng_state));
+    }
+    return random_unit();
+}
+
+static void fill_random_number_section_recursive(OfortInterpreter *I, OfortValue *dst,
+                                                 OfortSubscriptSpec *specs, int nargs,
+                                                 int dim, int *subscripts,
+                                                 uint64_t *rng_state) {
+    if (dim < 0) {
+        int dst_index = section_linear_index(dst, subscripts, nargs);
+        double value;
+
+        if (dst_index < 0 || dst_index >= dst->v.arr.len)
+            ofort_error(I, "Array section index out of bounds");
+
+        value = random_number_next(I, rng_state);
+        if (I->fast_mode && dst->v.arr.real_data) {
+            dst->v.arr.real_data[dst_index] = value;
+            return;
+        }
+        if (I->fast_mode && dst->v.arr.data) {
+            dst->v.arr.data[dst_index].type = dst->v.arr.elem_type;
+            dst->v.arr.data[dst_index].kind = dst->v.arr.elem_type == FVAL_DOUBLE ? 8 : 4;
+            dst->v.arr.data[dst_index].v.r = value;
+            return;
+        }
+        if (assign_packed_array_element(dst, dst_index,
+                                        dst->v.arr.elem_type == FVAL_DOUBLE ?
+                                        make_double(value) : make_real(value))) {
+            return;
+        }
+        free_value(&dst->v.arr.data[dst_index]);
+        dst->v.arr.data[dst_index] = dst->v.arr.elem_type == FVAL_DOUBLE ?
+                                     make_double(value) : make_real(value);
+        return;
+    }
+
+    for (int pos = 0; pos < specs[dim].count; pos++) {
+        subscripts[dim] = subscript_spec_value(&specs[dim], pos);
+        fill_random_number_section_recursive(I, dst, specs, nargs, dim - 1, subscripts, rng_state);
+    }
+}
+
+static int fill_random_number_array_section(OfortInterpreter *I, OfortVar *var, OfortNode *ref) {
+    int nargs = ref->n_stmts;
+    OfortSubscriptSpec specs[7];
+    int has_section = 0;
+    int subscripts[7] = {0};
+    uint64_t rng_state = 0;
+
+    if (!var || var->val.type != FVAL_ARRAY || nargs <= 0) return 0;
+    if (var->val.v.arr.elem_type == FVAL_VOID)
+        var->val.v.arr.elem_type = FVAL_REAL;
+    if (var->val.v.arr.elem_type != FVAL_REAL && var->val.v.arr.elem_type != FVAL_DOUBLE)
+        ofort_error(I, "RANDOM_NUMBER harvest array section must be REAL");
+
+    for (int i = 0; i < nargs; i++) {
+        int extent = i < var->val.v.arr.n_dims ? var->val.v.arr.dims[i] : var->val.v.arr.len;
+        int lower = i < var->val.v.arr.n_dims ? var->val.v.arr.lower_bounds[i] : 1;
+        if (eval_subscript_spec(I, ref->stmts[i], lower, extent, &specs[i]))
+            has_section = 1;
+    }
+
+    if (!has_section) {
+        free_subscript_specs(specs, nargs);
+        return 0;
+    }
+
+    if (I->fast_mode) {
+        seed_fast_rng_if_needed(I);
+        rng_state = I->fast_rng_state;
+    }
+    fill_random_number_section_recursive(I, &var->val, specs, nargs, nargs - 1, subscripts, &rng_state);
+    if (I->fast_mode) I->fast_rng_state = rng_state;
+
+    free_subscript_specs(specs, nargs);
+    return 1;
+}
+
 static void append_to_buffer(char *buf, int bufsize, const char *text) {
     size_t used;
     size_t avail;
@@ -13628,7 +13711,8 @@ static int ofort_extension_module_exists(const char *module_name) {
 
 static int ofort_extension_module_exports(const char *module_name, const char *name) {
     if (str_eq_nocase(module_name, "ofort_random_mod")) {
-        return str_eq_nocase(name, "rnorm");
+        return str_eq_nocase(name, "rnorm") ||
+               str_eq_nocase(name, "rnorm_fill");
     }
     if (str_eq_nocase(module_name, "ofort_statistics_mod") ||
         str_eq_nocase(module_name, "ofort_stats_mod")) {
@@ -14282,6 +14366,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 } else {
                     if (str_eq_nocase(n->name, "ofort_random_mod")) {
                         import_ofort_extension_intrinsic(I, "rnorm", "rnorm");
+                        import_ofort_extension_intrinsic(I, "rnorm_fill", "rnorm_fill");
                     } else {
                         import_ofort_extension_intrinsic(I, "mean", "mean");
                         import_ofort_extension_intrinsic(I, "variance", "variance");
@@ -14925,6 +15010,20 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     if (rhs.v.arr.len != v->val.v.arr.len)
                         ofort_error(I, "Array assignment shape mismatch assigning to '%s' (lhs %d, rhs %d)",
                                     lhs->name, v->val.v.arr.len, rhs.v.arr.len);
+                    if (!I->where_mask && v->val.v.arr.real_data && rhs.v.arr.real_data) {
+                        memcpy(v->val.v.arr.real_data, rhs.v.arr.real_data,
+                               sizeof(double) * (size_t)v->val.v.arr.len);
+                        trace_assignment_value(I, lhs, rhs);
+                        free_value(&rhs);
+                        break;
+                    }
+                    if (!I->where_mask && v->val.v.arr.int_data && rhs.v.arr.int_data) {
+                        memcpy(v->val.v.arr.int_data, rhs.v.arr.int_data,
+                               sizeof(long long) * (size_t)v->val.v.arr.len);
+                        trace_assignment_value(I, lhs, rhs);
+                        free_value(&rhs);
+                        break;
+                    }
                     for (int i = 0; i < v->val.v.arr.len; i++) {
                         if (I->where_mask) {
                             int take = 0;
@@ -15788,6 +15887,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
     case FND_CALL: {
         char call_upper[256];
         str_upper(call_upper, n->name, 256);
+        if (call_ofort_extension_subroutine(I, n)) {
+            break;
+        }
         if (I->fast_mode && I->specialized_fast_paths &&
             strcmp(call_upper, "FANNKUCHREDUX") == 0 && n->n_stmts == 3 &&
             n->stmts[0]->type == FND_IDENT && n->stmts[1]->type == FND_IDENT &&
@@ -16009,39 +16111,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             } else if (n->stmts[0]->type == FND_FUNC_CALL) {
                 OfortNode *ref = n->stmts[0];
                 OfortVar *var = find_var(I, ref->name);
-                int has_slice = 0;
-                if (var && var->val.type == FVAL_ARRAY && ref->n_stmts > 0) {
-                    for (int si = 0; si < ref->n_stmts; si++) {
-                        OfortSubscriptRange range;
-                        int extent = si < var->val.v.arr.n_dims ? var->val.v.arr.dims[si] : var->val.v.arr.len;
-                        int lower = si < var->val.v.arr.n_dims ? var->val.v.arr.lower_bounds[si] : 1;
-                        if (eval_subscript_range(I, ref->stmts[si], lower, extent, &range)) {
-                            has_slice = 1;
-                            break;
-                        }
-                    }
-                    if (has_slice) {
-                        OfortValue section = eval_array_section(I, var, ref);
-                        if (section.type != FVAL_ARRAY ||
-                            (section.v.arr.elem_type != FVAL_REAL && section.v.arr.elem_type != FVAL_DOUBLE)) {
-                            free_value(&section);
-                            ofort_error(I, "RANDOM_NUMBER harvest array section must be REAL");
-                        }
-                        for (int i = 0; i < section.v.arr.len; i++) {
-                            OfortValue rv = section.v.arr.elem_type == FVAL_DOUBLE ?
-                                make_double(random_unit()) : make_real(random_unit());
-                            if (assign_packed_array_element(&section, i, rv)) {
-                                free_value(&rv);
-                            } else {
-                                free_value(&section.v.arr.data[i]);
-                                section.v.arr.data[i] = rv;
-                            }
-                        }
-                        assign_array_ref(I, var, ref, &section);
-                        free_value(&section);
-                        break;
-                    }
-                }
+                if (fill_random_number_array_section(I, var, ref)) break;
             }
             if (!harvest_val)
                 ofort_error(I, "RANDOM_NUMBER requires a variable argument");
@@ -17194,6 +17264,11 @@ static double *ofort_stats_array_arg(OfortInterpreter *I, OfortValue *arg, int *
     if (arg->v.arr.len <= 0) {
         ofort_error(I, "ofort statistics functions require nonempty arrays");
     }
+    if (arg->v.arr.real_data &&
+        (arg->v.arr.elem_type == FVAL_REAL || arg->v.arr.elem_type == FVAL_DOUBLE)) {
+        if (n_out) *n_out = arg->v.arr.len;
+        return arg->v.arr.real_data;
+    }
     x = (double *)calloc((size_t)arg->v.arr.len, sizeof(*x));
     if (!x) ofort_error(I, "Out of memory");
     for (int i = 0; i < arg->v.arr.len; i++) {
@@ -17216,8 +17291,10 @@ static OfortValue call_ofort_stats_unary(OfortInterpreter *I, const char *name,
     double *x;
     double result;
     int n;
+    int borrowed_x = 0;
     if (nargs != 1) ofort_error(I, "%s takes one array argument", name);
     x = ofort_stats_array_arg(I, &args[0], &n);
+    borrowed_x = x == args[0].v.arr.real_data;
     if (str_eq_nocase(name, "mean")) {
         result = ofort_stats_mean_r8(x, n);
     } else if (str_eq_nocase(name, "variance")) {
@@ -17225,10 +17302,10 @@ static OfortValue call_ofort_stats_unary(OfortInterpreter *I, const char *name,
     } else if (str_eq_nocase(name, "sd")) {
         result = ofort_stats_sd_r8(x, n);
     } else {
-        free(x);
+        if (!borrowed_x) free(x);
         ofort_error(I, "Unknown unary ofort statistics function '%s'", name);
     }
-    free(x);
+    if (!borrowed_x) free(x);
     if (isnan(result)) ofort_error(I, "%s is undefined for this input", name);
     return make_double(result);
 }
@@ -17240,12 +17317,16 @@ static OfortValue call_ofort_stats_binary(OfortInterpreter *I, const char *name,
     double result;
     int nx;
     int ny;
+    int borrowed_x = 0;
+    int borrowed_y = 0;
     if (nargs != 2) ofort_error(I, "%s takes two array arguments", name);
     x = ofort_stats_array_arg(I, &args[0], &nx);
+    borrowed_x = x == args[0].v.arr.real_data;
     y = ofort_stats_array_arg(I, &args[1], &ny);
+    borrowed_y = y == args[1].v.arr.real_data;
     if (nx != ny) {
-        free(x);
-        free(y);
+        if (!borrowed_x) free(x);
+        if (!borrowed_y) free(y);
         ofort_error(I, "%s requires arrays of the same size", name);
     }
     if (str_eq_nocase(name, "cov")) {
@@ -17253,12 +17334,12 @@ static OfortValue call_ofort_stats_binary(OfortInterpreter *I, const char *name,
     } else if (str_eq_nocase(name, "cor")) {
         result = ofort_stats_cor_r8(x, y, nx);
     } else {
-        free(x);
-        free(y);
+        if (!borrowed_x) free(x);
+        if (!borrowed_y) free(y);
         ofort_error(I, "Unknown binary ofort statistics function '%s'", name);
     }
-    free(x);
-    free(y);
+    if (!borrowed_x) free(x);
+    if (!borrowed_y) free(y);
     if (isnan(result)) ofort_error(I, "%s is undefined for this input", name);
     return make_double(result);
 }
@@ -17275,9 +17356,13 @@ static OfortValue call_ofort_extension_intrinsic(OfortInterpreter *I, const char
             OfortValue result;
             if (n < 0) ofort_error(I, "RNORM argument must be nonnegative");
             dims[0] = n;
-            result = make_array(FVAL_DOUBLE, dims, 1);
-            for (int i = 0; i < result.v.arr.len; i++) {
-                result.v.arr.data[i] = make_double(ofort_rnorm_sample(I));
+            result = make_array_with_char_len_options(FVAL_DOUBLE, dims, 1, 0, 1);
+            if (result.v.arr.real_data) {
+                for (int i = 0; i < result.v.arr.len; i++)
+                    result.v.arr.real_data[i] = ofort_rnorm_sample(I);
+            } else {
+                for (int i = 0; i < result.v.arr.len; i++)
+                    result.v.arr.data[i] = make_double(ofort_rnorm_sample(I));
             }
             return result;
         }
@@ -17294,6 +17379,64 @@ static OfortValue call_ofort_extension_intrinsic(OfortInterpreter *I, const char
     }
     ofort_error(I, "Unknown ofort extension intrinsic '%s'", name);
     return make_void_val();
+}
+
+static void ofort_rnorm_fill_value(OfortInterpreter *I, OfortValue *target) {
+    if (!target) ofort_error(I, "RNORM_FILL requires a REAL harvest argument");
+    if (target->type == FVAL_REAL || target->type == FVAL_DOUBLE) {
+        target->v.r = ofort_rnorm_sample(I);
+        return;
+    }
+    if (target->type != FVAL_ARRAY)
+        ofort_error(I, "RNORM_FILL requires a REAL scalar or rank-1 REAL array");
+    if (target->v.arr.n_dims != 1)
+        ofort_error(I, "RNORM_FILL requires a rank-1 REAL array");
+    if (target->v.arr.elem_type == FVAL_VOID)
+        target->v.arr.elem_type = FVAL_DOUBLE;
+    if (target->v.arr.elem_type != FVAL_REAL && target->v.arr.elem_type != FVAL_DOUBLE)
+        ofort_error(I, "RNORM_FILL harvest array must be REAL");
+    if (target->v.arr.real_data) {
+        for (int i = 0; i < target->v.arr.len; i++)
+            target->v.arr.real_data[i] = ofort_rnorm_sample(I);
+        return;
+    }
+    for (int i = 0; i < target->v.arr.len; i++) {
+        OfortValue elem = target->v.arr.elem_type == FVAL_DOUBLE ?
+                          make_double(ofort_rnorm_sample(I)) :
+                          make_real(ofort_rnorm_sample(I));
+        if (assign_packed_array_element(target, i, elem)) {
+            free_value(&elem);
+        } else {
+            free_value(&target->v.arr.data[i]);
+            target->v.arr.data[i] = elem;
+        }
+    }
+}
+
+static int call_ofort_extension_subroutine(OfortInterpreter *I, OfortNode *n) {
+    const char *extension_name;
+    if (!n || !find_imported_extension_intrinsic(I, n->name)) return 0;
+    extension_name = resolve_imported_extension_intrinsic(I, n->name);
+    if (!extension_name) extension_name = n->name;
+
+    if (str_eq_nocase(extension_name, "rnorm_fill")) {
+        OfortValue *target = NULL;
+        if (n->n_stmts != 1)
+            ofort_error(I, "RNORM_FILL takes one REAL harvest argument");
+        if (n->stmts[0]->type == FND_IDENT) {
+            OfortVar *v = find_var(I, n->stmts[0]->name);
+            if (!v) ofort_error(I, "Undefined variable '%s' in RNORM_FILL", n->stmts[0]->name);
+            target = &v->val;
+        } else if (n->stmts[0]->type == FND_MEMBER) {
+            target = member_lvalue(I, n->stmts[0]);
+        } else {
+            ofort_error(I, "RNORM_FILL argument must be a variable");
+        }
+        ofort_rnorm_fill_value(I, target);
+        return 1;
+    }
+
+    return 0;
 }
 
 static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortValue *args, int nargs,
