@@ -13720,7 +13720,10 @@ static int ofort_extension_module_exports(const char *module_name, const char *n
                str_eq_nocase(name, "variance") ||
                str_eq_nocase(name, "sd") ||
                str_eq_nocase(name, "cov") ||
-               str_eq_nocase(name, "cor");
+               str_eq_nocase(name, "cor") ||
+               str_eq_nocase(name, "variance_given_mean") ||
+               str_eq_nocase(name, "sd_given_mean") ||
+               str_eq_nocase(name, "calc_stats");
     }
     return 0;
 }
@@ -14373,6 +14376,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         import_ofort_extension_intrinsic(I, "sd", "sd");
                         import_ofort_extension_intrinsic(I, "cov", "cov");
                         import_ofort_extension_intrinsic(I, "cor", "cor");
+                        import_ofort_extension_intrinsic(I, "variance_given_mean", "variance_given_mean");
+                        import_ofort_extension_intrinsic(I, "sd_given_mean", "sd_given_mean");
+                        import_ofort_extension_intrinsic(I, "calc_stats", "calc_stats");
                     }
                 }
                 break;
@@ -17246,7 +17252,16 @@ static OfortValue transfer_value_from_bytes(OfortValType type, int kind, int cha
     }
 }
 
-static double ofort_rnorm_sample(OfortInterpreter *I) {
+static int ofort_rnorm_method(OfortInterpreter *I, OfortValue *arg) {
+    int method;
+    if (!arg || arg->type == FVAL_VOID) return 2;
+    method = (int)val_to_int(*arg);
+    if (method != 1 && method != 2)
+        ofort_error(I, "RNORM method must be 1 (Box-Muller) or 2 (Marsaglia polar)");
+    return method;
+}
+
+static double ofort_rnorm_sample_box_muller(OfortInterpreter *I) {
     const double two_pi = 6.283185307179586476925286766559;
     double u1, u2;
     seed_fast_rng_if_needed(I);
@@ -17254,6 +17269,45 @@ static double ofort_rnorm_sample(OfortInterpreter *I) {
     u2 = fast_rng_unit_from_u32(fast_rng_next32(&I->fast_rng_state));
     if (u1 <= 0.0) u1 = 1.0 / 4294967296.0;
     return sqrt(-2.0 * log(u1)) * cos(two_pi * u2);
+}
+
+static void ofort_rnorm_pair_polar(OfortInterpreter *I, double *z1, double *z2) {
+    double u, v, s, factor;
+    seed_fast_rng_if_needed(I);
+    do {
+        u = 2.0 * fast_rng_unit_from_u32(fast_rng_next32(&I->fast_rng_state)) - 1.0;
+        v = 2.0 * fast_rng_unit_from_u32(fast_rng_next32(&I->fast_rng_state)) - 1.0;
+        s = u * u + v * v;
+    } while (s <= 0.0 || s >= 1.0);
+    factor = sqrt(-2.0 * log(s) / s);
+    *z1 = u * factor;
+    *z2 = v * factor;
+}
+
+static double ofort_rnorm_sample(OfortInterpreter *I, int method) {
+    double z1, z2;
+    if (method == 2) {
+        ofort_rnorm_pair_polar(I, &z1, &z2);
+        return z1;
+    }
+    return ofort_rnorm_sample_box_muller(I);
+}
+
+static void ofort_rnorm_fill_double_data(OfortInterpreter *I, double *data, int n, int method) {
+    int i = 0;
+    if (!data || n <= 0) return;
+    if (method == 2) {
+        while (i + 1 < n) {
+            double z1, z2;
+            ofort_rnorm_pair_polar(I, &z1, &z2);
+            data[i++] = z1;
+            data[i++] = z2;
+        }
+        if (i < n) data[i] = ofort_rnorm_sample(I, method);
+        return;
+    }
+    for (i = 0; i < n; i++)
+        data[i] = ofort_rnorm_sample(I, method);
 }
 
 static double *ofort_stats_array_arg(OfortInterpreter *I, OfortValue *arg, int *n_out) {
@@ -17344,13 +17398,41 @@ static OfortValue call_ofort_stats_binary(OfortInterpreter *I, const char *name,
     return make_double(result);
 }
 
+static OfortValue call_ofort_stats_given_mean(OfortInterpreter *I, const char *name,
+                                              OfortValue *args, int nargs) {
+    double *x;
+    double xmean;
+    double ss = 0.0;
+    double result;
+    int n;
+    int borrowed_x = 0;
+
+    if (nargs != 2) ofort_error(I, "%s takes array and mean arguments", name);
+    x = ofort_stats_array_arg(I, &args[0], &n);
+    borrowed_x = x == args[0].v.arr.real_data;
+    xmean = val_to_real(args[1]);
+    if (n < 2) {
+        if (!borrowed_x) free(x);
+        ofort_error(I, "%s is undefined for this input", name);
+    }
+    for (int i = 0; i < n; i++) {
+        double d = x[i] - xmean;
+        ss += d * d;
+    }
+    result = ss / (double)(n - 1);
+    if (str_eq_nocase(name, "sd_given_mean")) result = sqrt(result);
+    if (!borrowed_x) free(x);
+    return make_double(result);
+}
+
 static OfortValue call_ofort_extension_intrinsic(OfortInterpreter *I, const char *name,
                                                 OfortValue *args, int nargs) {
     if (str_eq_nocase(name, "rnorm")) {
+        int method = nargs >= 2 ? ofort_rnorm_method(I, &args[1]) : 2;
         if (nargs == 0) {
-            return make_double(ofort_rnorm_sample(I));
+            return make_double(ofort_rnorm_sample(I, method));
         }
-        if (nargs == 1) {
+        if (nargs == 1 || nargs == 2) {
             int n = (int)val_to_int(args[0]);
             int dims[1];
             OfortValue result;
@@ -17358,15 +17440,14 @@ static OfortValue call_ofort_extension_intrinsic(OfortInterpreter *I, const char
             dims[0] = n;
             result = make_array_with_char_len_options(FVAL_DOUBLE, dims, 1, 0, 1);
             if (result.v.arr.real_data) {
-                for (int i = 0; i < result.v.arr.len; i++)
-                    result.v.arr.real_data[i] = ofort_rnorm_sample(I);
+                ofort_rnorm_fill_double_data(I, result.v.arr.real_data, result.v.arr.len, method);
             } else {
                 for (int i = 0; i < result.v.arr.len; i++)
-                    result.v.arr.data[i] = make_double(ofort_rnorm_sample(I));
+                    result.v.arr.data[i] = make_double(ofort_rnorm_sample(I, method));
             }
             return result;
         }
-        ofort_error(I, "RNORM takes zero or one argument");
+        ofort_error(I, "RNORM takes zero, one, or two arguments");
     }
     if (str_eq_nocase(name, "mean") ||
         str_eq_nocase(name, "variance") ||
@@ -17377,14 +17458,18 @@ static OfortValue call_ofort_extension_intrinsic(OfortInterpreter *I, const char
         str_eq_nocase(name, "cor")) {
         return call_ofort_stats_binary(I, name, args, nargs);
     }
+    if (str_eq_nocase(name, "variance_given_mean") ||
+        str_eq_nocase(name, "sd_given_mean")) {
+        return call_ofort_stats_given_mean(I, name, args, nargs);
+    }
     ofort_error(I, "Unknown ofort extension intrinsic '%s'", name);
     return make_void_val();
 }
 
-static void ofort_rnorm_fill_value(OfortInterpreter *I, OfortValue *target) {
+static void ofort_rnorm_fill_value(OfortInterpreter *I, OfortValue *target, int method) {
     if (!target) ofort_error(I, "RNORM_FILL requires a REAL harvest argument");
     if (target->type == FVAL_REAL || target->type == FVAL_DOUBLE) {
-        target->v.r = ofort_rnorm_sample(I);
+        target->v.r = ofort_rnorm_sample(I, method);
         return;
     }
     if (target->type != FVAL_ARRAY)
@@ -17396,14 +17481,13 @@ static void ofort_rnorm_fill_value(OfortInterpreter *I, OfortValue *target) {
     if (target->v.arr.elem_type != FVAL_REAL && target->v.arr.elem_type != FVAL_DOUBLE)
         ofort_error(I, "RNORM_FILL harvest array must be REAL");
     if (target->v.arr.real_data) {
-        for (int i = 0; i < target->v.arr.len; i++)
-            target->v.arr.real_data[i] = ofort_rnorm_sample(I);
+        ofort_rnorm_fill_double_data(I, target->v.arr.real_data, target->v.arr.len, method);
         return;
     }
     for (int i = 0; i < target->v.arr.len; i++) {
         OfortValue elem = target->v.arr.elem_type == FVAL_DOUBLE ?
-                          make_double(ofort_rnorm_sample(I)) :
-                          make_real(ofort_rnorm_sample(I));
+                          make_double(ofort_rnorm_sample(I, method)) :
+                          make_real(ofort_rnorm_sample(I, method));
         if (assign_packed_array_element(target, i, elem)) {
             free_value(&elem);
         } else {
@@ -17411,6 +17495,83 @@ static void ofort_rnorm_fill_value(OfortInterpreter *I, OfortValue *target) {
             target->v.arr.data[i] = elem;
         }
     }
+}
+
+static OfortValue *ofort_scalar_output_lvalue(OfortInterpreter *I, OfortNode *node, const char *arg_name) {
+    OfortValue *target = NULL;
+    if (!node) ofort_error(I, "Missing %s output argument", arg_name);
+    if (node->type == FND_IDENT) {
+        OfortVar *v = find_var(I, node->name);
+        if (!v) ofort_error(I, "Undefined variable '%s' in %s output", node->name, arg_name);
+        target = &v->val;
+    } else if (node->type == FND_MEMBER) {
+        target = member_lvalue(I, node);
+    } else {
+        ofort_error(I, "%s output argument must be a scalar variable", arg_name);
+    }
+    if (!target) ofort_error(I, "%s output argument is not assignable", arg_name);
+    if (target->type != FVAL_VOID && target->type != FVAL_REAL && target->type != FVAL_DOUBLE)
+        ofort_error(I, "%s output argument must be REAL", arg_name);
+    return target;
+}
+
+static void ofort_assign_real_output(OfortValue *target, double value) {
+    if (target->type == FVAL_VOID || target->type == FVAL_DOUBLE) {
+        free_value(target);
+        *target = make_double(value);
+    } else {
+        target->v.r = value;
+    }
+}
+
+static OfortValue *ofort_calc_stats_input_lvalue(OfortInterpreter *I, OfortNode *node) {
+    if (!node) ofort_error(I, "CALC_STATS requires array argument x");
+    if (node->type == FND_IDENT) {
+        OfortVar *v = find_var(I, node->name);
+        if (!v) ofort_error(I, "Undefined variable '%s' in CALC_STATS", node->name);
+        return &v->val;
+    }
+    if (node->type == FND_MEMBER) {
+        return member_lvalue(I, node);
+    }
+    return NULL;
+}
+
+static void ofort_calc_stats_value(OfortInterpreter *I, OfortValue *xval,
+                                   double *mean_out, double *var_out) {
+    int n;
+    double mean = 0.0;
+    double m2 = 0.0;
+
+    if (!xval || xval->type != FVAL_ARRAY || xval->v.arr.n_dims != 1)
+        ofort_error(I, "CALC_STATS requires rank-1 REAL array x");
+    if (xval->v.arr.len <= 0)
+        ofort_error(I, "CALC_STATS requires nonempty array x");
+    if (xval->v.arr.elem_type != FVAL_REAL && xval->v.arr.elem_type != FVAL_DOUBLE &&
+        xval->v.arr.elem_type != FVAL_INTEGER)
+        ofort_error(I, "CALC_STATS requires numeric array x");
+
+    n = xval->v.arr.len;
+    if (xval->v.arr.real_data) {
+        for (int i = 0; i < n; i++) {
+            double x = xval->v.arr.real_data[i];
+            double delta = x - mean;
+            mean += delta / (double)(i + 1);
+            m2 += delta * (x - mean);
+        }
+    } else {
+        for (int i = 0; i < n; i++) {
+            OfortValue elem = array_element_value(xval, i);
+            double x = val_to_real(elem);
+            double delta = x - mean;
+            mean += delta / (double)(i + 1);
+            m2 += delta * (x - mean);
+            free_value(&elem);
+        }
+    }
+
+    *mean_out = mean;
+    *var_out = n > 1 ? m2 / (double)(n - 1) : NAN;
 }
 
 static int call_ofort_extension_subroutine(OfortInterpreter *I, OfortNode *n) {
@@ -17421,8 +17582,14 @@ static int call_ofort_extension_subroutine(OfortInterpreter *I, OfortNode *n) {
 
     if (str_eq_nocase(extension_name, "rnorm_fill")) {
         OfortValue *target = NULL;
-        if (n->n_stmts != 1)
-            ofort_error(I, "RNORM_FILL takes one REAL harvest argument");
+        int method = 2;
+        if (n->n_stmts != 1 && n->n_stmts != 2)
+            ofort_error(I, "RNORM_FILL takes one REAL harvest argument and optional method");
+        if (n->n_stmts == 2) {
+            OfortValue method_val = eval_node(I, n->stmts[1]);
+            method = ofort_rnorm_method(I, &method_val);
+            free_value(&method_val);
+        }
         if (n->stmts[0]->type == FND_IDENT) {
             OfortVar *v = find_var(I, n->stmts[0]->name);
             if (!v) ofort_error(I, "Undefined variable '%s' in RNORM_FILL", n->stmts[0]->name);
@@ -17432,7 +17599,58 @@ static int call_ofort_extension_subroutine(OfortInterpreter *I, OfortNode *n) {
         } else {
             ofort_error(I, "RNORM_FILL argument must be a variable");
         }
-        ofort_rnorm_fill_value(I, target);
+        ofort_rnorm_fill_value(I, target, method);
+        return 1;
+    }
+
+    if (str_eq_nocase(extension_name, "calc_stats")) {
+        int x_idx = -1;
+        int mean_idx = -1;
+        int sd_idx = -1;
+        int var_idx = -1;
+        OfortValue *xval;
+        OfortValue *mean_target;
+        double mean;
+        double var;
+
+        for (int i = 0; i < n->n_stmts; i++) {
+            const char *pname = n->param_names[i];
+            if (pname[0]) {
+                if (str_eq_nocase(pname, "x")) x_idx = i;
+                else if (str_eq_nocase(pname, "mean")) mean_idx = i;
+                else if (str_eq_nocase(pname, "sd")) sd_idx = i;
+                else if (str_eq_nocase(pname, "var") || str_eq_nocase(pname, "variance")) var_idx = i;
+                else ofort_error(I, "Unknown CALC_STATS keyword '%s'", pname);
+            }
+        }
+        if (x_idx < 0 && n->n_stmts >= 1 && n->param_names[0][0] == '\0') x_idx = 0;
+        if (mean_idx < 0 && n->n_stmts >= 2 && n->param_names[1][0] == '\0') mean_idx = 1;
+        if (sd_idx < 0 && n->n_stmts >= 3 && n->param_names[2][0] == '\0') sd_idx = 2;
+        if (var_idx < 0 && n->n_stmts >= 4 && n->param_names[3][0] == '\0') var_idx = 3;
+        if (x_idx < 0 || mean_idx < 0)
+            ofort_error(I, "CALC_STATS requires x and mean arguments");
+
+        xval = ofort_calc_stats_input_lvalue(I, n->stmts[x_idx]);
+        if (!xval) {
+            OfortValue tmp = eval_node(I, n->stmts[x_idx]);
+            ofort_calc_stats_value(I, &tmp, &mean, &var);
+            free_value(&tmp);
+        } else {
+            ofort_calc_stats_value(I, xval, &mean, &var);
+        }
+
+        mean_target = ofort_scalar_output_lvalue(I, n->stmts[mean_idx], "mean");
+        ofort_assign_real_output(mean_target, mean);
+        if (sd_idx >= 0) {
+            OfortValue *sd_target = ofort_scalar_output_lvalue(I, n->stmts[sd_idx], "sd");
+            if (isnan(var)) ofort_error(I, "CALC_STATS sd is undefined for this input");
+            ofort_assign_real_output(sd_target, sqrt(var));
+        }
+        if (var_idx >= 0) {
+            OfortValue *var_target = ofort_scalar_output_lvalue(I, n->stmts[var_idx], "var");
+            if (isnan(var)) ofort_error(I, "CALC_STATS var is undefined for this input");
+            ofort_assign_real_output(var_target, var);
+        }
         return 1;
     }
 
