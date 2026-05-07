@@ -1418,12 +1418,36 @@ static int is_immediate_expression_line(const char *line) {
     return 1;
 }
 
+static int is_trace_assign_immediate_line(const char *line) {
+    static const char *non_assignment_words[] = {
+        "program", "end", "subroutine", "function", "module", "use",
+        "contains", "implicit", "integer", "real", "double", "character",
+        "logical", "complex", "type", "if", "then", "else", "elseif",
+        "do", "select", "case", "call", "print", "write", "read",
+        "allocate", "deallocate", "return", "stop", "exit", "cycle",
+        NULL
+    };
+    const char *p = skip_space(line);
+    int i;
+
+    if (*p == '\0' || *p == '\r' || *p == '\n' || *p == '.') return 0;
+    if (strstr(p, "::")) return 0;
+    if (!contains_assignment(p)) return 0;
+    for (i = 0; non_assignment_words[i]; i++) {
+        if (starts_with_word_nocase(p, non_assignment_words[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int g_implicit_typing = 1;
 static int g_warnings_enabled = 1;
 static int g_time_detail = 0;
 static int g_fast_mode = 0;
 static int g_specialized_fast_paths = 1;
 static int g_line_profile = 0;
+static int g_trace_assign = 0;
 static OfortStandardMode g_standard_mode = OFORT_STD_LEGACY;
 
 static OfortInterpreter *create_ofort_interpreter(void) {
@@ -1434,6 +1458,7 @@ static OfortInterpreter *create_ofort_interpreter(void) {
         ofort_set_fast_mode(interp, g_fast_mode);
         ofort_set_specialized_fast_paths(interp, g_specialized_fast_paths);
         ofort_set_line_profile_enabled(interp, g_line_profile);
+        ofort_set_trace_assign(interp, g_trace_assign);
         ofort_set_standard_mode(interp, g_standard_mode);
     }
     return interp;
@@ -1856,6 +1881,33 @@ static int execute_repl_pending_source(OfortInterpreter *interp, const char *sou
         *executed_len = strlen(source);
     }
     free(pending);
+    return rc;
+}
+
+static int execute_repl_source_prefix(OfortInterpreter *interp, const char *source,
+                                      size_t prefix_len, size_t *executed_len,
+                                      int trace_assign_enabled) {
+    char *prefix;
+    int rc;
+
+    if (!source || prefix_len == 0) {
+        if (executed_len) *executed_len = 0;
+        return 0;
+    }
+    prefix = (char *)malloc(prefix_len + 1);
+    if (!prefix) {
+        fprintf(stderr, "out of memory\n");
+        return 2;
+    }
+    memcpy(prefix, source, prefix_len);
+    prefix[prefix_len] = '\0';
+    ofort_set_trace_assign(interp, trace_assign_enabled);
+    rc = execute_source_text_on_interpreter(interp, prefix, 0, 1, 0, NULL);
+    ofort_set_trace_assign(interp, g_trace_assign);
+    if (rc == 0 && executed_len) {
+        *executed_len = prefix_len;
+    }
+    free(prefix);
     return rc;
 }
 
@@ -2556,7 +2608,7 @@ static int run_interactive(const char *load_path, int run_after_load) {
     int last_rc = 0;
 
     printf("Enter Fortran source.\n");
-    printf("Commands: . runs, .run [n] [-- args] repeats, .time [n] [-- args] times, .runq [n] [-- args] runs and quits, .quit quits, .clear clears, .del n[:m] deletes lines, .ins n text inserts, .rep n text replaces, .rename old new renames, .list lists, .decl lists declarations, .vars [names] lists values, .info [names] lists details, .shapes [names] lists array shapes, .sizes [names] lists array sizes, .stats [names] lists array stats, .load file loads, .load-run file loads/runs.\n");
+    printf("Commands: . runs, .run [n] [-- args] repeats, .time [n] [-- args] times, .runq [n] [-- args] runs and quits, .quit quits, .clear clears, .del n[:m] deletes lines, .ins n text inserts, .rep n text replaces, .rename old new renames, .list lists, .decl lists declarations, .vars [names] lists values, .info [names] lists details, .shapes [names] lists array shapes, .sizes [names] lists array sizes, .stats [names] lists array stats, .load file loads, .load-run file loads/runs. With --trace-assign, top-level assignments run immediately.\n");
 
     repl_interp = create_repl_interpreter();
     if (!repl_interp) {
@@ -3097,6 +3149,9 @@ static int run_interactive(const char *load_path, int run_after_load) {
 
         {
             int line_indent = source_indent_level(buf ? buf : "");
+            int trace_immediate = (g_trace_assign && line_indent == 0 && is_trace_assign_immediate_line(line));
+            int declaration_after_execution = (executed_len > 0 && is_repl_declaration_line(line));
+            size_t old_len = len;
             if (repl_line_pre_dedent(line) && line_indent > 0) {
                 line_indent--;
             }
@@ -3105,6 +3160,27 @@ static int run_interactive(const char *load_path, int run_after_load) {
                 free(footer);
                 ofort_destroy(repl_interp);
                 return 2;
+            }
+            if (declaration_after_execution) {
+                executed_len = 0;
+                ofort_destroy(repl_interp);
+                repl_interp = create_repl_interpreter();
+                if (!repl_interp) {
+                    fprintf(stderr, "failed to create Fortran interpreter\n");
+                    free(buf);
+                    free(footer);
+                    return 2;
+                }
+            }
+            if (trace_immediate) {
+                if (executed_len == 0 && old_len > 0) {
+                    last_rc = execute_repl_source_prefix(repl_interp, buf ? buf : "", old_len,
+                                                        &executed_len, 0);
+                    if (last_rc != 0) {
+                        continue;
+                    }
+                }
+                last_rc = execute_repl_pending_source(repl_interp, buf ? buf : "", &executed_len);
             }
         }
     }
@@ -3288,7 +3364,7 @@ static char *maybe_wrap_loose_source(char *source) {
 }
 
 static void print_usage(const char *program) {
-    fprintf(stderr, "usage: %s [--version] [-w] [--quiet] [--std=f2023|--std=legacy] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
+    fprintf(stderr, "usage: %s [--version] [-w] [--quiet] [--std=f2023|--std=legacy] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--trace-assign] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
     fprintf(stderr, "       %s --each [--check] [--quiet] [--limit n] [options] file-or-glob [file-or-glob ...] [-- args...]\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load file.f90\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load-run file.f90\n", program);
@@ -3304,6 +3380,7 @@ static void print_usage(const char *program) {
     fprintf(stderr, "       --time prints elapsed time for the requested operation\n");
     fprintf(stderr, "       --time-detail prints setup, lex, parse, register, execute, and total times\n");
     fprintf(stderr, "       --profile-lines prints elapsed execution time by source line\n");
+    fprintf(stderr, "       --trace-assign prints assignment trace diagnostics\n");
     fprintf(stderr, "       --each treats each file or Windows glob match as a separate program\n");
     fprintf(stderr, "       --limit n checks at most n files in --each mode\n");
     fprintf(stderr, "       @file reads source file names from a manifest, one path per line\n");
@@ -3429,6 +3506,9 @@ int main(int argc, char **argv) {
             g_time_detail = 1;
         } else if (strcmp(argv[i], "--profile-lines") == 0) {
             g_line_profile = 1;
+        } else if (strcmp(argv[i], "--trace-assign") == 0) {
+            g_trace_assign = 1;
+            g_specialized_fast_paths = 0;
         } else if (strcmp(argv[i], "--each") == 0) {
             each_mode = 1;
         } else if (strcmp(argv[i], "--limit") == 0) {
