@@ -251,6 +251,10 @@ static void import_ofort_extension_intrinsic(OfortInterpreter *I, const char *lo
                                              const char *target_name);
 static int find_imported_extension_intrinsic(OfortInterpreter *I, const char *name);
 static const char *resolve_imported_extension_intrinsic(OfortInterpreter *I, const char *name);
+static OfortValue call_ofort_stats_matrix_cov_cor(OfortInterpreter *I, const char *name,
+                                                  OfortValue *arg);
+static OfortValue call_ofort_la_intrinsic(OfortInterpreter *I, const char *name,
+                                          OfortValue *args, int nargs);
 static OfortValue call_ofort_extension_intrinsic(OfortInterpreter *I, const char *name,
                                                  OfortValue *args, int nargs);
 static int call_ofort_extension_subroutine(OfortInterpreter *I, OfortNode *n);
@@ -13705,6 +13709,7 @@ static void check_semantics_block(OfortInterpreter *I, OfortNode *block) {
 
 static int ofort_extension_module_exists(const char *module_name) {
     return str_eq_nocase(module_name, "ofort_random_mod") ||
+           str_eq_nocase(module_name, "ofort_la_mod") ||
            str_eq_nocase(module_name, "ofort_statistics_mod") ||
            str_eq_nocase(module_name, "ofort_stats_mod");
 }
@@ -13713,6 +13718,15 @@ static int ofort_extension_module_exports(const char *module_name, const char *n
     if (str_eq_nocase(module_name, "ofort_random_mod")) {
         return str_eq_nocase(name, "rnorm") ||
                str_eq_nocase(name, "rnorm_fill");
+    }
+    if (str_eq_nocase(module_name, "ofort_la_mod")) {
+        return str_eq_nocase(name, "matmul2") ||
+               str_eq_nocase(name, "transpose2") ||
+               str_eq_nocase(name, "crossprod") ||
+               str_eq_nocase(name, "tcrossprod") ||
+               str_eq_nocase(name, "center_cols") ||
+               str_eq_nocase(name, "col_sums") ||
+               str_eq_nocase(name, "col_means");
     }
     if (str_eq_nocase(module_name, "ofort_statistics_mod") ||
         str_eq_nocase(module_name, "ofort_stats_mod")) {
@@ -13723,7 +13737,8 @@ static int ofort_extension_module_exports(const char *module_name, const char *n
                str_eq_nocase(name, "cor") ||
                str_eq_nocase(name, "variance_given_mean") ||
                str_eq_nocase(name, "sd_given_mean") ||
-               str_eq_nocase(name, "calc_stats");
+               str_eq_nocase(name, "calc_stats") ||
+               str_eq_nocase(name, "calc_col_stats");
     }
     return 0;
 }
@@ -14370,6 +14385,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     if (str_eq_nocase(n->name, "ofort_random_mod")) {
                         import_ofort_extension_intrinsic(I, "rnorm", "rnorm");
                         import_ofort_extension_intrinsic(I, "rnorm_fill", "rnorm_fill");
+                    } else if (str_eq_nocase(n->name, "ofort_la_mod")) {
+                        import_ofort_extension_intrinsic(I, "matmul2", "matmul2");
+                        import_ofort_extension_intrinsic(I, "transpose2", "transpose2");
+                        import_ofort_extension_intrinsic(I, "crossprod", "crossprod");
+                        import_ofort_extension_intrinsic(I, "tcrossprod", "tcrossprod");
+                        import_ofort_extension_intrinsic(I, "center_cols", "center_cols");
+                        import_ofort_extension_intrinsic(I, "col_sums", "col_sums");
+                        import_ofort_extension_intrinsic(I, "col_means", "col_means");
                     } else {
                         import_ofort_extension_intrinsic(I, "mean", "mean");
                         import_ofort_extension_intrinsic(I, "variance", "variance");
@@ -14379,6 +14402,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         import_ofort_extension_intrinsic(I, "variance_given_mean", "variance_given_mean");
                         import_ofort_extension_intrinsic(I, "sd_given_mean", "sd_given_mean");
                         import_ofort_extension_intrinsic(I, "calc_stats", "calc_stats");
+                        import_ofort_extension_intrinsic(I, "calc_col_stats", "calc_col_stats");
                     }
                 }
                 break;
@@ -17456,11 +17480,21 @@ static OfortValue call_ofort_extension_intrinsic(OfortInterpreter *I, const char
     }
     if (str_eq_nocase(name, "cov") ||
         str_eq_nocase(name, "cor")) {
+        if (nargs == 1)
+            return call_ofort_stats_matrix_cov_cor(I, name, &args[0]);
         return call_ofort_stats_binary(I, name, args, nargs);
     }
     if (str_eq_nocase(name, "variance_given_mean") ||
         str_eq_nocase(name, "sd_given_mean")) {
         return call_ofort_stats_given_mean(I, name, args, nargs);
+    }
+    if (str_eq_nocase(name, "matmul2") ||
+        str_eq_nocase(name, "transpose2") ||
+        str_eq_nocase(name, "crossprod") ||
+        str_eq_nocase(name, "tcrossprod") ||
+        str_eq_nocase(name, "col_sums") ||
+        str_eq_nocase(name, "col_means")) {
+        return call_ofort_la_intrinsic(I, name, args, nargs);
     }
     ofort_error(I, "Unknown ofort extension intrinsic '%s'", name);
     return make_void_val();
@@ -17473,9 +17507,7 @@ static void ofort_rnorm_fill_value(OfortInterpreter *I, OfortValue *target, int 
         return;
     }
     if (target->type != FVAL_ARRAY)
-        ofort_error(I, "RNORM_FILL requires a REAL scalar or rank-1 REAL array");
-    if (target->v.arr.n_dims != 1)
-        ofort_error(I, "RNORM_FILL requires a rank-1 REAL array");
+        ofort_error(I, "RNORM_FILL requires a REAL scalar or REAL array");
     if (target->v.arr.elem_type == FVAL_VOID)
         target->v.arr.elem_type = FVAL_DOUBLE;
     if (target->v.arr.elem_type != FVAL_REAL && target->v.arr.elem_type != FVAL_DOUBLE)
@@ -17521,6 +17553,51 @@ static void ofort_assign_real_output(OfortValue *target, double value) {
         *target = make_double(value);
     } else {
         target->v.r = value;
+    }
+}
+
+static OfortValue *ofort_array_output_lvalue(OfortInterpreter *I, OfortNode *node,
+                                             const char *arg_name, int rank,
+                                             int dim1, int dim2) {
+    OfortValue *target = NULL;
+    if (!node) ofort_error(I, "Missing %s output argument", arg_name);
+    if (node->type == FND_IDENT) {
+        OfortVar *v = find_var(I, node->name);
+        if (!v) ofort_error(I, "Undefined variable '%s' in %s output", node->name, arg_name);
+        target = &v->val;
+    } else if (node->type == FND_MEMBER) {
+        target = member_lvalue(I, node);
+    } else {
+        ofort_error(I, "%s output argument must be an array variable", arg_name);
+    }
+    if (!target || target->type != FVAL_ARRAY)
+        ofort_error(I, "%s output argument must be an array", arg_name);
+    if (target->v.arr.elem_type != FVAL_REAL && target->v.arr.elem_type != FVAL_DOUBLE)
+        ofort_error(I, "%s output argument must be REAL", arg_name);
+    if (target->v.arr.n_dims != rank)
+        ofort_error(I, "%s output argument has wrong rank", arg_name);
+    if (rank == 1) {
+        if (target->v.arr.dims[0] != dim1)
+            ofort_error(I, "%s output argument has wrong size", arg_name);
+    } else {
+        if (target->v.arr.dims[0] != dim1 || target->v.arr.dims[1] != dim2)
+            ofort_error(I, "%s output argument has wrong shape", arg_name);
+    }
+    return target;
+}
+
+static void ofort_assign_real_array_element(OfortValue *target, int index, double value) {
+    OfortValue elem;
+    if (target->v.arr.real_data) {
+        target->v.arr.real_data[index] = value;
+        return;
+    }
+    elem = target->v.arr.elem_type == FVAL_DOUBLE ? make_double(value) : make_real(value);
+    if (assign_packed_array_element(target, index, elem)) {
+        free_value(&elem);
+    } else {
+        free_value(&target->v.arr.data[index]);
+        target->v.arr.data[index] = elem;
     }
 }
 
@@ -17572,6 +17649,448 @@ static void ofort_calc_stats_value(OfortInterpreter *I, OfortValue *xval,
 
     *mean_out = mean;
     *var_out = n > 1 ? m2 / (double)(n - 1) : NAN;
+}
+
+static double ofort_matrix_real_element(OfortInterpreter *I, OfortValue *xval, int index) {
+    (void)I;
+    if (xval->v.arr.real_data) return xval->v.arr.real_data[index];
+    if (xval->v.arr.int_data) return (double)xval->v.arr.int_data[index];
+    {
+        OfortValue elem = array_element_value(xval, index);
+        double value = val_to_real(elem);
+        free_value(&elem);
+        return value;
+    }
+}
+
+static void ofort_calc_col_stats_value(OfortInterpreter *I, OfortValue *xval,
+                                       OfortValue *mean_out, OfortValue *sd_out,
+                                       OfortValue *var_out, OfortValue *cov_out,
+                                       OfortValue *corr_out, OfortValue *rms_out,
+                                       OfortValue *cov_zm_out, OfortValue *corr_zm_out) {
+    int nrow;
+    int ncol;
+    int need_var;
+    int need_cov;
+    int need_zm_var;
+    int need_zm_cov;
+    double *means;
+    double *vars = NULL;
+    double *covs = NULL;
+    double *zm_vars = NULL;
+    double *zm_covs = NULL;
+    double *xc = NULL;
+
+    if (!mean_out && !sd_out && !var_out && !cov_out && !corr_out &&
+        !rms_out && !cov_zm_out && !corr_zm_out)
+        ofort_error(I, "CALC_COL_STATS requires at least one output argument");
+    if (!xval || xval->type != FVAL_ARRAY || xval->v.arr.n_dims != 2)
+        ofort_error(I, "CALC_COL_STATS requires rank-2 REAL array x");
+    if (xval->v.arr.elem_type != FVAL_REAL && xval->v.arr.elem_type != FVAL_DOUBLE &&
+        xval->v.arr.elem_type != FVAL_INTEGER)
+        ofort_error(I, "CALC_COL_STATS requires numeric array x");
+
+    nrow = xval->v.arr.dims[0];
+    ncol = xval->v.arr.dims[1];
+    if (nrow <= 0 || ncol <= 0)
+        ofort_error(I, "CALC_COL_STATS requires nonempty array x");
+    if ((sd_out || var_out || cov_out || corr_out) && nrow < 2)
+        ofort_error(I, "CALC_COL_STATS variance/covariance outputs require at least two rows");
+
+    means = (double *)calloc((size_t)ncol, sizeof(*means));
+    if (!means) ofort_error(I, "Out of memory");
+    for (int j = 0; j < ncol; j++) {
+        double sum = 0.0;
+        for (int i = 0; i < nrow; i++) {
+            sum += ofort_matrix_real_element(I, xval, i + j * nrow);
+        }
+        means[j] = sum / (double)nrow;
+    }
+
+    need_cov = cov_out || corr_out;
+    need_var = sd_out || var_out || corr_out;
+    need_zm_cov = cov_zm_out || corr_zm_out;
+    need_zm_var = rms_out || corr_zm_out;
+    if (need_cov) {
+        size_t ncov = (size_t)ncol * (size_t)ncol;
+        size_t nx = (size_t)nrow * (size_t)ncol;
+        covs = (double *)calloc(ncov, sizeof(*covs));
+        if (!covs) {
+            free(means);
+            ofort_error(I, "Out of memory");
+        }
+        xc = (double *)malloc(nx * sizeof(*xc));
+        if (!xc) {
+            free(covs);
+            free(means);
+            ofort_error(I, "Out of memory");
+        }
+        for (int j = 0; j < ncol; j++) {
+            double mu = means[j];
+            double *xcj = xc + (size_t)j * (size_t)nrow;
+            for (int i = 0; i < nrow; i++) {
+                xcj[i] = ofort_matrix_real_element(I, xval, i + j * nrow) - mu;
+            }
+        }
+        for (int j = 0; j < ncol; j++) {
+            double *xcj = xc + (size_t)j * (size_t)nrow;
+            for (int k = j; k < ncol; k++) {
+                double *xck = xc + (size_t)k * (size_t)nrow;
+                double ss = 0.0;
+                for (int i = 0; i < nrow; i++) {
+                    ss += xcj[i] * xck[i];
+                }
+                covs[j + k * ncol] = ss / (double)(nrow - 1);
+                covs[k + j * ncol] = covs[j + k * ncol];
+            }
+        }
+        free(xc);
+        xc = NULL;
+    }
+    if (need_var) {
+        vars = (double *)calloc((size_t)ncol, sizeof(*vars));
+        if (!vars) {
+            free(covs);
+            free(means);
+            ofort_error(I, "Out of memory");
+        }
+        if (covs) {
+            for (int j = 0; j < ncol; j++) vars[j] = covs[j + j * ncol];
+        } else {
+            for (int j = 0; j < ncol; j++) {
+                double ss = 0.0;
+                for (int i = 0; i < nrow; i++) {
+                    double d = ofort_matrix_real_element(I, xval, i + j * nrow) - means[j];
+                    ss += d * d;
+                }
+                vars[j] = ss / (double)(nrow - 1);
+            }
+        }
+    }
+    if (need_zm_cov) {
+        zm_covs = (double *)calloc((size_t)ncol * (size_t)ncol, sizeof(*zm_covs));
+        if (!zm_covs) {
+            free(covs);
+            free(vars);
+            free(means);
+            ofort_error(I, "Out of memory");
+        }
+        for (int j = 0; j < ncol; j++) {
+            for (int k = j; k < ncol; k++) {
+                double ss = 0.0;
+                for (int i = 0; i < nrow; i++) {
+                    double xj = ofort_matrix_real_element(I, xval, i + j * nrow);
+                    double xk = ofort_matrix_real_element(I, xval, i + k * nrow);
+                    ss += xj * xk;
+                }
+                zm_covs[j + k * ncol] = ss / (double)nrow;
+                zm_covs[k + j * ncol] = zm_covs[j + k * ncol];
+            }
+        }
+    }
+    if (need_zm_var) {
+        zm_vars = (double *)calloc((size_t)ncol, sizeof(*zm_vars));
+        if (!zm_vars) {
+            free(zm_covs);
+            free(covs);
+            free(vars);
+            free(means);
+            ofort_error(I, "Out of memory");
+        }
+        if (zm_covs) {
+            for (int j = 0; j < ncol; j++) zm_vars[j] = zm_covs[j + j * ncol];
+        } else {
+            for (int j = 0; j < ncol; j++) {
+                double ss = 0.0;
+                for (int i = 0; i < nrow; i++) {
+                    double x = ofort_matrix_real_element(I, xval, i + j * nrow);
+                    ss += x * x;
+                }
+                zm_vars[j] = ss / (double)nrow;
+            }
+        }
+    }
+
+    if (mean_out) {
+        for (int j = 0; j < ncol; j++) ofort_assign_real_array_element(mean_out, j, means[j]);
+    }
+    if (var_out) {
+        for (int j = 0; j < ncol; j++) ofort_assign_real_array_element(var_out, j, vars[j]);
+    }
+    if (sd_out) {
+        for (int j = 0; j < ncol; j++) ofort_assign_real_array_element(sd_out, j, sqrt(vars[j]));
+    }
+    if (cov_out) {
+        for (int j = 0; j < ncol * ncol; j++) ofort_assign_real_array_element(cov_out, j, covs[j]);
+    }
+    if (corr_out) {
+        for (int j = 0; j < ncol; j++) {
+            for (int k = 0; k < ncol; k++) {
+                double denom = sqrt(vars[j] * vars[k]);
+                double value = denom != 0.0 ? covs[j + k * ncol] / denom : NAN;
+                ofort_assign_real_array_element(corr_out, j + k * ncol, value);
+            }
+        }
+    }
+    if (rms_out) {
+        for (int j = 0; j < ncol; j++) ofort_assign_real_array_element(rms_out, j, sqrt(zm_vars[j]));
+    }
+    if (cov_zm_out) {
+        for (int j = 0; j < ncol * ncol; j++) ofort_assign_real_array_element(cov_zm_out, j, zm_covs[j]);
+    }
+    if (corr_zm_out) {
+        for (int j = 0; j < ncol; j++) {
+            for (int k = 0; k < ncol; k++) {
+                double denom = sqrt(zm_vars[j] * zm_vars[k]);
+                double value = denom != 0.0 ? zm_covs[j + k * ncol] / denom : NAN;
+                ofort_assign_real_array_element(corr_zm_out, j + k * ncol, value);
+            }
+        }
+    }
+
+    free(xc);
+    free(zm_covs);
+    free(zm_vars);
+    free(covs);
+    free(vars);
+    free(means);
+}
+
+static OfortValue call_ofort_stats_matrix_cov_cor(OfortInterpreter *I, const char *name,
+                                                  OfortValue *arg) {
+    int nrow;
+    int ncol;
+    int dims[2];
+    double *means;
+    double *vars = NULL;
+    double *covs;
+    OfortValue result;
+
+    if (!arg || arg->type != FVAL_ARRAY || arg->v.arr.n_dims != 2)
+        ofort_error(I, "%s(x) with one argument requires rank-2 REAL array x", name);
+    if (arg->v.arr.elem_type != FVAL_REAL && arg->v.arr.elem_type != FVAL_DOUBLE &&
+        arg->v.arr.elem_type != FVAL_INTEGER)
+        ofort_error(I, "%s(x) requires numeric array x", name);
+    nrow = arg->v.arr.dims[0];
+    ncol = arg->v.arr.dims[1];
+    if (nrow < 2 || ncol <= 0)
+        ofort_error(I, "%s(x) requires at least two rows and one column", name);
+
+    means = (double *)calloc((size_t)ncol, sizeof(*means));
+    covs = (double *)calloc((size_t)ncol * (size_t)ncol, sizeof(*covs));
+    if (!means || !covs) {
+        free(means);
+        free(covs);
+        ofort_error(I, "Out of memory");
+    }
+    for (int j = 0; j < ncol; j++) {
+        double sum = 0.0;
+        for (int i = 0; i < nrow; i++)
+            sum += ofort_matrix_real_element(I, arg, i + j * nrow);
+        means[j] = sum / (double)nrow;
+    }
+    for (int j = 0; j < ncol; j++) {
+        for (int k = j; k < ncol; k++) {
+            double ss = 0.0;
+            for (int i = 0; i < nrow; i++) {
+                double xj = ofort_matrix_real_element(I, arg, i + j * nrow) - means[j];
+                double xk = ofort_matrix_real_element(I, arg, i + k * nrow) - means[k];
+                ss += xj * xk;
+            }
+            covs[j + k * ncol] = ss / (double)(nrow - 1);
+            covs[k + j * ncol] = covs[j + k * ncol];
+        }
+    }
+    if (str_eq_nocase(name, "cor")) {
+        vars = (double *)calloc((size_t)ncol, sizeof(*vars));
+        if (!vars) {
+            free(means);
+            free(covs);
+            ofort_error(I, "Out of memory");
+        }
+        for (int j = 0; j < ncol; j++) vars[j] = covs[j + j * ncol];
+    }
+
+    dims[0] = ncol;
+    dims[1] = ncol;
+    result = make_array_with_char_len_options(FVAL_DOUBLE, dims, 2, 0, 1);
+    for (int j = 0; j < ncol; j++) {
+        for (int k = 0; k < ncol; k++) {
+            double value = covs[j + k * ncol];
+            if (vars) {
+                double denom = sqrt(vars[j] * vars[k]);
+                value = denom != 0.0 ? value / denom : NAN;
+            }
+            ofort_assign_real_array_element(&result, j + k * ncol, value);
+        }
+    }
+
+    free(vars);
+    free(covs);
+    free(means);
+    return result;
+}
+
+static void ofort_require_rank2_numeric(OfortInterpreter *I, OfortValue *x, const char *name) {
+    if (!x || x->type != FVAL_ARRAY || x->v.arr.n_dims != 2)
+        ofort_error(I, "%s requires a rank-2 numeric array", name);
+    if (x->v.arr.elem_type != FVAL_REAL && x->v.arr.elem_type != FVAL_DOUBLE &&
+        x->v.arr.elem_type != FVAL_INTEGER)
+        ofort_error(I, "%s requires a numeric array", name);
+}
+
+static OfortValue ofort_make_double_matrix(int nrow, int ncol) {
+    int dims[2];
+    dims[0] = nrow;
+    dims[1] = ncol;
+    return make_array_with_char_len_options(FVAL_DOUBLE, dims, 2, 0, 1);
+}
+
+static OfortValue ofort_make_double_vector(int n) {
+    int dims[1];
+    dims[0] = n;
+    return make_array_with_char_len_options(FVAL_DOUBLE, dims, 1, 0, 1);
+}
+
+static OfortValue ofort_la_transpose2(OfortInterpreter *I, OfortValue *x) {
+    int nrow;
+    int ncol;
+    OfortValue result;
+    ofort_require_rank2_numeric(I, x, "TRANSPOSE2");
+    nrow = x->v.arr.dims[0];
+    ncol = x->v.arr.dims[1];
+    result = ofort_make_double_matrix(ncol, nrow);
+    for (int j = 0; j < ncol; j++) {
+        for (int i = 0; i < nrow; i++) {
+            ofort_assign_real_array_element(&result, j + i * ncol,
+                                            ofort_matrix_real_element(I, x, i + j * nrow));
+        }
+    }
+    return result;
+}
+
+static OfortValue ofort_la_matmul2(OfortInterpreter *I, OfortValue *a, OfortValue *b) {
+    int m, k, kb, n;
+    OfortValue result;
+    ofort_require_rank2_numeric(I, a, "MATMUL2");
+    ofort_require_rank2_numeric(I, b, "MATMUL2");
+    m = a->v.arr.dims[0];
+    k = a->v.arr.dims[1];
+    kb = b->v.arr.dims[0];
+    n = b->v.arr.dims[1];
+    if (k != kb) ofort_error(I, "MATMUL2 inner dimensions do not conform");
+    result = ofort_make_double_matrix(m, n);
+    for (int j = 0; j < n; j++) {
+        for (int i = 0; i < m; i++) {
+            double sum = 0.0;
+            for (int p = 0; p < k; p++) {
+                sum += ofort_matrix_real_element(I, a, i + p * m) *
+                       ofort_matrix_real_element(I, b, p + j * kb);
+            }
+            ofort_assign_real_array_element(&result, i + j * m, sum);
+        }
+    }
+    return result;
+}
+
+static OfortValue ofort_la_crossprod(OfortInterpreter *I, OfortValue *x, OfortValue *y) {
+    int nrow;
+    int xcols;
+    int ycols;
+    OfortValue result;
+    ofort_require_rank2_numeric(I, x, "CROSSPROD");
+    if (y) ofort_require_rank2_numeric(I, y, "CROSSPROD");
+    nrow = x->v.arr.dims[0];
+    xcols = x->v.arr.dims[1];
+    if (!y) y = x;
+    if (y->v.arr.dims[0] != nrow) ofort_error(I, "CROSSPROD row counts do not conform");
+    ycols = y->v.arr.dims[1];
+    result = ofort_make_double_matrix(xcols, ycols);
+    for (int j = 0; j < ycols; j++) {
+        for (int i = 0; i < xcols; i++) {
+            double sum = 0.0;
+            for (int r = 0; r < nrow; r++) {
+                sum += ofort_matrix_real_element(I, x, r + i * nrow) *
+                       ofort_matrix_real_element(I, y, r + j * nrow);
+            }
+            ofort_assign_real_array_element(&result, i + j * xcols, sum);
+        }
+    }
+    return result;
+}
+
+static OfortValue ofort_la_tcrossprod(OfortInterpreter *I, OfortValue *x, OfortValue *y) {
+    int xrows;
+    int yrows;
+    int ncol;
+    OfortValue result;
+    ofort_require_rank2_numeric(I, x, "TCROSSPROD");
+    if (y) ofort_require_rank2_numeric(I, y, "TCROSSPROD");
+    xrows = x->v.arr.dims[0];
+    ncol = x->v.arr.dims[1];
+    if (!y) y = x;
+    if (y->v.arr.dims[1] != ncol) ofort_error(I, "TCROSSPROD column counts do not conform");
+    yrows = y->v.arr.dims[0];
+    result = ofort_make_double_matrix(xrows, yrows);
+    for (int j = 0; j < yrows; j++) {
+        for (int i = 0; i < xrows; i++) {
+            double sum = 0.0;
+            for (int c = 0; c < ncol; c++) {
+                sum += ofort_matrix_real_element(I, x, i + c * xrows) *
+                       ofort_matrix_real_element(I, y, j + c * yrows);
+            }
+            ofort_assign_real_array_element(&result, i + j * xrows, sum);
+        }
+    }
+    return result;
+}
+
+static OfortValue ofort_la_col_sums_means(OfortInterpreter *I, OfortValue *x, int means) {
+    int nrow;
+    int ncol;
+    OfortValue result;
+    ofort_require_rank2_numeric(I, x, means ? "COL_MEANS" : "COL_SUMS");
+    nrow = x->v.arr.dims[0];
+    ncol = x->v.arr.dims[1];
+    result = ofort_make_double_vector(ncol);
+    for (int j = 0; j < ncol; j++) {
+        double sum = 0.0;
+        for (int i = 0; i < nrow; i++)
+            sum += ofort_matrix_real_element(I, x, i + j * nrow);
+        if (means) sum /= (double)nrow;
+        ofort_assign_real_array_element(&result, j, sum);
+    }
+    return result;
+}
+
+static OfortValue call_ofort_la_intrinsic(OfortInterpreter *I, const char *name,
+                                          OfortValue *args, int nargs) {
+    if (str_eq_nocase(name, "transpose2")) {
+        if (nargs != 1) ofort_error(I, "TRANSPOSE2 takes one matrix argument");
+        return ofort_la_transpose2(I, &args[0]);
+    }
+    if (str_eq_nocase(name, "matmul2")) {
+        if (nargs != 2) ofort_error(I, "MATMUL2 takes two matrix arguments");
+        return ofort_la_matmul2(I, &args[0], &args[1]);
+    }
+    if (str_eq_nocase(name, "crossprod")) {
+        if (nargs != 1 && nargs != 2) ofort_error(I, "CROSSPROD takes one or two matrix arguments");
+        return ofort_la_crossprod(I, &args[0], nargs == 2 ? &args[1] : NULL);
+    }
+    if (str_eq_nocase(name, "tcrossprod")) {
+        if (nargs != 1 && nargs != 2) ofort_error(I, "TCROSSPROD takes one or two matrix arguments");
+        return ofort_la_tcrossprod(I, &args[0], nargs == 2 ? &args[1] : NULL);
+    }
+    if (str_eq_nocase(name, "col_sums")) {
+        if (nargs != 1) ofort_error(I, "COL_SUMS takes one matrix argument");
+        return ofort_la_col_sums_means(I, &args[0], 0);
+    }
+    if (str_eq_nocase(name, "col_means")) {
+        if (nargs != 1) ofort_error(I, "COL_MEANS takes one matrix argument");
+        return ofort_la_col_sums_means(I, &args[0], 1);
+    }
+    ofort_error(I, "Unknown ofort linear algebra function '%s'", name);
+    return make_void_val();
 }
 
 static int call_ofort_extension_subroutine(OfortInterpreter *I, OfortNode *n) {
@@ -17650,6 +18169,115 @@ static int call_ofort_extension_subroutine(OfortInterpreter *I, OfortNode *n) {
             OfortValue *var_target = ofort_scalar_output_lvalue(I, n->stmts[var_idx], "var");
             if (isnan(var)) ofort_error(I, "CALC_STATS var is undefined for this input");
             ofort_assign_real_output(var_target, var);
+        }
+        return 1;
+    }
+
+    if (str_eq_nocase(extension_name, "calc_col_stats")) {
+        int x_idx = -1;
+        int mean_idx = -1;
+        int sd_idx = -1;
+        int var_idx = -1;
+        int cov_idx = -1;
+        int corr_idx = -1;
+        int rms_idx = -1;
+        int cov_zm_idx = -1;
+        int corr_zm_idx = -1;
+        OfortValue *xval;
+        OfortValue *mean_target = NULL;
+        OfortValue *sd_target = NULL;
+        OfortValue *var_target = NULL;
+        OfortValue *cov_target = NULL;
+        OfortValue *corr_target = NULL;
+        OfortValue *rms_target = NULL;
+        OfortValue *cov_zm_target = NULL;
+        OfortValue *corr_zm_target = NULL;
+        int ncol;
+
+        for (int i = 0; i < n->n_stmts; i++) {
+            const char *pname = n->param_names[i];
+            if (pname[0]) {
+                if (str_eq_nocase(pname, "x")) x_idx = i;
+                else if (str_eq_nocase(pname, "mean")) mean_idx = i;
+                else if (str_eq_nocase(pname, "sd")) sd_idx = i;
+                else if (str_eq_nocase(pname, "var") || str_eq_nocase(pname, "variance")) var_idx = i;
+                else if (str_eq_nocase(pname, "cov")) cov_idx = i;
+                else if (str_eq_nocase(pname, "corr") || str_eq_nocase(pname, "cor")) corr_idx = i;
+                else if (str_eq_nocase(pname, "rms")) rms_idx = i;
+                else if (str_eq_nocase(pname, "cov_zm") || str_eq_nocase(pname, "covzm")) cov_zm_idx = i;
+                else if (str_eq_nocase(pname, "corr_zm") || str_eq_nocase(pname, "cor_zm") ||
+                         str_eq_nocase(pname, "corrzm") || str_eq_nocase(pname, "corzm")) corr_zm_idx = i;
+                else ofort_error(I, "Unknown CALC_COL_STATS keyword '%s'", pname);
+            }
+        }
+        if (x_idx < 0 && n->n_stmts >= 1 && n->param_names[0][0] == '\0') x_idx = 0;
+        if (mean_idx < 0 && n->n_stmts >= 2 && n->param_names[1][0] == '\0') mean_idx = 1;
+        if (sd_idx < 0 && n->n_stmts >= 3 && n->param_names[2][0] == '\0') sd_idx = 2;
+        if (var_idx < 0 && n->n_stmts >= 4 && n->param_names[3][0] == '\0') var_idx = 3;
+        if (cov_idx < 0 && n->n_stmts >= 5 && n->param_names[4][0] == '\0') cov_idx = 4;
+        if (corr_idx < 0 && n->n_stmts >= 6 && n->param_names[5][0] == '\0') corr_idx = 5;
+        if (x_idx < 0) ofort_error(I, "CALC_COL_STATS requires x argument");
+
+        xval = ofort_calc_stats_input_lvalue(I, n->stmts[x_idx]);
+        if (!xval || xval->type != FVAL_ARRAY || xval->v.arr.n_dims != 2)
+            ofort_error(I, "CALC_COL_STATS requires rank-2 array x");
+        ncol = xval->v.arr.dims[1];
+        if (mean_idx >= 0) mean_target = ofort_array_output_lvalue(I, n->stmts[mean_idx], "mean", 1, ncol, 0);
+        if (sd_idx >= 0) sd_target = ofort_array_output_lvalue(I, n->stmts[sd_idx], "sd", 1, ncol, 0);
+        if (var_idx >= 0) var_target = ofort_array_output_lvalue(I, n->stmts[var_idx], "var", 1, ncol, 0);
+        if (cov_idx >= 0) cov_target = ofort_array_output_lvalue(I, n->stmts[cov_idx], "cov", 2, ncol, ncol);
+        if (corr_idx >= 0) corr_target = ofort_array_output_lvalue(I, n->stmts[corr_idx], "corr", 2, ncol, ncol);
+        if (rms_idx >= 0) rms_target = ofort_array_output_lvalue(I, n->stmts[rms_idx], "rms", 1, ncol, 0);
+        if (cov_zm_idx >= 0) cov_zm_target = ofort_array_output_lvalue(I, n->stmts[cov_zm_idx], "cov_zm", 2, ncol, ncol);
+        if (corr_zm_idx >= 0) corr_zm_target = ofort_array_output_lvalue(I, n->stmts[corr_zm_idx], "corr_zm", 2, ncol, ncol);
+
+        ofort_calc_col_stats_value(I, xval, mean_target, sd_target, var_target, cov_target, corr_target,
+                                   rms_target, cov_zm_target, corr_zm_target);
+        return 1;
+    }
+
+    if (str_eq_nocase(extension_name, "center_cols")) {
+        int x_idx = -1;
+        int mean_idx = -1;
+        int out_idx = -1;
+        OfortValue *xval;
+        OfortValue *mean_val;
+        OfortValue *out_val;
+        int nrow;
+        int ncol;
+
+        for (int i = 0; i < n->n_stmts; i++) {
+            const char *pname = n->param_names[i];
+            if (pname[0]) {
+                if (str_eq_nocase(pname, "x")) x_idx = i;
+                else if (str_eq_nocase(pname, "mean") || str_eq_nocase(pname, "center")) mean_idx = i;
+                else if (str_eq_nocase(pname, "out") || str_eq_nocase(pname, "y")) out_idx = i;
+                else ofort_error(I, "Unknown CENTER_COLS keyword '%s'", pname);
+            }
+        }
+        if (x_idx < 0 && n->n_stmts >= 1 && n->param_names[0][0] == '\0') x_idx = 0;
+        if (mean_idx < 0 && n->n_stmts >= 2 && n->param_names[1][0] == '\0') mean_idx = 1;
+        if (out_idx < 0 && n->n_stmts >= 3 && n->param_names[2][0] == '\0') out_idx = 2;
+        if (x_idx < 0 || mean_idx < 0 || out_idx < 0)
+            ofort_error(I, "CENTER_COLS requires x, mean, and out arguments");
+
+        xval = ofort_calc_stats_input_lvalue(I, n->stmts[x_idx]);
+        mean_val = ofort_calc_stats_input_lvalue(I, n->stmts[mean_idx]);
+        if (!xval || xval->type != FVAL_ARRAY || xval->v.arr.n_dims != 2)
+            ofort_error(I, "CENTER_COLS requires rank-2 array x");
+        if (!mean_val || mean_val->type != FVAL_ARRAY || mean_val->v.arr.n_dims != 1)
+            ofort_error(I, "CENTER_COLS requires rank-1 mean array");
+        nrow = xval->v.arr.dims[0];
+        ncol = xval->v.arr.dims[1];
+        if (mean_val->v.arr.len != ncol)
+            ofort_error(I, "CENTER_COLS mean length must match number of columns");
+        out_val = ofort_array_output_lvalue(I, n->stmts[out_idx], "out", 2, nrow, ncol);
+        for (int j = 0; j < ncol; j++) {
+            double mu = ofort_matrix_real_element(I, mean_val, j);
+            for (int i = 0; i < nrow; i++) {
+                double value = ofort_matrix_real_element(I, xval, i + j * nrow) - mu;
+                ofort_assign_real_array_element(out_val, i + j * nrow, value);
+            }
         }
         return 1;
     }
