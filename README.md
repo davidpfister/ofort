@@ -26,6 +26,7 @@ development. It is not a production Fortran compiler.
   expected-output file.
 - `scripts/xofort.py` is a batch runner for trying many source files one at a
   time.
+- `ofort_gui.py` is a small Tkinter GUI wrapper around `ofort.exe`.
 - `examples` contains small demonstration programs when present.
 
 Generated files such as `ofort.exe`, `ofort.build`, `main*.f90`, compiler
@@ -34,10 +35,11 @@ artifacts and should not be committed.
 
 ## Current Status
 
-The interpreter currently supports a growing practical Fortran subset. It
-includes the expected core scalar, array, procedure, module, control-flow, and
-I/O features, plus selected post-Fortran-95 features where they are useful for
-real test programs:
+The interpreter currently supports a growing practical Fortran subset. It is no
+longer only a Fortran 90/95-style interpreter: the core remains small and
+pragmatic, but `ofort` accepts selected Fortran 2003/2008/2018-era features
+where they are useful for real test programs. Coverage is implementation-driven
+rather than standard-complete.
 
 - scalar `INTEGER`, `REAL`, `DOUBLE PRECISION`, `COMPLEX`, `LOGICAL`, and
   `CHARACTER`
@@ -50,6 +52,8 @@ real test programs:
   procedures, and basic dispatch for supported cases
 - selected parameterized derived-type syntax and derived-type parameter
   handling used by the regression tests
+- `block data`, `bind(c)` on supported declarations and common blocks, selected
+  user-defined operators, and selected pointer/allocation features
 - selected `iso_fortran_env` named constants such as `real64`, including
   `only` renaming
 - `implicit none`, configurable implicit typing, declaration reordering in the
@@ -60,6 +64,7 @@ real test programs:
 - `format` statements, formatted `print`/`write`, `read`, `open`, `close`,
   `rewind`, internal I/O, simple external files, and simple unformatted stream
   I/O
+- simple preprocessing support for `#define` macro substitution in source files
 - command-line arguments via `command_argument_count`, `get_command_argument`,
   and the nonstandard `getarg`
 - allocatable utilities such as `allocated`, `allocate`, `deallocate`, and
@@ -180,6 +185,17 @@ implementation and its limitations. Use `--no-specialize` with `--fast` to
 disable specialized pattern/program fast paths while keeping the general fast
 mode enabled.
 
+Trace assignment values:
+
+```powershell
+.\ofort.exe --trace-assign x.f90
+```
+
+`--trace-assign` prints the value assigned by each executed assignment
+statement. In the interactive REPL, top-level assignment lines run immediately
+when this mode is enabled, so a line such as `n = 2**5` prints `32` without
+requiring `.` or `.run`.
+
 By default, `ofort` follows historical Fortran implicit typing, where names
 beginning with I-N are integers and other names are real. To require explicit
 declarations unless an `implicit` statement says otherwise:
@@ -211,6 +227,44 @@ python .\scripts\xofort.py --filter "gfortran -std=f95" "tests\cases\*.f90"
 `--quiet` reports only files that `ofort` does not handle. `--filter` runs the
 given command with the source file appended and skips files for which that
 command fails.
+
+## GUI
+
+`ofort_gui.py` provides a small Tkinter front end around the command-line
+interpreter. It does not link to the C code directly; it writes the editor
+contents to a temporary Fortran file, invokes `ofort`, and displays the
+captured output. It can also call external compilers when they are installed
+and available on `PATH`.
+
+Run it with:
+
+```powershell
+python .\ofort_gui.py
+```
+
+Current GUI features include:
+
+- source editor with 4-space auto-indentation for common `if`, `do`, `select`,
+  `where`, and related blocks
+- syntax coloring for common Fortran keywords, declaration words, intrinsics,
+  strings, comments, and numbers
+- open/save support for Fortran source files
+- checkboxes for `--trace-assign`, `--no-implicit-typing`, `--std=f2023`, and
+  `--fast`
+- run buttons for `ofort`, `gfortran`, `ifx`, and LFortran
+- check/compile-only buttons: `Check ofort`, `Compile gfortran`, `Compile ifx`,
+  and `Compile LFortran`
+- stdout, stderr, assignment-trace, and problems panes, with the active pane
+  switching automatically after run/check/compile actions
+- clickable problem diagnostics that jump to the reported source line
+- compiler output cleanup for common ANSI color sequences emitted by tools such
+  as LFortran
+- elapsed-time reporting for check, compile, run, and total time
+
+The GUI should run on Windows, macOS, and Linux when Python includes Tkinter and
+an `ofort` executable is either next to `ofort_gui.py` or available on `PATH`.
+External compiler buttons require the corresponding compiler executable
+(`gfortran`, `ifx`, or `lfortran`) to be installed and available on `PATH`.
 
 ## Benchmarks
 
