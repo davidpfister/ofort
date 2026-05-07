@@ -1472,6 +1472,41 @@ static OfortInterpreter *create_repl_interpreter(void) {
     return interp;
 }
 
+static int repl_preflight_check_source(const char *source, const char *footer) {
+    char *effective = NULL;
+    OfortInterpreter *checker = NULL;
+    int rc;
+    const char *error;
+
+    if (source_indent_level(source ? source : "") > 0) {
+        return 0;
+    }
+
+    effective = make_effective_source(source ? source : "", footer);
+    if (!effective) {
+        fprintf(stderr, "failed to prepare source for interactive check\n");
+        return -1;
+    }
+
+    checker = create_ofort_interpreter();
+    if (!checker) {
+        free(effective);
+        fprintf(stderr, "failed to create Fortran interpreter\n");
+        return -1;
+    }
+
+    ofort_set_trace_assign(checker, 0);
+    rc = ofort_check(checker, effective);
+    if (rc != 0) {
+        error = ofort_get_error(checker);
+        fprintf(stderr, "%s\n", (error && error[0] != '\0') ? error : "interactive check failed");
+    }
+
+    ofort_destroy(checker);
+    free(effective);
+    return rc;
+}
+
 static int execute_source_text(const char *text, int print_expr_statements, int suppress_output,
                                int command_argc, char **command_args, double setup_start,
                                const SourceMap *source_map) {
@@ -3171,6 +3206,10 @@ static int run_interactive(const char *load_path, int run_after_load) {
                     free(footer);
                     return 2;
                 }
+            }
+            last_rc = repl_preflight_check_source(buf ? buf : "", footer);
+            if (last_rc != 0) {
+                continue;
             }
             if (trace_immediate) {
                 if (executed_len == 0 && old_len > 0) {
