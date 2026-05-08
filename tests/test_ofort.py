@@ -61,6 +61,7 @@ def case_files():
             "xalternate_return_dummy_obsolescent.f90",
             "xallocate_already_allocated.f90",
             "ximplicit_derived_type.f90",
+            "ximplicit_typing_ranges.f90",
         }
     )
 
@@ -79,6 +80,23 @@ def test_case_stdout(source):
     assert result.returncode == 0, result.stderr
     assert result.stderr == ""
     assert result.stdout == expected
+
+
+def test_implicit_integer_real_assignment_warns_but_runs():
+    source = CASES / "ximplicit_typing_ranges.f90"
+    expected = source.with_suffix(".out").read_text(encoding="utf-8")
+    result = subprocess.run(
+        [str(OFORT), str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected
+    assert "warning: assigning REAL to INTEGER variable 'i' truncates toward zero" in result.stderr
+    assert "line 3: i = 2.8" in result.stderr
 
 
 def test_entry_statement_is_reported_obsolescent():
@@ -1845,6 +1863,633 @@ def test_rejects_type_changing_assignment():
     assert result.stdout == ""
     assert "Cannot assign CHARACTER to INTEGER variable 'i'" in result.stderr
     assert 'line 4: i = "a"' in result.stderr
+
+
+def test_repl_print_shortcut_is_stored_as_fortran(tmp_path):
+    source = tmp_path / "repl_print_shortcut.f90"
+    source.write_text("integer :: i = 2\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--load", str(source)],
+        cwd=ROOT,
+        input="print i,i+1,\"x\"\n.list\n.\n.clear\n.quit\n",
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "   2  print *, i,i+1,\"x\"\n" in result.stdout
+    assert "2 3 x\n" in result.stdout
+
+
+def test_repl_let_const_shortcuts_are_stored_as_fortran(tmp_path):
+    source = tmp_path / "repl_let_const_shortcut.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--load", str(source)],
+        cwd=ROOT,
+        input=(
+            "let i = 2\n"
+            "let x = 2.5\n"
+            "let s = \"abc\"\n"
+            "const n = 10\n"
+            "const ok = .true.\n"
+            ".list\n"
+            "print i,x,s,n,ok\n"
+            ".\n"
+            ".clear\n"
+            ".quit\n"
+        ),
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "integer :: i\n" in result.stdout
+    assert "i = 2\n" in result.stdout
+    assert "real :: x\n" in result.stdout
+    assert "x = 2.5\n" in result.stdout
+    assert "character(len=3) :: s\n" in result.stdout
+    assert "s = \"abc\"\n" in result.stdout
+    assert "integer, parameter :: n = 10\n" in result.stdout
+    assert "logical, parameter :: ok = .true.\n" in result.stdout
+    assert "2 2.5 abc 10 T\n" in result.stdout
+
+
+def test_repl_const_kind_shortcut_is_integer_parameter(tmp_path):
+    source = tmp_path / "repl_const_kind_shortcut.f90"
+    source.write_text("implicit none\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--load", str(source)],
+        cwd=ROOT,
+        input="const dp = kind(1.0d0)\n.list\nprint dp\n.\n.clear\n.quit\n",
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "integer, parameter :: dp = kind(1.0d0)\n" in result.stdout
+    assert "8\n" in result.stdout
+
+
+def test_repl_let_const_existing_names_and_reconst(tmp_path):
+    source = tmp_path / "repl_reconst_shortcut.f90"
+    source.write_text("implicit none\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--load", str(source)],
+        cwd=ROOT,
+        input=(
+            "const n = 4\n"
+            "let m = 5\n"
+            "n*m\n"
+            "let m = 7\n"
+            "const n = 8\n"
+            "reconst n = 8\n"
+            "n*m\n"
+            ".list\n"
+            ".clear\n"
+            ".quit\n"
+        ),
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "LET variable 'm' already exists; use assignment: m = ..." in result.stderr
+    assert "CONST name 'n' already exists; use reconst n = ... to replace a parameter" in result.stderr
+    assert "ofort> 20\n" in result.stdout
+    assert "ofort> 40\n" in result.stdout
+    assert "integer, parameter :: n = 8\n" in result.stdout
+    assert result.stdout.count("integer :: m\n") == 1
+    assert "m = 5\n" in result.stdout
+    assert "m = 7\n" not in result.stdout
+
+
+def test_repl_implicit_none_first_line_has_no_spurious_text(tmp_path):
+    source = tmp_path / "repl_implicit_none.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--load", str(source)],
+        cwd=ROOT,
+        input="implicit none\n.list\n.clear\n.quit\n",
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    assert "   1  implicit none\n" in result.stdout
+    assert "   2  P\n" not in result.stdout
+
+
+def test_repl_malformed_let_const_are_not_shortcuts(tmp_path):
+    source = tmp_path / "repl_bad_let_const_shortcut.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--load", str(source)],
+        cwd=ROOT,
+        input="let = 3\nconst = .true.\n.list\n.clear\n.quit\n",
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "   1  let = 3\n" in result.stdout
+    assert "   2  const = .true.\n" in result.stdout
+
+
+def test_pure_procedure_rejects_io(tmp_path):
+    source = tmp_path / "xpure_io.f90"
+    source.write_text(
+        """
+module m
+implicit none
+contains
+pure subroutine s()
+print*,"in s"
+end subroutine s
+end module m
+
+program main
+implicit none
+use m
+call s()
+end program main
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "PRINT statement is not allowed in PURE procedure 's'" in result.stderr
+    assert 'line 5: print*,"in s"' in result.stderr
+
+
+def test_pure_procedure_rejects_random_number(tmp_path):
+    source = tmp_path / "xpure_random_number.f90"
+    source.write_text(
+        """
+module m
+implicit none
+contains
+pure subroutine s()
+real :: x
+call random_number(x)
+end subroutine s
+end module m
+
+program main
+implicit none
+use m
+call s()
+end program main
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "Impure intrinsic subroutine 'random_number' is not allowed in PURE procedure 's'" in result.stderr
+    assert "line 6: call random_number(x)" in result.stderr
+
+
+def test_pure_procedure_reports_multiple_violations(tmp_path):
+    source = tmp_path / "xpure.f90"
+    source.write_text(
+        """
+module m
+implicit none
+real :: y
+contains
+pure subroutine s1()
+print*,"in s1"
+end subroutine s1
+
+pure subroutine s2()
+real :: x
+call random_number(x)
+end subroutine s2
+
+pure subroutine s3()
+y = 0.0
+end subroutine s3
+
+pure subroutine s4()
+integer :: n
+call random_seed(size=n)
+end subroutine s4
+end module m
+
+program main
+implicit none
+use m
+call s1()
+call s2()
+end program main
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "PRINT statement is not allowed in PURE procedure 's1'" in result.stderr
+    assert 'line 6: print*,"in s1"' in result.stderr
+    assert "Impure intrinsic subroutine 'random_number' is not allowed in PURE procedure 's2'" in result.stderr
+    assert "line 11: call random_number(x)" in result.stderr
+    assert "Variable 'y' cannot appear in a variable definition context in PURE procedure 's3'" in result.stderr
+    assert "line 15: y = 0.0" in result.stderr
+    assert "Impure intrinsic subroutine 'random_seed' is not allowed in PURE procedure 's4'" in result.stderr
+    assert "line 20: call random_seed(size=n)" in result.stderr
+
+
+def test_matmul_matrix_vector_and_vector_matrix(tmp_path):
+    source = tmp_path / "xmatmul_vector.f90"
+    source.write_text(
+        """
+program main
+implicit none
+real(8) :: a(2,3), b(3,2), x(3), y(3)
+a = reshape([1.0d0,2.0d0,3.0d0,4.0d0,5.0d0,6.0d0], [2,3])
+b = reshape([1.0d0,2.0d0,3.0d0,4.0d0,5.0d0,6.0d0], [3,2])
+x = [10.0d0,20.0d0,30.0d0]
+y = [10.0d0,20.0d0,30.0d0]
+print *, matmul(a, x)
+print *, matmul(y, b)
+end program main
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    assert result.stdout == "220 280\n140 320\n"
+
+
+def test_ofort_statistics_mod_vector_functions(tmp_path):
+    source = tmp_path / "xofort_statistics_mod.f90"
+    source.write_text(
+        """
+program main
+use ofort_statistics_mod, only: mean, variance, sd, cov, cor, variance_given_mean, sd_given_mean
+implicit none
+real(8) :: x(4), y(4)
+real(8) :: xm
+x = [1.0d0, 2.0d0, 3.0d0, 4.0d0]
+y = [2.0d0, 4.0d0, 6.0d0, 8.0d0]
+xm = mean(x)
+print *, mean(x)
+print *, variance(x)
+print *, sd(x)
+print *, cov(x, y)
+print *, cor(x, y)
+print *, variance_given_mean(x, xm)
+print *, sd_given_mean(x, xm)
+end program main
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    lines = result.stdout.splitlines()
+    assert float(lines[0]) == pytest.approx(2.5)
+    assert float(lines[1]) == pytest.approx(1.6666666666666667)
+    assert float(lines[2]) == pytest.approx(1.2909944487358056)
+    assert float(lines[3]) == pytest.approx(3.3333333333333335)
+    assert float(lines[4]) == pytest.approx(1.0)
+    assert float(lines[5]) == pytest.approx(1.6666666666666667)
+    assert float(lines[6]) == pytest.approx(1.2909944487358056)
+
+
+def test_ofort_statistics_mod_calc_stats(tmp_path):
+    source = tmp_path / "xcalc_stats.f90"
+    source.write_text(
+        """
+program main
+use ofort_statistics_mod, only: calc_stats
+implicit none
+real(8) :: x(4)
+real(8) :: xm, xs, xv
+real(8) :: xm2, xv2
+x = [1.0d0, 2.0d0, 3.0d0, 4.0d0]
+call calc_stats(x, mean=xm, sd=xs, var=xv)
+call calc_stats(x, xm2, var=xv2)
+print *, xm
+print *, xs
+print *, xv
+print *, xm2
+print *, xv2
+end program main
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), "--fast", str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    lines = result.stdout.splitlines()
+    assert float(lines[0]) == pytest.approx(2.5)
+    assert float(lines[1]) == pytest.approx(1.2909944487358056)
+    assert float(lines[2]) == pytest.approx(1.6666666666666667)
+    assert float(lines[3]) == pytest.approx(2.5)
+    assert float(lines[4]) == pytest.approx(1.6666666666666667)
+
+
+def test_ofort_statistics_mod_calc_col_stats(tmp_path):
+    source = tmp_path / "xcalc_col_stats.f90"
+    source.write_text(
+        """
+program main
+use ofort_statistics_mod, only: calc_col_stats, cov, cor
+implicit none
+real(8) :: x(3,2)
+real(8) :: mu(2), xs(2), xv(2), c(2,2), r(2,2)
+real(8) :: rms(2), c_zm(2,2), r_zm(2,2)
+x(1,1) = 1.0d0
+x(2,1) = 2.0d0
+x(3,1) = 3.0d0
+x(1,2) = 2.0d0
+x(2,2) = 4.0d0
+x(3,2) = 6.0d0
+call calc_col_stats(x, mean=mu, sd=xs, var=xv, cov=c, corr=r, rms=rms, cov_zm=c_zm, corr_zm=r_zm)
+print *, mu
+print *, xs
+print *, xv
+print *, c
+print *, r
+print *, rms
+print *, c_zm
+print *, r_zm
+print *, cov(x)
+print *, cor(x)
+end program main
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), "--fast", str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    vals = [float(x) for x in result.stdout.split()]
+    assert vals[0:2] == pytest.approx([2.0, 4.0])
+    assert vals[2:4] == pytest.approx([1.0, 2.0])
+    assert vals[4:6] == pytest.approx([1.0, 4.0])
+    assert vals[6:10] == pytest.approx([1.0, 2.0, 2.0, 4.0])
+    assert vals[10:14] == pytest.approx([1.0, 1.0, 1.0, 1.0])
+    assert vals[14:16] == pytest.approx([(14.0 / 3.0) ** 0.5, (56.0 / 3.0) ** 0.5])
+    assert vals[16:20] == pytest.approx([14.0 / 3.0, 28.0 / 3.0, 28.0 / 3.0, 56.0 / 3.0])
+    assert vals[20:24] == pytest.approx([1.0, 1.0, 1.0, 1.0])
+    assert vals[24:28] == pytest.approx([1.0, 2.0, 2.0, 4.0])
+    assert vals[28:32] == pytest.approx([1.0, 1.0, 1.0, 1.0])
+
+
+def test_ofort_la_mod_initial_functions(tmp_path):
+    source = tmp_path / "xofort_la_mod.f90"
+    source.write_text(
+        """
+program main
+use ofort_la_mod, only: matmul2, transpose2, crossprod, tcrossprod, center_cols, col_sums, col_means
+implicit none
+real(8) :: a(2,2), b(2,2), mu(2), centered(2,2)
+a(1,1) = 1.0d0
+a(2,1) = 2.0d0
+a(1,2) = 3.0d0
+a(2,2) = 4.0d0
+b(1,1) = 5.0d0
+b(2,1) = 6.0d0
+b(1,2) = 7.0d0
+b(2,2) = 8.0d0
+mu = col_means(a)
+call center_cols(a, mu, centered)
+print *, col_sums(a)
+print *, mu
+print *, transpose2(a)
+print *, matmul2(a, b)
+print *, crossprod(a)
+print *, tcrossprod(a)
+print *, centered
+end program main
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), "--fast", str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    vals = [float(x) for x in result.stdout.split()]
+    assert vals[0:2] == pytest.approx([3.0, 7.0])
+    assert vals[2:4] == pytest.approx([1.5, 3.5])
+    assert vals[4:8] == pytest.approx([1.0, 3.0, 2.0, 4.0])
+    assert vals[8:12] == pytest.approx([23.0, 34.0, 31.0, 46.0])
+    assert vals[12:16] == pytest.approx([5.0, 11.0, 11.0, 25.0])
+    assert vals[16:20] == pytest.approx([10.0, 14.0, 14.0, 20.0])
+    assert vals[20:24] == pytest.approx([-0.5, 0.5, -0.5, 0.5])
+
+
+def test_ofort_io_mod_read_matrix_and_vector(tmp_path):
+    matrix_file = tmp_path / "matrix.txt"
+    matrix_file.write_text(
+        """
+# comment
+1 2 3
+4 5 6
+""".lstrip(),
+        encoding="utf-8",
+    )
+    prices_file = tmp_path / "prices.csv"
+    prices_file.write_text(
+        """
+date,SPY,TLT
+2024-01-02,472.65,97.12
+2024-01-03,468.79,98.04
+""".lstrip(),
+        encoding="utf-8",
+    )
+    vector_file = tmp_path / "vector.txt"
+    vector_file.write_text("10\n20 30\n", encoding="utf-8")
+    matrix_path = str(matrix_file).replace("\\", "/")
+    prices_path = str(prices_file).replace("\\", "/")
+    vector_path = str(vector_file).replace("\\", "/")
+
+    source = tmp_path / "xofort_io_mod.f90"
+    source.write_text(
+        f"""
+program main
+use ofort_io_mod, only: read_matrix, read_vector
+implicit none
+real(8), allocatable :: a(:,:), prices(:,:), v(:)
+character(len=20), allocatable :: dates(:)
+call read_matrix("{matrix_path}", a)
+call read_matrix("{prices_path}", prices, delimiter=",", header=.true., ncol=2, row_labels=dates)
+call read_vector("{vector_path}", v)
+print *, size(a, 1), size(a, 2)
+print *, a
+print *, size(prices, 1), size(prices, 2)
+print *, trim(dates(1)), trim(dates(2))
+print *, prices
+print *, size(v)
+print *, v
+end program main
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), "--fast", str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    assert "2024-01-02" in result.stdout
+    assert "2024-01-03" in result.stdout
+    numeric_stdout = result.stdout.replace("2024-01-02", "").replace("2024-01-03", "")
+    vals = [float(x) for x in numeric_stdout.split()]
+    assert vals[0:2] == pytest.approx([2.0, 3.0])
+    assert vals[2:8] == pytest.approx([1.0, 4.0, 2.0, 5.0, 3.0, 6.0])
+    assert vals[8:10] == pytest.approx([2.0, 2.0])
+    assert vals[10:14] == pytest.approx([472.65, 468.79, 97.12, 98.04])
+    assert vals[14:18] == pytest.approx([3.0, 10.0, 20.0, 30.0])
+
+
+def test_random_number_accepts_array_section_harvest(tmp_path):
+    source = tmp_path / "xrandom_number_section.f90"
+    source.write_text(
+        """
+program main
+implicit none
+integer :: m
+real(8) :: u(5)
+m = 3
+u = -1.0d0
+call random_number(u(1:m))
+print *, u(4), u(5)
+end program main
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), "--fast", str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    assert result.stdout == "-1 -1\n"
+
+
+def test_ofort_random_mod_rnorm_fill(tmp_path):
+    source = tmp_path / "xrnorm_fill.f90"
+    source.write_text(
+        """
+program main
+use ofort_random_mod, only: rnorm, rnorm_fill
+use ofort_statistics_mod, only: variance
+implicit none
+real(8) :: x(1000), y(1000), z(20, 10)
+x = 0.0d0
+call rnorm_fill(x, 1)
+call rnorm_fill(y, 2)
+call rnorm_fill(z)
+print *, variance(x) > 0.0d0
+print *, variance(y) > 0.0d0
+print *, variance(rnorm(1000, 2)) > 0.0d0
+print *, variance(reshape(z, [200])) > 0.0d0
+end program main
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), "--fast", str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    assert result.stdout == "T\nT\nT\nT\n"
 
 
 def test_write_and_read_external_file(tmp_path):
