@@ -8920,6 +8920,10 @@ static int pointer_target_descriptor(OfortInterpreter *I, OfortNode *node,
     return 0;
 }
 
+static int is_null_func_call_node(OfortNode *node) {
+    return node && node->type == FND_FUNC_CALL && str_eq_nocase(node->name, "null");
+}
+
 static int pointer_matches_target(OfortInterpreter *I, OfortVar *ptr, OfortNode *target) {
     char target_name[256];
     int has_slice, start, end;
@@ -15404,6 +15408,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         v->pointer_slice_start = 0;
         v->pointer_slice_end = 0;
         if (n->is_pointer && n->n_children > 0 && n->children[0]) {
+            if (is_null_func_call_node(n->children[0])) {
+                free_value(&v->val);
+                v->val = make_void_val();
+                v->pointer_associated = 0;
+                v->pointer_target[0] = '\0';
+                v->pointer_has_slice = 0;
+                break;
+            }
             char target_name[256];
             int has_slice = 0, slice_start = 0, slice_end = 0;
             v->pointer_associated = 1;
@@ -15450,6 +15462,17 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         ptr = find_var(I, lhs->name);
         if (!ptr || !ptr->is_pointer)
             ofort_error(I, "'%s' is not a pointer", lhs->name);
+        if (is_null_func_call_node(rhs_node)) {
+            free_value(&ptr->val);
+            ptr->val = make_void_val();
+            ptr->pointer_associated = 0;
+            ptr->pointer_target[0] = '\0';
+            ptr->pointer_has_slice = 0;
+            ptr->pointer_slice_start = 0;
+            ptr->pointer_slice_end = 0;
+            trace_assignment_value(I, lhs, ptr->val);
+            break;
+        }
         if (!pointer_target_descriptor(I, rhs_node, target_name, sizeof(target_name),
                                        &has_slice, &slice_start, &slice_end))
             ofort_error(I, "Invalid pointer target");
@@ -17508,7 +17531,7 @@ static const char *intrinsic_names[] = {
     /* Array */
     "SIZE", "SHAPE", "RANK", "PACK", "UNPACK", "MERGE", "SUM", "PRODUCT", "REDUCE", "MAXVAL", "MINVAL", "MAXLOC", "MINLOC", "FINDLOC",
     "DOT_PRODUCT", "MATMUL", "TRANSPOSE", "RESHAPE", "SPREAD", "EOSHIFT", "CSHIFT",
-    "COUNT", "ANY", "ALL", "ALLOCATED", "LBOUND", "UBOUND",
+    "COUNT", "ANY", "ALL", "ALLOCATED", "ASSOCIATED", "NULL", "LBOUND", "UBOUND",
     /* Type conversion */
     "FLOAT", "DFLOAT", "SNGL", "LOGICAL",
     /* Command line */
@@ -19166,6 +19189,11 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
                                 char arg_names[OFORT_MAX_PARAMS][256]) {
     char upper[256];
     str_upper(upper, name, 256);
+
+    if (strcmp(upper, "NULL") == 0) {
+        if (nargs > 1) ofort_error(I, "NULL accepts at most one MOLD argument");
+        return make_void_val();
+    }
 
     if (nargs > 0 && args[0].type == FVAL_ARRAY && is_elemental_unary_intrinsic(upper)) {
         OfortValue result = copy_value(args[0]);
