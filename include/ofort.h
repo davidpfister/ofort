@@ -202,6 +202,7 @@ typedef struct OfortNode {
     int is_parameter;
     int is_optional;
     int is_elemental;
+    int is_pure;
     int no_advance;         /* WRITE(..., ADVANCE='NO') */
     char result_name[256];  /* for FUNCTION ... RESULT(name) */
     char format_str[512];   /* for WRITE format */
