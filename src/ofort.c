@@ -851,6 +851,16 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                 ofort_error(I, "Cannot assign to PARAMETER '%s'", name);
             if (s->vars[i].is_protected)
                 ofort_error(I, "Cannot assign to PROTECTED variable '%s'", name);
+            if (s->vars[i].is_alias && s->vars[i].pointer_target[0]) {
+                OfortVar *target = find_var(I, s->vars[i].pointer_target);
+                OfortValue alias_val = copy_value(val);
+                if (target && target != &s->vars[i]) set_var(I, target->name, val);
+                else free_value(&val);
+                if (!s->vars[i].is_alias) free_value(&s->vars[i].val);
+                s->vars[i].val = alias_val;
+                s->vars[i].is_alias = 1;
+                return &s->vars[i];
+            }
             if (s->vars[i].is_allocatable && s->vars[i].val.type != FVAL_ARRAY &&
                     !s->vars[i].scalar_allocated && !deferred_char_alloc) {
                 free_value(&val);
@@ -904,6 +914,16 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                     ofort_error(I, "Cannot assign to PARAMETER '%s'", name);
                 if (ps->vars[i].is_protected)
                     ofort_error(I, "Cannot assign to PROTECTED variable '%s'", name);
+                if (ps->vars[i].is_alias && ps->vars[i].pointer_target[0]) {
+                    OfortVar *target = find_var(I, ps->vars[i].pointer_target);
+                    OfortValue alias_val = copy_value(val);
+                    if (target && target != &ps->vars[i]) set_var(I, target->name, val);
+                    else free_value(&val);
+                    if (!ps->vars[i].is_alias) free_value(&ps->vars[i].val);
+                    ps->vars[i].val = alias_val;
+                    ps->vars[i].is_alias = 1;
+                    return &ps->vars[i];
+                }
                 if (ps->vars[i].is_allocatable && ps->vars[i].val.type != FVAL_ARRAY &&
                     !ps->vars[i].scalar_allocated && !deferred_char_alloc) {
                     free_value(&val);
@@ -1654,6 +1674,36 @@ static int pp_macro_defined(OfortMacro *macros, int n_macros, const char *name, 
     return macro_index(macros, n_macros, name, name_len) >= 0;
 }
 
+static void append_macro_expanded_text(char **buf, size_t *len, size_t *cap,
+                                       OfortMacro *macros, int n_macros,
+                                       const char *text, size_t n, int depth) {
+    const char *q = text;
+    const char *end = text + n;
+    if (depth > 16) {
+        append_text(buf, len, cap, text, n);
+        return;
+    }
+    while (q < end) {
+        if (isalpha((unsigned char)*q) || *q == '_') {
+            const char *id_start = q;
+            int mi;
+            q++;
+            while (q < end && (isalnum((unsigned char)*q) || *q == '_')) q++;
+            mi = macro_index(macros, n_macros, id_start, (size_t)(q - id_start));
+            if (mi >= 0) {
+                append_macro_expanded_text(buf, len, cap, macros, n_macros,
+                                           macros[mi].replacement,
+                                           strlen(macros[mi].replacement),
+                                           depth + 1);
+            } else {
+                append_text(buf, len, cap, id_start, (size_t)(q - id_start));
+            }
+        } else {
+            append_char_text(buf, len, cap, *q++);
+        }
+    }
+}
+
 static int pp_eval_condition(OfortMacro *macros, int n_macros, const char *q, const char *line_end) {
     while (q < line_end && isspace((unsigned char)*q)) q++;
     if (q < line_end && *q == '!') {
@@ -1888,8 +1938,11 @@ static char *preprocess_source(OfortInterpreter *I, const char *source) {
                     while (q < line_end && (isalnum((unsigned char)*q) || *q == '_')) q++;
                     mi = macro_index(macros, n_macros, id_start, (size_t)(q - id_start));
                     if (mi >= 0) {
-                        append_text(&out, &out_len, &out_cap, macros[mi].replacement,
-                                    strlen(macros[mi].replacement));
+                        append_macro_expanded_text(&out, &out_len, &out_cap,
+                                                   macros, n_macros,
+                                                   macros[mi].replacement,
+                                                   strlen(macros[mi].replacement),
+                                                   0);
                     } else {
                         append_text(&out, &out_len, &out_cap, id_start, (size_t)(q - id_start));
                     }
@@ -7531,6 +7584,46 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         return n;
     }
 
+    if (token_ident_upper(t, "EQUIVALENCE")) {
+        OfortToken *eq = advance(I);
+        OfortNode *n = alloc_node(I, FND_EQUIVALENCE);
+        int cap = 0;
+        n->line = eq->line;
+        n->stmts = NULL;
+        n->n_stmts = 0;
+        while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
+            OfortNode *group = alloc_node(I, FND_ARRAY_CONSTRUCTOR);
+            int gcap = 0;
+            group->line = peek(I)->line;
+            group->stmts = NULL;
+            group->n_stmts = 0;
+            if (check(I, FTOK_COMMA)) {
+                advance(I);
+                continue;
+            }
+            expect(I, FTOK_LPAREN);
+            while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+                OfortNode *item = parse_expr(I);
+                if (group->n_stmts >= gcap) {
+                    gcap = gcap ? gcap * 2 : 4;
+                    group->stmts = (OfortNode **)realloc(group->stmts, sizeof(OfortNode *) * (size_t)gcap);
+                    if (!group->stmts) ofort_error(I, "Out of memory parsing EQUIVALENCE");
+                }
+                group->stmts[group->n_stmts++] = item;
+                if (check(I, FTOK_COMMA)) advance(I);
+            }
+            expect(I, FTOK_RPAREN);
+            if (n->n_stmts >= cap) {
+                cap = cap ? cap * 2 : 4;
+                n->stmts = (OfortNode **)realloc(n->stmts, sizeof(OfortNode *) * (size_t)cap);
+                if (!n->stmts) ofort_error(I, "Out of memory parsing EQUIVALENCE");
+            }
+            n->stmts[n->n_stmts++] = group;
+            if (check(I, FTOK_COMMA)) advance(I);
+        }
+        return n;
+    }
+
     /* CONTAINS */
     if (t->type == FTOK_CONTAINS) {
         advance(I);
@@ -8238,6 +8331,11 @@ static OfortValue default_derived_value(OfortInterpreter *I, const char *type_na
                 }
                 free_value(&init);
             } else {
+                if (td->field_is_pointer[i] && init.type == FVAL_VOID) {
+                    free_value(&v.v.dt.fields[i]);
+                    v.v.dt.fields[i] = init;
+                    continue;
+                }
                 init = coerce_assignment_value(I, td->field_names[i], v.v.dt.fields[i].type, init);
                 if (v.v.dt.fields[i].type == FVAL_CHARACTER)
                     init = resize_character_value(init, field_char_len);
@@ -9080,6 +9178,44 @@ static void assign_array_ref(OfortInterpreter *I, OfortVar *var, OfortNode *lhs,
     free_subscript_specs(specs, nargs);
 }
 
+static void assign_array_ref_value(OfortInterpreter *I, OfortValue *array, OfortNode *lhs, OfortValue *rhs) {
+    int nargs = lhs->n_stmts;
+    OfortSubscriptSpec specs[7];
+    int has_section = 0;
+
+    if (!array || array->type != FVAL_ARRAY)
+        ofort_error(I, "Array reference target is not an array");
+
+    for (int i = 0; i < nargs; i++) {
+        int extent = i < array->v.arr.n_dims ? array->v.arr.dims[i] : array->v.arr.len;
+        int lower = i < array->v.arr.n_dims ? array->v.arr.lower_bounds[i] : 1;
+        if (eval_subscript_spec(I, lhs->stmts[i], lower, extent, &specs[i])) has_section = 1;
+    }
+
+    if (!has_section) {
+        int subscripts[7];
+        int index;
+        for (int i = 0; i < nargs; i++) subscripts[i] = specs[i].range.start;
+        index = section_linear_index(array, subscripts, nargs);
+        if (index < 0 || index >= array->v.arr.len)
+            ofort_error(I, "Array index out of bounds");
+        if (assign_packed_array_element(array, index, *rhs)) return;
+        free_value(&array->v.arr.data[index]);
+        array->v.arr.data[index] = copy_value(*rhs);
+        return;
+    }
+
+    {
+        int selected = subscript_spec_element_count(specs, nargs);
+        int subscripts[7] = {0};
+        int rhs_index = 0;
+        if (rhs->type == FVAL_ARRAY && rhs->v.arr.len != selected)
+            ofort_error(I, "Array assignment shape mismatch");
+        assign_subscripted_recursive(I, array, rhs, specs, nargs, nargs - 1, subscripts, &rhs_index);
+    }
+    free_subscript_specs(specs, nargs);
+}
+
 typedef struct {
     OfortNode *target;
     int count;
@@ -9109,7 +9245,9 @@ static void ensure_data_target_declared(OfortInterpreter *I, OfortNode *target) 
         } else {
             declare_var(I, target->name, default_value(type, char_len > 0 ? char_len : 1));
         }
-    } else if ((target->type == FND_FUNC_CALL || target->type == FND_ARRAY_REF) && !find_var(I, target->name)) {
+    } else if (target->type == FND_ARRAY_REF && target->children[0]) {
+        ensure_data_target_declared(I, target->children[0]);
+    } else if (target->type == FND_FUNC_CALL && !find_var(I, target->name)) {
         OfortNode ident;
         memset(&ident, 0, sizeof(ident));
         ident.type = FND_IDENT;
@@ -15741,8 +15879,15 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         } else if (lhs->type == FND_ARRAY_REF) {
             OfortValue *target = member_lvalue(I, lhs);
             if (!target) {
+                OfortValue *array_target = lhs->children[0] ? member_lvalue(I, lhs->children[0]) : NULL;
+                if (!array_target) {
+                    free_value(&rhs);
+                    ofort_error(I, "Invalid array reference assignment target");
+                }
+                assign_array_ref_value(I, array_target, lhs, &rhs);
+                trace_assignment_value(I, lhs, rhs);
                 free_value(&rhs);
-                ofort_error(I, "Invalid array reference assignment target");
+                break;
             }
             free_value(target);
             *target = rhs;
@@ -15827,6 +15972,35 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         } else {
             free_value(&rhs);
             ofort_error(I, "Invalid assignment target");
+        }
+        break;
+    }
+
+    case FND_EQUIVALENCE: {
+        for (int gi = 0; gi < n->n_stmts; gi++) {
+            OfortNode *group = n->stmts[gi];
+            OfortVar *base;
+            if (!group || group->n_stmts < 2 || !group->stmts[0] ||
+                group->stmts[0]->type != FND_IDENT) continue;
+            ensure_data_target_declared(I, group->stmts[0]);
+            base = find_var(I, group->stmts[0]->name);
+            if (!base) continue;
+            for (int i = 1; i < group->n_stmts; i++) {
+                OfortVar *alias;
+                if (!group->stmts[i] || group->stmts[i]->type != FND_IDENT) continue;
+                ensure_data_target_declared(I, group->stmts[i]);
+                alias = find_var_in_current_scope(I, group->stmts[i]->name);
+                if (!alias) alias = declare_alias_var(I, group->stmts[i]->name, base);
+                if (alias && alias != base) {
+                    if (!alias->is_alias) free_value(&alias->val);
+                    alias->val = base->val;
+                    alias->is_alias = 1;
+                    copy_cstr(alias->pointer_target, sizeof(alias->pointer_target), base->name);
+                    alias->declared_type = base->declared_type;
+                    alias->declared_kind = base->declared_kind;
+                    alias->char_len = base->char_len;
+                }
+            }
         }
         break;
     }
