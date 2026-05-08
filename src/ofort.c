@@ -13710,6 +13710,7 @@ static void check_semantics_block(OfortInterpreter *I, OfortNode *block) {
 static int ofort_extension_module_exists(const char *module_name) {
     return str_eq_nocase(module_name, "ofort_random_mod") ||
            str_eq_nocase(module_name, "ofort_la_mod") ||
+           str_eq_nocase(module_name, "ofort_io_mod") ||
            str_eq_nocase(module_name, "ofort_statistics_mod") ||
            str_eq_nocase(module_name, "ofort_stats_mod");
 }
@@ -13727,6 +13728,10 @@ static int ofort_extension_module_exports(const char *module_name, const char *n
                str_eq_nocase(name, "center_cols") ||
                str_eq_nocase(name, "col_sums") ||
                str_eq_nocase(name, "col_means");
+    }
+    if (str_eq_nocase(module_name, "ofort_io_mod")) {
+        return str_eq_nocase(name, "read_matrix") ||
+               str_eq_nocase(name, "read_vector");
     }
     if (str_eq_nocase(module_name, "ofort_statistics_mod") ||
         str_eq_nocase(module_name, "ofort_stats_mod")) {
@@ -14393,6 +14398,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         import_ofort_extension_intrinsic(I, "center_cols", "center_cols");
                         import_ofort_extension_intrinsic(I, "col_sums", "col_sums");
                         import_ofort_extension_intrinsic(I, "col_means", "col_means");
+                    } else if (str_eq_nocase(n->name, "ofort_io_mod")) {
+                        import_ofort_extension_intrinsic(I, "read_matrix", "read_matrix");
+                        import_ofort_extension_intrinsic(I, "read_vector", "read_vector");
                     } else {
                         import_ofort_extension_intrinsic(I, "mean", "mean");
                         import_ofort_extension_intrinsic(I, "variance", "variance");
@@ -18093,6 +18101,365 @@ static OfortValue call_ofort_la_intrinsic(OfortInterpreter *I, const char *name,
     return make_void_val();
 }
 
+typedef struct {
+    char *filename;
+    char delimiter;
+    char comment;
+    int header;
+    int skiprows;
+    int ncol;
+    int has_row_labels;
+    int file_idx;
+    int out_idx;
+    int row_labels_idx;
+} OfortReadOptions;
+
+static char *ofort_strdup_trimmed(const char *s) {
+    const char *start = s ? s : "";
+    const char *end;
+    char *out;
+    size_t len;
+    while (*start && isspace((unsigned char)*start)) start++;
+    end = start + strlen(start);
+    while (end > start && isspace((unsigned char)end[-1])) end--;
+    len = (size_t)(end - start);
+    out = (char *)malloc(len + 1);
+    if (!out) return NULL;
+    memcpy(out, start, len);
+    out[len] = '\0';
+    return out;
+}
+
+static char *ofort_eval_string_arg(OfortInterpreter *I, OfortNode *node, const char *arg_name) {
+    OfortValue value;
+    char *out;
+    if (!node) ofort_error(I, "%s is required", arg_name);
+    value = eval_node(I, node);
+    if (value.type != FVAL_CHARACTER || !value.v.s) {
+        free_value(&value);
+        ofort_error(I, "%s must be CHARACTER", arg_name);
+    }
+    out = ofort_strdup_trimmed(value.v.s);
+    free_value(&value);
+    if (!out) ofort_error(I, "Out of memory");
+    return out;
+}
+
+static int ofort_eval_int_arg(OfortInterpreter *I, OfortNode *node, const char *arg_name) {
+    OfortValue value = eval_node(I, node);
+    int out = (int)val_to_int(value);
+    free_value(&value);
+    if (out < 0) ofort_error(I, "%s must be nonnegative", arg_name);
+    return out;
+}
+
+static int ofort_eval_logical_arg(OfortInterpreter *I, OfortNode *node) {
+    OfortValue value = eval_node(I, node);
+    int out = val_to_logical(value);
+    free_value(&value);
+    return out;
+}
+
+static char ofort_eval_char_option(OfortInterpreter *I, OfortNode *node, char default_value,
+                                   const char *arg_name) {
+    char *text;
+    char out;
+    if (!node) return default_value;
+    text = ofort_eval_string_arg(I, node, arg_name);
+    out = text[0] ? text[0] : default_value;
+    free(text);
+    return out;
+}
+
+static OfortValue *ofort_output_array_lvalue_any(OfortInterpreter *I, OfortNode *node,
+                                                 const char *arg_name) {
+    OfortValue *target = ofort_calc_stats_input_lvalue(I, node);
+    if (!target) ofort_error(I, "%s output argument must be an array variable", arg_name);
+    return target;
+}
+
+static void ofort_assign_new_array_value(OfortValue *target, OfortValue value) {
+    free_value(target);
+    *target = value;
+}
+
+static void ofort_assign_character_array_element(OfortValue *target, int index, const char *value) {
+    OfortValue elem;
+    if (!target || target->type != FVAL_ARRAY || target->v.arr.elem_type != FVAL_CHARACTER ||
+        index < 0 || index >= target->v.arr.len || !target->v.arr.data)
+        return;
+    elem = make_character(value ? value : "");
+    elem = resize_character_value(elem, target->v.arr.data[index].type == FVAL_CHARACTER &&
+                                  target->v.arr.data[index].v.s
+                                      ? (int)strlen(target->v.arr.data[index].v.s)
+                                      : OFORT_MAX_STRLEN - 1);
+    free_value(&target->v.arr.data[index]);
+    target->v.arr.data[index] = elem;
+}
+
+static int ofort_split_fields(char *line, char delimiter, char **fields, int max_fields) {
+    int n = 0;
+    char *p = line;
+    if (delimiter == '\0') {
+        while (*p) {
+            while (*p && isspace((unsigned char)*p)) p++;
+            if (!*p) break;
+            if (n >= max_fields) return n;
+            fields[n++] = p;
+            while (*p && !isspace((unsigned char)*p)) p++;
+            if (*p) *p++ = '\0';
+        }
+        return n;
+    }
+    while (n < max_fields) {
+        char *start = p;
+        char *end;
+        if (!p) break;
+        end = strchr(p, delimiter);
+        if (end) {
+            *end = '\0';
+            p = end + 1;
+        } else {
+            p = NULL;
+        }
+        fields[n++] = start;
+        if (!p) break;
+    }
+    return n;
+}
+
+static double ofort_parse_double_field(OfortInterpreter *I, const char *field, const char *filename,
+                                       int line_no) {
+    char *trimmed = ofort_strdup_trimmed(field);
+    char *endp;
+    double value;
+    if (!trimmed) ofort_error(I, "Out of memory");
+    value = strtod(trimmed, &endp);
+    while (endp && *endp && isspace((unsigned char)*endp)) endp++;
+    if (trimmed[0] == '\0' || (endp && *endp != '\0')) {
+        free(trimmed);
+        ofort_error(I, "READ_MATRIX cannot parse numeric value in %s at line %d", filename, line_no);
+    }
+    free(trimmed);
+    return value;
+}
+
+static void ofort_read_options_init(OfortReadOptions *opts) {
+    memset(opts, 0, sizeof(*opts));
+    opts->delimiter = '\0';
+    opts->comment = '#';
+    opts->ncol = 0;
+    opts->file_idx = -1;
+    opts->out_idx = -1;
+    opts->row_labels_idx = -1;
+}
+
+static void ofort_read_parse_common_options(OfortInterpreter *I, OfortNode *n,
+                                            OfortReadOptions *opts, int vector_mode) {
+    ofort_read_options_init(opts);
+    for (int i = 0; i < n->n_stmts; i++) {
+        const char *pname = n->param_names[i];
+        if (pname[0]) {
+            if (str_eq_nocase(pname, "file") || str_eq_nocase(pname, "filename") ||
+                str_eq_nocase(pname, "path")) opts->file_idx = i;
+            else if (str_eq_nocase(pname, "x") || str_eq_nocase(pname, "out") ||
+                     str_eq_nocase(pname, vector_mode ? "vector" : "matrix")) opts->out_idx = i;
+            else if (str_eq_nocase(pname, "delimiter") || str_eq_nocase(pname, "delim"))
+                opts->delimiter = ofort_eval_char_option(I, n->stmts[i], '\0', "delimiter");
+            else if (str_eq_nocase(pname, "comment"))
+                opts->comment = ofort_eval_char_option(I, n->stmts[i], '#', "comment");
+            else if (str_eq_nocase(pname, "header"))
+                opts->header = ofort_eval_logical_arg(I, n->stmts[i]);
+            else if (str_eq_nocase(pname, "skiprows") || str_eq_nocase(pname, "skip_rows"))
+                opts->skiprows = ofort_eval_int_arg(I, n->stmts[i], "skiprows");
+            else if (!vector_mode && str_eq_nocase(pname, "ncol"))
+                opts->ncol = ofort_eval_int_arg(I, n->stmts[i], "ncol");
+            else if (!vector_mode && (str_eq_nocase(pname, "row_labels") ||
+                                      str_eq_nocase(pname, "row_names") ||
+                                      str_eq_nocase(pname, "labels"))) {
+                opts->row_labels_idx = i;
+                opts->has_row_labels = 1;
+            } else {
+                ofort_error(I, "Unknown %s keyword '%s'", vector_mode ? "READ_VECTOR" : "READ_MATRIX", pname);
+            }
+        }
+    }
+    if (opts->file_idx < 0 && n->n_stmts >= 1 && n->param_names[0][0] == '\0') opts->file_idx = 0;
+    if (opts->out_idx < 0 && n->n_stmts >= 2 && n->param_names[1][0] == '\0') opts->out_idx = 1;
+    if (opts->file_idx < 0 || opts->out_idx < 0)
+        ofort_error(I, "%s requires file and output arguments", vector_mode ? "READ_VECTOR" : "READ_MATRIX");
+    opts->filename = ofort_eval_string_arg(I, n->stmts[opts->file_idx], "file");
+}
+
+static void ofort_io_read_matrix(OfortInterpreter *I, OfortNode *n) {
+    enum { MAX_FIELDS = 4096, LINE_SIZE = 65536 };
+    OfortReadOptions opts;
+    FILE *fp;
+    char line[LINE_SIZE];
+    char *fields[MAX_FIELDS];
+    double *values = NULL;
+    char **labels = NULL;
+    int capacity = 0;
+    int nrow = 0;
+    int ncol = 0;
+    int line_no = 0;
+    int header_left;
+    OfortValue *matrix_target;
+    OfortValue *labels_target = NULL;
+
+    ofort_read_parse_common_options(I, n, &opts, 0);
+    fp = fopen(opts.filename, "r");
+    if (!fp) ofort_error(I, "READ_MATRIX cannot open '%s'", opts.filename);
+    matrix_target = ofort_output_array_lvalue_any(I, n->stmts[opts.out_idx], "matrix");
+    if (opts.has_row_labels)
+        labels_target = ofort_output_array_lvalue_any(I, n->stmts[opts.row_labels_idx], "row_labels");
+
+    header_left = opts.header ? 1 : 0;
+    while (fgets(line, sizeof(line), fp)) {
+        char *comment_pos;
+        char *trimmed_line;
+        int nf;
+        int first_numeric = opts.has_row_labels ? 1 : 0;
+        line_no++;
+        if (line_no <= opts.skiprows) continue;
+        comment_pos = opts.comment ? strchr(line, opts.comment) : NULL;
+        if (comment_pos) *comment_pos = '\0';
+        trimmed_line = ofort_strdup_trimmed(line);
+        if (!trimmed_line) ofort_error(I, "Out of memory");
+        if (trimmed_line[0] == '\0') {
+            free(trimmed_line);
+            continue;
+        }
+        if (header_left > 0) {
+            header_left--;
+            free(trimmed_line);
+            continue;
+        }
+        nf = ofort_split_fields(trimmed_line, opts.delimiter, fields, MAX_FIELDS);
+        if (nf <= first_numeric) {
+            free(trimmed_line);
+            continue;
+        }
+        if (ncol == 0) {
+            ncol = opts.ncol > 0 ? opts.ncol : nf - first_numeric;
+            if (ncol <= 0) ofort_error(I, "READ_MATRIX could not infer number of columns");
+        }
+        if (nf - first_numeric != ncol)
+            ofort_error(I, "READ_MATRIX found %d numeric fields at line %d but expected %d",
+                        nf - first_numeric, line_no, ncol);
+        if (nrow >= capacity) {
+            int new_capacity = capacity > 0 ? capacity * 2 : 1024;
+            double *new_values = (double *)realloc(values, (size_t)new_capacity * (size_t)ncol * sizeof(*values));
+            char **new_labels = labels;
+            if (!new_values) ofort_error(I, "Out of memory");
+            values = new_values;
+            if (opts.has_row_labels) {
+                new_labels = (char **)realloc(labels, (size_t)new_capacity * sizeof(*labels));
+                if (!new_labels) ofort_error(I, "Out of memory");
+                labels = new_labels;
+            }
+            capacity = new_capacity;
+        }
+        if (opts.has_row_labels) {
+            labels[nrow] = ofort_strdup_trimmed(fields[0]);
+            if (!labels[nrow]) ofort_error(I, "Out of memory");
+        }
+        for (int j = 0; j < ncol; j++) {
+            values[(size_t)nrow * (size_t)ncol + (size_t)j] =
+                ofort_parse_double_field(I, fields[first_numeric + j], opts.filename, line_no);
+        }
+        nrow++;
+        free(trimmed_line);
+    }
+    fclose(fp);
+
+    {
+        int dims[2] = {nrow, ncol};
+        OfortValue matrix = make_array_with_char_len_options(FVAL_DOUBLE, dims, 2, 0, 1);
+        for (int j = 0; j < ncol; j++) {
+            for (int i = 0; i < nrow; i++) {
+                ofort_assign_real_array_element(&matrix, i + j * nrow,
+                                                values[(size_t)i * (size_t)ncol + (size_t)j]);
+            }
+        }
+        ofort_assign_new_array_value(matrix_target, matrix);
+    }
+    if (opts.has_row_labels) {
+        int dims[1] = {nrow};
+        OfortValue label_array = make_array_with_char_len(FVAL_CHARACTER, dims, 1, OFORT_MAX_STRLEN - 1);
+        for (int i = 0; i < nrow; i++) {
+            ofort_assign_character_array_element(&label_array, i, labels[i]);
+            free(labels[i]);
+        }
+        ofort_assign_new_array_value(labels_target, label_array);
+    }
+    free(labels);
+    free(values);
+    free(opts.filename);
+}
+
+static void ofort_io_read_vector(OfortInterpreter *I, OfortNode *n) {
+    enum { MAX_FIELDS = 4096, LINE_SIZE = 65536 };
+    OfortReadOptions opts;
+    FILE *fp;
+    char line[LINE_SIZE];
+    char *fields[MAX_FIELDS];
+    double *values = NULL;
+    int capacity = 0;
+    int nval = 0;
+    int line_no = 0;
+    int header_left;
+    OfortValue *target;
+
+    ofort_read_parse_common_options(I, n, &opts, 1);
+    fp = fopen(opts.filename, "r");
+    if (!fp) ofort_error(I, "READ_VECTOR cannot open '%s'", opts.filename);
+    target = ofort_output_array_lvalue_any(I, n->stmts[opts.out_idx], "vector");
+    header_left = opts.header ? 1 : 0;
+    while (fgets(line, sizeof(line), fp)) {
+        char *comment_pos;
+        char *trimmed_line;
+        int nf;
+        line_no++;
+        if (line_no <= opts.skiprows) continue;
+        comment_pos = opts.comment ? strchr(line, opts.comment) : NULL;
+        if (comment_pos) *comment_pos = '\0';
+        trimmed_line = ofort_strdup_trimmed(line);
+        if (!trimmed_line) ofort_error(I, "Out of memory");
+        if (trimmed_line[0] == '\0') {
+            free(trimmed_line);
+            continue;
+        }
+        if (header_left > 0) {
+            header_left--;
+            free(trimmed_line);
+            continue;
+        }
+        nf = ofort_split_fields(trimmed_line, opts.delimiter, fields, MAX_FIELDS);
+        for (int j = 0; j < nf; j++) {
+            if (nval >= capacity) {
+                int new_capacity = capacity > 0 ? capacity * 2 : 1024;
+                double *new_values = (double *)realloc(values, (size_t)new_capacity * sizeof(*values));
+                if (!new_values) ofort_error(I, "Out of memory");
+                values = new_values;
+                capacity = new_capacity;
+            }
+            values[nval++] = ofort_parse_double_field(I, fields[j], opts.filename, line_no);
+        }
+        free(trimmed_line);
+    }
+    fclose(fp);
+
+    {
+        int dims[1] = {nval};
+        OfortValue vector = make_array_with_char_len_options(FVAL_DOUBLE, dims, 1, 0, 1);
+        for (int i = 0; i < nval; i++) ofort_assign_real_array_element(&vector, i, values[i]);
+        ofort_assign_new_array_value(target, vector);
+    }
+    free(values);
+    free(opts.filename);
+}
+
 static int call_ofort_extension_subroutine(OfortInterpreter *I, OfortNode *n) {
     const char *extension_name;
     if (!n || !find_imported_extension_intrinsic(I, n->name)) return 0;
@@ -18170,6 +18537,16 @@ static int call_ofort_extension_subroutine(OfortInterpreter *I, OfortNode *n) {
             if (isnan(var)) ofort_error(I, "CALC_STATS var is undefined for this input");
             ofort_assign_real_output(var_target, var);
         }
+        return 1;
+    }
+
+    if (str_eq_nocase(extension_name, "read_matrix")) {
+        ofort_io_read_matrix(I, n);
+        return 1;
+    }
+
+    if (str_eq_nocase(extension_name, "read_vector")) {
+        ofort_io_read_vector(I, n);
         return 1;
     }
 
