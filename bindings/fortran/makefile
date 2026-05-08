@@ -9,10 +9,11 @@ FFLAGS ?= -O2
 LDLIBS ?= -lm
 
 TARGET = $(BINDIR)demo_eval.exe
-C_OBJECTS = $(BINDIR)ofort.o $(BINDIR)ofort_values.o $(BINDIR)ofort_c_api.o
+C_OBJECTS = $(BINDIR)ofort.o $(BINDIR)ofort_values.o $(BINDIR)ofort_c_api.o $(BINDIR)ofort_stats.o
 F_OBJECTS = $(BINDIR)ofort_binding.o $(BINDIR)demo_eval.o
+STATS_OBJECTS = $(BINDIR)ofort_stats.o $(BINDIR)ofort_statistics_mod.o
 
-.PHONY: all clean run
+.PHONY: all clean run stats_mod
 
 all: $(TARGET)
 
@@ -24,6 +25,12 @@ $(BINDIR)ofort_values.o: $(ROOT)/src/ofort_values.c $(ROOT)/include/ofort.h $(RO
 
 $(BINDIR)ofort_c_api.o: $(ROOT)/src/ofort_c_api.c $(ROOT)/include/ofort.h $(ROOT)/include/ofort_c_api.h
 	$(CC) $(CFLAGS) -c $(ROOT)/src/ofort_c_api.c -o $@
+
+$(BINDIR)ofort_stats.o: $(ROOT)/src/ofort_stats.c $(ROOT)/include/ofort_stats.h
+	$(CC) $(CFLAGS) -c $(ROOT)/src/ofort_stats.c -o $@
+
+$(BINDIR)ofort_statistics_mod.o: $(BINDIR)ofort_statistics_mod.f90
+	$(FC) $(FFLAGS) -J$(BINDIR) -c $(BINDIR)ofort_statistics_mod.f90 -o $@
 
 $(BINDIR)ofort_binding.o: $(BINDIR)ofort_binding.f90
 	$(FC) $(FFLAGS) -J$(BINDIR) -c $(BINDIR)ofort_binding.f90 -o $@
@@ -37,5 +44,7 @@ $(TARGET): $(C_OBJECTS) $(F_OBJECTS)
 run: $(TARGET)
 	$(TARGET)
 
+stats_mod: $(STATS_OBJECTS)
+
 clean:
-	rm -f $(TARGET) $(C_OBJECTS) $(F_OBJECTS) *.mod
+	rm -f $(TARGET) $(C_OBJECTS) $(F_OBJECTS) $(BINDIR)ofort_statistics_mod.o *.mod
