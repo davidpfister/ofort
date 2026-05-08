@@ -4080,13 +4080,16 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
                 } else if (check(I, FTOK_COLON)) {
                     /* allocatable dimension (:) */
                     advance(I);
+                    if (n_decl_dims >= 7) ofort_error(I, "Too many DIMENSION dimensions");
                     decl_dims[n_decl_dims++] = 0; /* unknown size */
                 } else if (check(I, FTOK_STAR)) {
                     advance(I);
+                    if (n_decl_dims >= 7) ofort_error(I, "Too many DIMENSION dimensions");
                     decl_dims[n_decl_dims++] = 0; /* inferred/assumed size */
                 } else {
                     OfortNode *dim_expr = parse_dimension_bound_expr(I);
                     int dim_index = n_decl_dims;
+                    if (n_decl_dims >= 7) ofort_error(I, "Too many DIMENSION dimensions");
                     /* For now assume it's a simple integer */
                     if (dim_expr->type == FND_INT_LIT)
                         decl_dims[n_decl_dims++] = (int)dim_expr->int_val;
@@ -4280,14 +4283,17 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
                     break;
                 } else if (check(I, FTOK_COLON)) {
                     advance(I);
+                    if (decl->n_dims >= 7) ofort_error(I, "Too many DIMENSION dimensions");
                     decl->dims[decl->n_dims++] = 0;
                 } else if (check(I, FTOK_STAR)) {
                     advance(I);
+                    if (decl->n_dims >= 7) ofort_error(I, "Too many DIMENSION dimensions");
                     decl->dims[decl->n_dims++] = 0;
                 } else {
                     OfortNode *de = parse_dimension_bound_expr(I);
                     int dim_index = decl->n_dims;
                     int de_value = 0;
+                    if (decl->n_dims >= 7) ofort_error(I, "Too many DIMENSION dimensions");
                     if (int_constant_node(de, &de_value))
                         decl->dims[decl->n_dims++] = de_value;
                     else
