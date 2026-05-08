@@ -89,6 +89,7 @@ typedef struct {
 
 typedef struct {
     char name[128];
+    char parent_type_name[64];
     char field_names[OFORT_MAX_FIELDS][64];
     char field_type_names[OFORT_MAX_FIELDS][64];
     OfortValType field_types[OFORT_MAX_FIELDS];
@@ -100,6 +101,7 @@ typedef struct {
     OfortNode *field_dim_exprs[OFORT_MAX_FIELDS][7];
     int field_n_dims[OFORT_MAX_FIELDS];
     int field_is_pointer[OFORT_MAX_FIELDS];
+    int field_is_allocatable[OFORT_MAX_FIELDS];
     int n_fields;
     char type_param_names[OFORT_MAX_PARAMS][64];
     int n_type_params;
@@ -130,6 +132,12 @@ typedef struct {
     char action[16];
     char position[16];
 } OfortUnitFile;
+
+typedef struct {
+    char name[256];
+    char var_names[OFORT_MAX_PARAMS][256];
+    int n_vars;
+} OfortNamelist;
 
 struct OfortInterpreter {
     /* output */
@@ -177,6 +185,8 @@ struct OfortInterpreter {
     /* simple external-unit file table */
     OfortUnitFile unit_files[32];
     int n_unit_files;
+    OfortNamelist namelists[32];
+    int n_namelists;
     int format_labels[256];
     char format_strings[256][512];
     int n_formats;
@@ -228,6 +238,7 @@ typedef struct {
 } FastNumericLoopPlan;
 
 static void ofort_error(OfortInterpreter *I, const char *fmt, ...);
+static OfortNamelist *find_namelist(OfortInterpreter *I, const char *name);
 static OfortValue eval_node(OfortInterpreter *I, OfortNode *n);
 static const char *type_token_intrinsic_name(OfortTokenType t);
 static void exec_node(OfortInterpreter *I, OfortNode *n);
@@ -1083,6 +1094,8 @@ static OfortFunc *find_func(OfortInterpreter *I, const char *name) {
 }
 
 static OfortGeneric *find_generic(OfortInterpreter *I, const char *name);
+static int type_extends_or_same(OfortInterpreter *I, const char *actual_name,
+                                const char *expected_name);
 
 static OfortFunc *find_matching_generic_proc(OfortInterpreter *I, const char *name,
                                              OfortValue *args, int nargs,
@@ -1117,7 +1130,7 @@ static OfortFunc *find_matching_generic_proc(OfortInterpreter *I, const char *na
                 const char *actual_name = args[j].type == FVAL_ARRAY ?
                     args[j].v.arr.elem_type_name : args[j].v.dt.type_name;
                 if (!actual_name || !actual_name[0] ||
-                    !str_eq_nocase(fn->param_type_names[j], actual_name)) {
+                    !type_extends_or_same(I, actual_name, fn->param_type_names[j])) {
                     match = 0;
                     break;
                 }
@@ -1166,7 +1179,7 @@ static OfortFunc *find_matching_generic_proc(OfortInterpreter *I, const char *na
                 const char *actual_name = args[j].type == FVAL_ARRAY ?
                     args[j].v.arr.elem_type_name : args[j].v.dt.type_name;
                 if (!actual_name || !actual_name[0] ||
-                    !str_eq_nocase(fn->param_type_names[j], actual_name)) {
+                    !type_extends_or_same(I, actual_name, fn->param_type_names[j])) {
                     ok = 0;
                     break;
                 }
@@ -2572,6 +2585,11 @@ static int token_can_be_name(OfortToken *t) {
                  t->type == FTOK_OUT || t->type == FTOK_INOUT ||
                  t->type == FTOK_CALL || t->type == FTOK_DEFAULT ||
                  t->type == FTOK_SELECT || t->type == FTOK_DATA ||
+                 t->type == FTOK_CASE || t->type == FTOK_CONTAINS ||
+                 t->type == FTOK_DO || t->type == FTOK_ELSE ||
+                 t->type == FTOK_ELSEIF || t->type == FTOK_IMPLICIT ||
+                 t->type == FTOK_NONE || t->type == FTOK_THEN ||
+                 t->type == FTOK_WHILE ||
                  t->type == FTOK_RESULT || t->type == FTOK_PRINT ||
                  t->type == FTOK_INTEGER || t->type == FTOK_REAL ||
                  t->type == FTOK_DOUBLE_PRECISION || t->type == FTOK_CHARACTER ||
@@ -2600,6 +2618,15 @@ static const char *token_name_text(OfortToken *t) {
     if (t->type == FTOK_DEFAULT) return "default";
     if (t->type == FTOK_SELECT) return "select";
     if (t->type == FTOK_DATA) return "data";
+    if (t->type == FTOK_CASE) return "case";
+    if (t->type == FTOK_CONTAINS) return "contains";
+    if (t->type == FTOK_DO) return "do";
+    if (t->type == FTOK_ELSE) return "else";
+    if (t->type == FTOK_ELSEIF) return "elseif";
+    if (t->type == FTOK_IMPLICIT) return "implicit";
+    if (t->type == FTOK_NONE) return "none";
+    if (t->type == FTOK_THEN) return "then";
+    if (t->type == FTOK_WHILE) return "while";
     if (t->type == FTOK_RESULT) return "result";
     if (t->type == FTOK_PRINT) return "print";
     if (t->type == FTOK_INTEGER) return "integer";
@@ -2672,9 +2699,13 @@ static const char *find_type_binding_proc(OfortInterpreter *I, const char *type_
                                           const char *binding_name) {
     OfortTypeDef *td = find_type_def(I, type_name);
     if (!td || !binding_name) return NULL;
-    for (int i = 0; i < td->n_bindings; i++) {
-        if (str_eq_nocase(td->binding_names[i], binding_name))
-            return td->binding_proc_names[i];
+    int depth = 0;
+    while (td && depth++ < 64) {
+        for (int i = 0; i < td->n_bindings; i++) {
+            if (str_eq_nocase(td->binding_names[i], binding_name))
+                return td->binding_proc_names[i];
+        }
+        td = td->parent_type_name[0] ? find_type_def(I, td->parent_type_name) : NULL;
     }
     return NULL;
 }
@@ -5078,6 +5109,10 @@ static OfortNode *parse_write(OfortInterpreter *I) {
                     n->children[1] = parse_expr(I);
                     if (n->n_children < 2) n->n_children = 2;
                 }
+            } else if (str_eq_nocase(name, "nml")) {
+                if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+                copy_cstr(n->name, sizeof(n->name), token_name_text(advance(I)));
+                saw_fmt = 1;
             } else if (str_eq_nocase(name, "advance")) {
                 if (check(I, FTOK_STRING_LIT)) {
                     if (str_eq_nocase(peek(I)->str_val, "no")) n->no_advance = 1;
@@ -5198,6 +5233,10 @@ static OfortNode *parse_read_stmt(OfortInterpreter *I) {
                     } else {
                         parse_expr(I);
                     }
+                } else if (str_eq_nocase(name, "nml")) {
+                    if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+                    copy_cstr(n->name, sizeof(n->name), token_name_text(advance(I)));
+                    saw_fmt = 1;
                 } else if (str_eq_nocase(name, "iostat")) {
                     n->children[4] = parse_expr(I);
                     if (n->n_children < 5) n->n_children = 5;
@@ -5704,6 +5743,28 @@ static OfortNode *parse_attribute_name_list_statement(OfortInterpreter *I) {
     return n;
 }
 
+static OfortNode *parse_namelist_statement(OfortInterpreter *I) {
+    OfortToken *nt = advance(I); /* NAMELIST */
+    OfortNode *n = alloc_node(I, FND_NAMELIST);
+    n->line = nt->line;
+    expect(I, FTOK_SLASH);
+    if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+    copy_cstr(n->name, sizeof(n->name), token_name_text(advance(I)));
+    expect(I, FTOK_SLASH);
+    while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
+        if (check(I, FTOK_COMMA)) {
+            advance(I);
+            continue;
+        }
+        if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+        if (n->n_params >= OFORT_MAX_PARAMS) too_many_params_error(I, "NAMELIST variables");
+        copy_cstr(n->param_names[n->n_params++], sizeof(n->param_names[0]),
+                  token_name_text(advance(I)));
+        if (check(I, FTOK_COMMA)) advance(I);
+    }
+    return n;
+}
+
 static OfortNode *parse_bind_statement(OfortInterpreter *I) {
     OfortToken *bt = advance(I); /* BIND */
     OfortNode *n = alloc_node(I, FND_CONTINUE);
@@ -6151,13 +6212,35 @@ static OfortNode *parse_module_procedure_body(OfortInterpreter *I) {
 
 static OfortNode *parse_type_def(OfortInterpreter *I) {
     OfortToken *tt = advance(I); /* TYPE */
-    /* TYPE :: name */
+    /* TYPE [ , EXTENDS(parent) ] :: name */
+    char parent_type_name[64] = "";
+    while (check(I, FTOK_COMMA)) {
+        advance(I);
+        if (token_ident_upper(peek(I), "EXTENDS")) {
+            advance(I);
+            expect(I, FTOK_LPAREN);
+            if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+            copy_cstr(parent_type_name, sizeof(parent_type_name), token_name_text(advance(I)));
+            expect(I, FTOK_RPAREN);
+        } else {
+            if (token_can_be_name(peek(I))) advance(I);
+            if (check(I, FTOK_LPAREN)) {
+                int depth = 0;
+                do {
+                    if (check(I, FTOK_LPAREN)) depth++;
+                    else if (check(I, FTOK_RPAREN)) depth--;
+                    advance(I);
+                } while (depth > 0 && !check(I, FTOK_EOF));
+            }
+        }
+    }
     if (check(I, FTOK_DCOLON)) advance(I);
     if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
     OfortToken *name = advance(I);
 
     OfortNode *n = alloc_node(I, FND_TYPE_DEF);
     copy_cstr(n->name, sizeof(n->name), name->str_val);
+    copy_cstr(n->parent_type_name, sizeof(n->parent_type_name), parent_type_name);
     n->line = tt->line;
     if (check(I, FTOK_LPAREN)) {
         advance(I);
@@ -7280,6 +7363,15 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         return parse_statement_function(I);
     }
 
+    if (peek_ahead(I, 1)->type == FTOK_ASSIGN && token_can_be_name(t)) {
+        leave_spec_section(I);
+        return parse_keyword_assignment_statement(I);
+    }
+
+    if (token_ident_upper(t, "NAMELIST")) {
+        return parse_namelist_statement(I);
+    }
+
     /* IMPLICIT NONE */
     if (t->type == FTOK_IMPLICIT) {
         return parse_implicit_stmt(I);
@@ -7318,6 +7410,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
                 advance(I);
             } else if (token_ident_upper(peek(I), "ONLY")) {
                 advance(I);
+                n->int_val = 1;
                 if (check(I, FTOK_COLON)) advance(I);
             } else if (token_ident_upper(peek(I), "OPERATOR")) {
                 char local_op[256];
@@ -7474,13 +7567,6 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         return block;
     }
 
-    if (peek_ahead(I, 1)->type == FTOK_ASSIGN &&
-        ((t->type != FTOK_IDENT && token_can_be_name(t)) ||
-         t->type == FTOK_PRINT || is_type_keyword(t->type))) {
-        leave_spec_section(I);
-        return parse_keyword_assignment_statement(I);
-    }
-
     /* declarations */
     if (is_type_keyword(t->type)) {
         if (typed_function_follows_type_prefix(I)) {
@@ -7504,9 +7590,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         }
         /* Distinguish between TYPE :: typename (definition) and TYPE(typename) :: var (declaration) */
         OfortToken *next = peek_ahead(I, 1);
-        if (next->type == FTOK_COMMA)
-            ofort_error(I, "Unsupported OOP feature at line %d: TYPE, EXTENDS(...) is not supported yet", t->line);
-        if (next->type == FTOK_DCOLON || token_can_be_name(next)) {
+        if (next->type == FTOK_COMMA || next->type == FTOK_DCOLON || token_can_be_name(next)) {
             return parse_type_def(I);
         }
         if (next->type == FTOK_LPAREN) {
@@ -8063,7 +8147,25 @@ static OfortValue default_derived_value(OfortInterpreter *I, const char *type_na
             }
         }
         copy_cstr(v.v.dt.field_names[i], sizeof(v.v.dt.field_names[i]), td->field_names[i]);
-        if (td->field_is_pointer[i] && field_type == FVAL_DERIVED) {
+        if (td->field_is_allocatable[i]) {
+            if (td->field_n_dims[i] > 0) {
+                v.v.dt.fields[i].type = FVAL_ARRAY;
+                memset(&v.v.dt.fields[i].v.arr, 0, sizeof(v.v.dt.fields[i].v.arr));
+                v.v.dt.fields[i].v.arr.elem_type = field_type;
+                v.v.dt.fields[i].v.arr.n_dims = td->field_n_dims[i];
+                for (int d = 0; d < td->field_n_dims[i] && d < 7; d++) {
+                    v.v.dt.fields[i].v.arr.dims[d] = 0;
+                    v.v.dt.fields[i].v.arr.lower_bounds[d] = 1;
+                }
+                if (field_type == FVAL_DERIVED && td->field_type_names[i][0])
+                    copy_cstr(v.v.dt.fields[i].v.arr.elem_type_name,
+                              sizeof(v.v.dt.fields[i].v.arr.elem_type_name),
+                              td->field_type_names[i]);
+                v.v.dt.fields[i].v.arr.allocated = 0;
+            } else {
+                v.v.dt.fields[i] = make_void_val();
+            }
+        } else if (td->field_is_pointer[i] && field_type == FVAL_DERIVED) {
             v.v.dt.fields[i] = make_void_val();
         } else if (td->field_n_dims[i] > 0) {
             if (field_type == FVAL_DERIVED && td->field_type_names[i][0]) {
@@ -9386,6 +9488,22 @@ static int values_equal_fortran(OfortInterpreter *I, OfortValue a, OfortValue b)
     return val_to_real(a) == val_to_real(b);
 }
 
+static int values_compare_fortran(OfortInterpreter *I, OfortValue a, OfortValue b) {
+    if (a.type == FVAL_CHARACTER || b.type == FVAL_CHARACTER) {
+        char abuf[OFORT_MAX_STRLEN], bbuf[OFORT_MAX_STRLEN];
+        value_to_string(I, a, abuf, sizeof(abuf));
+        value_to_string(I, b, bbuf, sizeof(bbuf));
+        return string_compare_fortran(abuf, bbuf);
+    }
+    {
+        double av = val_to_real(a);
+        double bv = val_to_real(b);
+        if (av < bv) return -1;
+        if (av > bv) return 1;
+        return 0;
+    }
+}
+
 static OfortValue eval_in_operator(OfortInterpreter *I, OfortValue item, OfortValue collection) {
     int found = 0;
     if (collection.type != FVAL_ARRAY) {
@@ -10090,6 +10208,206 @@ static void read_values_from_string(OfortInterpreter *I, const char *text, Ofort
     for (int i = 0; i < n->n_stmts; i++) {
         read_string_target(I, &p, n->stmts[i], tok, sizeof(tok));
     }
+}
+
+static void namelist_emit(OfortInterpreter *I, FILE *fp, const char *text) {
+    if (fp) fputs(text, fp);
+    else out_append(I, text);
+}
+
+static void namelist_emitf(OfortInterpreter *I, FILE *fp, const char *fmt, ...) {
+    char buf[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    namelist_emit(I, fp, buf);
+}
+
+static void namelist_write_value(OfortInterpreter *I, FILE *fp, const OfortValue *v) {
+    if (!v) {
+        namelist_emit(I, fp, " ");
+        return;
+    }
+    switch (v->type) {
+    case FVAL_INTEGER:
+        namelist_emitf(I, fp, " %lld", v->v.i);
+        break;
+    case FVAL_REAL:
+    case FVAL_DOUBLE:
+        namelist_emitf(I, fp, " %.17g", v->v.r);
+        break;
+    case FVAL_LOGICAL:
+        namelist_emit(I, fp, v->v.b ? " T" : " F");
+        break;
+    case FVAL_CHARACTER:
+        namelist_emitf(I, fp, " \"%s\"", v->v.s ? v->v.s : "");
+        break;
+    default:
+        namelist_emit(I, fp, " ");
+        break;
+    }
+}
+
+static void write_namelist_to_stream(OfortInterpreter *I, const char *group_name, FILE *fp) {
+    OfortNamelist *nl = find_namelist(I, group_name);
+    if (!nl) ofort_error(I, "Undefined NAMELIST group '%s'", group_name);
+    namelist_emitf(I, fp, "&%s\n", nl->name);
+    for (int i = 0; i < nl->n_vars; i++) {
+        OfortVar *v = find_var(I, nl->var_names[i]);
+        if (!v) ofort_error(I, "Undefined NAMELIST variable '%s'", nl->var_names[i]);
+        namelist_emitf(I, fp, " %s =", v->name);
+        if (v->val.type == FVAL_ARRAY) {
+            for (int j = 0; j < v->val.v.arr.len; j++) {
+                OfortValue elem = array_element_value(&v->val, j);
+                namelist_write_value(I, fp, &elem);
+                free_value(&elem);
+                if (j + 1 < v->val.v.arr.len) namelist_emit(I, fp, ",");
+            }
+        } else {
+            namelist_write_value(I, fp, &v->val);
+        }
+        namelist_emit(I, fp, ",\n");
+    }
+    namelist_emit(I, fp, "/\n");
+}
+
+static const char *namelist_skip_space_commas(const char *p) {
+    while (*p && (isspace((unsigned char)*p) || *p == ',')) p++;
+    return p;
+}
+
+static int namelist_read_word(const char **pp, char *buf, int buf_size) {
+    const char *p = *pp;
+    int n = 0;
+    p = namelist_skip_space_commas(p);
+    if (!isalpha((unsigned char)*p) && *p != '_') return 0;
+    while ((isalnum((unsigned char)*p) || *p == '_') && n < buf_size - 1) {
+        buf[n++] = *p++;
+    }
+    while (isalnum((unsigned char)*p) || *p == '_') p++;
+    buf[n] = '\0';
+    *pp = p;
+    return 1;
+}
+
+static int namelist_next_is_assignment(const char *p) {
+    char name[256];
+    p = namelist_skip_space_commas(p);
+    if (*p == '/' || *p == '&' || *p == '$' || !*p) return 1;
+    if (!namelist_read_word(&p, name, sizeof(name))) return 0;
+    while (isspace((unsigned char)*p)) p++;
+    return *p == '=';
+}
+
+static int namelist_read_value_token(const char **pp, char *buf, int buf_size) {
+    const char *p = namelist_skip_space_commas(*pp);
+    int n = 0;
+    if (*p == '/' || !*p) return 0;
+    if (*p == '\'' || *p == '"') {
+        char quote = *p++;
+        while (*p && *p != quote) {
+            if (n < buf_size - 1) buf[n++] = *p;
+            p++;
+        }
+        if (*p == quote) p++;
+    } else {
+        while (*p && *p != ',' && *p != '/' && !isspace((unsigned char)*p)) {
+            if (n < buf_size - 1) buf[n++] = *p;
+            p++;
+        }
+    }
+    buf[n] = '\0';
+    *pp = p;
+    return n > 0;
+}
+
+static void namelist_assign_scalar(OfortInterpreter *I, OfortVar *v, const char *tok) {
+    OfortValue tmp = default_value(v->val.type, v->char_len > 0 ? v->char_len : 1);
+    assign_token_to_value(&tmp, tok);
+    set_var(I, v->name, tmp);
+}
+
+static void namelist_assign_array_element(OfortValue *arr, int index, const char *tok) {
+    OfortValue tmp = default_value(arr->v.arr.elem_type, 1);
+    assign_token_to_value(&tmp, tok);
+    if (assign_packed_array_element(arr, index, tmp)) {
+        free_value(&tmp);
+    } else if (arr->v.arr.data && index >= 0 && index < arr->v.arr.len) {
+        free_value(&arr->v.arr.data[index]);
+        arr->v.arr.data[index] = tmp;
+    } else {
+        free_value(&tmp);
+    }
+}
+
+static int read_namelist_from_text(OfortInterpreter *I, const char *group_name, const char *text) {
+    OfortNamelist *nl = find_namelist(I, group_name);
+    const char *p = text ? text : "";
+    char word[256];
+    if (!nl) ofort_error(I, "Undefined NAMELIST group '%s'", group_name);
+    while (*p) {
+        if (*p == '&' || *p == '$') {
+            p++;
+            if (namelist_read_word(&p, word, sizeof(word)) && str_eq_nocase(word, nl->name)) break;
+        } else {
+            p++;
+        }
+    }
+    if (!*p) return 1;
+    for (;;) {
+        OfortVar *v;
+        char value[1024];
+        p = namelist_skip_space_commas(p);
+        if (*p == '/' || !*p) break;
+        if (!namelist_read_word(&p, word, sizeof(word))) {
+            p++;
+            continue;
+        }
+        while (isspace((unsigned char)*p)) p++;
+        if (*p != '=') continue;
+        p++;
+        v = find_var(I, word);
+        if (!v) ofort_error(I, "Undefined NAMELIST variable '%s'", word);
+        if (v->val.type == FVAL_ARRAY) {
+            int index = 0;
+            while (index < v->val.v.arr.len && namelist_read_value_token(&p, value, sizeof(value))) {
+                namelist_assign_array_element(&v->val, index++, value);
+                if (namelist_next_is_assignment(p)) break;
+            }
+        } else if (namelist_read_value_token(&p, value, sizeof(value))) {
+            namelist_assign_scalar(I, v, value);
+        }
+    }
+    return 0;
+}
+
+static int read_namelist_from_file(OfortInterpreter *I, OfortUnitFile *entry, const char *group_name) {
+    FILE *fp = fopen(entry->path, "rb");
+    long start;
+    long size;
+    size_t nread;
+    char *text;
+    int status;
+    if (!fp) ofort_error(I, "Cannot open '%s' for namelist reading", entry->path);
+    fseek(fp, entry->stream_pos, SEEK_SET);
+    start = ftell(fp);
+    fseek(fp, 0, SEEK_END);
+    size = ftell(fp) - start;
+    if (size < 0) size = 0;
+    fseek(fp, start, SEEK_SET);
+    text = (char *)calloc((size_t)size + 1, 1);
+    if (!text) {
+        fclose(fp);
+        ofort_error(I, "Out of memory reading NAMELIST");
+    }
+    nread = fread(text, 1, (size_t)size, fp);
+    text[nread] = '\0';
+    entry->stream_pos = (int)ftell(fp);
+    fclose(fp);
+    status = read_namelist_from_text(I, group_name, text);
+    free(text);
+    return status;
 }
 
 static int read_stream_token_at(FILE *fp, int *stream_pos, char *buf, int bufsize) {
@@ -11687,6 +12005,24 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 strcpy(v.v.dt.field_names[i], td->field_names[i]);
                 if (i < nargs) {
                     v.v.dt.fields[i] = copy_value(args[i]);
+                } else if (td->field_is_allocatable[i]) {
+                    if (td->field_n_dims[i] > 0) {
+                        v.v.dt.fields[i].type = FVAL_ARRAY;
+                        memset(&v.v.dt.fields[i].v.arr, 0, sizeof(v.v.dt.fields[i].v.arr));
+                        v.v.dt.fields[i].v.arr.elem_type = td->field_types[i];
+                        v.v.dt.fields[i].v.arr.n_dims = td->field_n_dims[i];
+                        for (int d = 0; d < td->field_n_dims[i] && d < 7; d++) {
+                            v.v.dt.fields[i].v.arr.dims[d] = 0;
+                            v.v.dt.fields[i].v.arr.lower_bounds[d] = 1;
+                        }
+                        if (td->field_types[i] == FVAL_DERIVED && td->field_type_names[i][0])
+                            copy_cstr(v.v.dt.fields[i].v.arr.elem_type_name,
+                                      sizeof(v.v.dt.fields[i].v.arr.elem_type_name),
+                                      td->field_type_names[i]);
+                        v.v.dt.fields[i].v.arr.allocated = 0;
+                    } else {
+                        v.v.dt.fields[i] = make_void_val();
+                    }
                 } else if (td->field_n_dims[i] > 0) {
                     if (td->field_types[i] == FVAL_DERIVED && td->field_type_names[i][0]) {
                         v.v.dt.fields[i] = make_derived_array(I, td->field_type_names[i],
@@ -13552,6 +13888,43 @@ static const char *extract_forall_lhs_name(OfortNode *lhs) {
     return NULL;
 }
 
+static OfortNamelist *find_namelist(OfortInterpreter *I, const char *name) {
+    for (int i = 0; i < I->n_namelists; i++) {
+        if (str_eq_nocase(I->namelists[i].name, name)) return &I->namelists[i];
+    }
+    return NULL;
+}
+
+static int type_extends_or_same(OfortInterpreter *I, const char *actual_name,
+                                const char *expected_name) {
+    if (!actual_name || !actual_name[0] || !expected_name || !expected_name[0])
+        return 0;
+    if (str_eq_nocase(actual_name, expected_name)) return 1;
+    OfortTypeDef *td = find_type_def(I, actual_name);
+    int depth = 0;
+    while (td && td->parent_type_name[0] && depth++ < 64) {
+        if (str_eq_nocase(td->parent_type_name, expected_name)) return 1;
+        td = find_type_def(I, td->parent_type_name);
+    }
+    return 0;
+}
+
+static void register_namelist(OfortInterpreter *I, OfortNode *n) {
+    OfortNamelist *nl = find_namelist(I, n->name);
+    if (!nl) {
+        if (I->n_namelists >= (int)(sizeof(I->namelists) / sizeof(I->namelists[0])))
+            ofort_error(I, "Too many NAMELIST groups");
+        nl = &I->namelists[I->n_namelists++];
+        memset(nl, 0, sizeof(*nl));
+        copy_cstr(nl->name, sizeof(nl->name), n->name);
+    }
+    nl->n_vars = 0;
+    for (int i = 0; i < n->n_params; i++) {
+        if (nl->n_vars >= OFORT_MAX_PARAMS) too_many_params_error(I, "NAMELIST variables");
+        copy_cstr(nl->var_names[nl->n_vars++], sizeof(nl->var_names[0]), n->param_names[i]);
+    }
+}
+
 static int check_semantics_is_spec_node(OfortNode *n) {
     if (!n) return 0;
     switch (n->type) {
@@ -13579,6 +13952,7 @@ static const char *io_statement_name(OfortNodeType type) {
         case FND_PRINT: return "PRINT";
         case FND_WRITE: return "WRITE";
         case FND_READ_STMT: return "READ";
+        case FND_NAMELIST: return "NAMELIST";
         case FND_OPEN: return "OPEN";
         case FND_CLOSE: return "CLOSE";
         case FND_REWIND: return "REWIND";
@@ -13862,6 +14236,15 @@ static void check_semantics_node(OfortInterpreter *I, OfortNode *n) {
         case FND_PROGRAM: {
             OfortNode *body = n->children[0];
             push_scope(I);
+            if (body && body->type == FND_BLOCK) {
+                for (int i = 0; i < body->n_stmts; i++) {
+                    OfortNode *s = body->stmts[i];
+                    if (s && (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION ||
+                              s->type == FND_STMT_FUNCTION)) {
+                        exec_node(I, s);
+                    }
+                }
+            }
             check_semantics_block(I, body);
             pop_scope(I);
             return;
@@ -14446,10 +14829,26 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             ofort_error(I, "Module '%s' not found", n->name);
         }
         /* import variables */
-        for (int i = 0; i < mod->n_vars; i++) {
-            if (!mod->var_public[i]) continue;
-            OfortVar *v = declare_var(I, mod->vars[i].name, copy_value(mod->vars[i].val));
-            copy_imported_var_attrs(v, &mod->vars[i]);
+        if (n->int_val && n->n_params == 0) {
+            /* USE module, ONLY: imports no variables. */
+        } else if (n->n_params > 0) {
+            for (int pi = 0; pi < n->n_params; pi++) {
+                const char *local = n->param_names[pi];
+                const char *remote = n->binding_proc_names[pi][0] ? n->binding_proc_names[pi] : local;
+                for (int i = 0; i < mod->n_vars; i++) {
+                    if (!mod->var_public[i]) continue;
+                    if (!str_eq_nocase(mod->vars[i].name, remote)) continue;
+                    OfortVar *v = declare_var(I, local, copy_value(mod->vars[i].val));
+                    copy_imported_var_attrs(v, &mod->vars[i]);
+                    break;
+                }
+            }
+        } else {
+            for (int i = 0; i < mod->n_vars; i++) {
+                if (!mod->var_public[i]) continue;
+                OfortVar *v = declare_var(I, mod->vars[i].name, copy_value(mod->vars[i].val));
+                copy_imported_var_attrs(v, &mod->vars[i]);
+            }
         }
         for (int i = 0; i < n->n_params; i++) {
             const char *local = n->param_names[i];
@@ -14487,21 +14886,58 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         OfortTypeDef *td = &I->type_defs[I->n_type_defs++];
         memset(td, 0, sizeof(*td));
         copy_cstr(td->name, sizeof(td->name), n->name);
+        copy_cstr(td->parent_type_name, sizeof(td->parent_type_name), n->parent_type_name);
         td->n_fields = 0;
         td->n_bindings = 0;
+        if (td->parent_type_name[0]) {
+            OfortTypeDef *parent = find_type_def(I, td->parent_type_name);
+            if (!parent)
+                ofort_error(I, "Unknown parent type '%s' in EXTENDS for type '%s'",
+                            td->parent_type_name, td->name);
+            td->n_fields = parent->n_fields;
+            for (int i = 0; i < parent->n_fields; i++) {
+                copy_cstr(td->field_names[i], sizeof(td->field_names[i]), parent->field_names[i]);
+                copy_cstr(td->field_type_names[i], sizeof(td->field_type_names[i]), parent->field_type_names[i]);
+                td->field_types[i] = parent->field_types[i];
+                td->field_char_lens[i] = parent->field_char_lens[i];
+                td->field_char_len_exprs[i] = parent->field_char_len_exprs[i];
+                td->field_kind_exprs[i] = parent->field_kind_exprs[i];
+                td->field_init_exprs[i] = parent->field_init_exprs[i];
+                td->field_n_dims[i] = parent->field_n_dims[i];
+                td->field_is_pointer[i] = parent->field_is_pointer[i];
+                td->field_is_allocatable[i] = parent->field_is_allocatable[i];
+                memcpy(td->field_dims[i], parent->field_dims[i], sizeof(td->field_dims[i]));
+                memcpy(td->field_dim_exprs[i], parent->field_dim_exprs[i], sizeof(td->field_dim_exprs[i]));
+            }
+            td->n_bindings = parent->n_bindings;
+            for (int i = 0; i < parent->n_bindings; i++) {
+                copy_cstr(td->binding_names[i], sizeof(td->binding_names[i]), parent->binding_names[i]);
+                copy_cstr(td->binding_proc_names[i], sizeof(td->binding_proc_names[i]), parent->binding_proc_names[i]);
+            }
+        }
         td->n_type_params = n->n_type_params;
         for (int i = 0; i < n->n_type_params && i < OFORT_MAX_PARAMS; i++) {
             copy_cstr(td->type_param_names[i], sizeof(td->type_param_names[i]),
                       n->type_param_names[i]);
         }
         for (int i = 0; i < n->n_params && i < OFORT_MAX_PARAMS; i++) {
-            copy_cstr(td->binding_names[td->n_bindings],
-                      sizeof(td->binding_names[td->n_bindings]),
+            int binding_index = -1;
+            for (int j = 0; j < td->n_bindings; j++) {
+                if (str_eq_nocase(td->binding_names[j], n->param_names[i])) {
+                    binding_index = j;
+                    break;
+                }
+            }
+            if (binding_index < 0) {
+                if (td->n_bindings >= OFORT_MAX_PARAMS) too_many_params_error(I, "type-bound procedures");
+                binding_index = td->n_bindings++;
+            }
+            copy_cstr(td->binding_names[binding_index],
+                      sizeof(td->binding_names[binding_index]),
                       n->param_names[i]);
-            copy_cstr(td->binding_proc_names[td->n_bindings],
-                      sizeof(td->binding_proc_names[td->n_bindings]),
+            copy_cstr(td->binding_proc_names[binding_index],
+                      sizeof(td->binding_proc_names[binding_index]),
                       n->binding_proc_names[i]);
-            td->n_bindings++;
             if (n->param_names[i][0] == '.')
                 register_generic_procedure(I, n->param_names[i], n->binding_proc_names[i]);
         }
@@ -14549,8 +14985,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         td->field_kind_exprs[td->n_fields] = d->kind_expr;
                         td->field_init_exprs[td->n_fields] =
                             (d->n_children > 0 && d->children[0]) ? d->children[0] : NULL;
+                        if (d->is_pointer && td->field_init_exprs[td->n_fields]) {
+                            OfortValue init = eval_node(I, td->field_init_exprs[td->n_fields]);
+                            td->field_init_exprs[td->n_fields] = data_node_from_value(I, &init);
+                            free_value(&init);
+                        }
                         td->field_n_dims[td->n_fields] = d->n_dims;
                         td->field_is_pointer[td->n_fields] = d->is_pointer;
+                        td->field_is_allocatable[td->n_fields] = d->is_allocatable;
                         memcpy(td->field_dims[td->n_fields], d->dims, sizeof(td->field_dims[td->n_fields]));
                         for (int fd = 0; fd < d->n_dims && fd < 7 && fd < d->n_stmts; fd++) {
                             td->field_dim_exprs[td->n_fields][fd] = d->stmts ? d->stmts[fd] : NULL;
@@ -14595,8 +15037,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 td->field_kind_exprs[td->n_fields] = s->kind_expr;
                 td->field_init_exprs[td->n_fields] =
                     (s->n_children > 0 && s->children[0]) ? s->children[0] : NULL;
+                if (s->is_pointer && td->field_init_exprs[td->n_fields]) {
+                    OfortValue init = eval_node(I, td->field_init_exprs[td->n_fields]);
+                    td->field_init_exprs[td->n_fields] = data_node_from_value(I, &init);
+                    free_value(&init);
+                }
                 td->field_n_dims[td->n_fields] = s->n_dims;
                 td->field_is_pointer[td->n_fields] = s->is_pointer;
+                td->field_is_allocatable[td->n_fields] = s->is_allocatable;
                 memcpy(td->field_dims[td->n_fields], s->dims, sizeof(td->field_dims[td->n_fields]));
                 for (int fd = 0; fd < s->n_dims && fd < 7 && fd < s->n_stmts; fd++) {
                     td->field_dim_exprs[td->n_fields][fd] = s->stmts ? s->stmts[fd] : NULL;
@@ -14873,7 +15321,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (n->val_type == FVAL_DERIVED)
                 copy_cstr(val.v.arr.elem_type_name, sizeof(val.v.arr.elem_type_name), n->str_val);
             val.v.arr.allocated = 0;
-        } else if (n->is_allocatable && n->val_type != FVAL_DERIVED) {
+        } else if (n->is_allocatable) {
             val = make_void_val();
         } else if (n->n_children > 0 && n->children[0]) {
             val = eval_node(I, n->children[0]);
@@ -15512,6 +15960,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         if (n->int_val > 0) register_format_label(I, (int)n->int_val, n->format_str);
         break;
 
+    case FND_NAMELIST:
+        register_namelist(I, n);
+        break;
+
     case FND_WRITE: {
         int nvals = 0;
         OfortValue *vals = eval_io_list(I, n, &nvals);
@@ -15522,7 +15974,32 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         int rec_no = 0;
         int has_rec = 0;
 
-        if (n->children[0] && write_to_internal_target(I, n->children[0], fmt, vals, nvals)) {
+        if (n->name[0]) {
+            if (n->children[0]) {
+                OfortValue uv = eval_node(I, n->children[0]);
+                int unit = (int)val_to_int(uv);
+                OfortUnitFile *entry = find_unit_file(I, unit);
+                free_value(&uv);
+                if (!entry && unit == 6) {
+                    write_namelist_to_stream(I, n->name, NULL);
+                    wrote_stdout = 1;
+                    status = 0;
+                } else {
+                    FILE *fp;
+                    if (!entry) entry = ensure_unit_file(I, unit, 1);
+                    if (!entry) ofort_error(I, "Unit %d is not open", unit);
+                    fp = fopen(entry->path, "ab");
+                    if (!fp) ofort_error(I, "Cannot open '%s' for namelist writing", entry->path);
+                    write_namelist_to_stream(I, n->name, fp);
+                    fclose(fp);
+                    status = 0;
+                }
+            } else {
+                write_namelist_to_stream(I, n->name, NULL);
+                wrote_stdout = 1;
+                status = 0;
+            }
+        } else if (n->children[0] && write_to_internal_target(I, n->children[0], fmt, vals, nvals)) {
             /* Internal character WRITE completed. */
             status = 0;
             if (n->children[4] && n->children[4]->type == FND_IDENT) {
@@ -15629,6 +16106,29 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
     }
 
     case FND_READ_STMT:
+        if (n->name[0]) {
+            int status = 0;
+            if (n->children[0]) {
+                OfortValue uv = eval_node(I, n->children[0]);
+                if (uv.type == FVAL_CHARACTER) {
+                    status = read_namelist_from_text(I, n->name, uv.v.s ? uv.v.s : "");
+                    free_value(&uv);
+                } else {
+                    int unit = (int)val_to_int(uv);
+                    OfortUnitFile *entry = find_unit_file(I, unit);
+                    free_value(&uv);
+                    if (!entry) entry = ensure_unit_file(I, unit, 0);
+                    if (!entry) ofort_error(I, "Unit %d is not open", unit);
+                    status = read_namelist_from_file(I, entry, n->name);
+                }
+            } else {
+                status = 1;
+            }
+            if (n->children[4] && n->children[4]->type == FND_IDENT) {
+                set_var(I, n->children[4]->name, make_integer(status));
+            }
+            break;
+        }
         if (n->children[0]) {
             OfortValue uv = eval_node(I, n->children[0]);
             int status = 0;
@@ -17006,7 +17506,7 @@ static const char *intrinsic_names[] = {
     "LEN", "LEN_TRIM", "TRIM", "NEW_LINE", "ADJUSTL", "ADJUSTR", "INDEX", "SCAN", "VERIFY",
     "CHAR", "ICHAR", "ACHAR", "IACHAR", "REPEAT",
     /* Array */
-    "SIZE", "SHAPE", "RANK", "PACK", "UNPACK", "MERGE", "SUM", "PRODUCT", "REDUCE", "MAXVAL", "MINVAL", "MAXLOC", "MINLOC",
+    "SIZE", "SHAPE", "RANK", "PACK", "UNPACK", "MERGE", "SUM", "PRODUCT", "REDUCE", "MAXVAL", "MINVAL", "MAXLOC", "MINLOC", "FINDLOC",
     "DOT_PRODUCT", "MATMUL", "TRANSPOSE", "RESHAPE", "SPREAD", "EOSHIFT", "CSHIFT",
     "COUNT", "ANY", "ALL", "ALLOCATED", "LBOUND", "UBOUND",
     /* Type conversion */
@@ -19998,6 +20498,124 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (args[0].v.arr.elem_type == FVAL_INTEGER) return make_integer((long long)mn);
         return make_real(mn);
     }
+    if (strcmp(upper, "FINDLOC") == 0) {
+        int array_idx = intrinsic_arg_index(arg_names, nargs, "array");
+        int value_idx = intrinsic_arg_index(arg_names, nargs, "value");
+        int dim_idx = intrinsic_arg_index(arg_names, nargs, "dim");
+        int mask_idx = intrinsic_arg_index(arg_names, nargs, "mask");
+        OfortValue *array;
+        OfortValue *value;
+        OfortValue *mask = NULL;
+        if (array_idx < 0) array_idx = 0;
+        if (value_idx < 0) value_idx = 1;
+        if (dim_idx < 0 && nargs >= 3 && (!arg_names || arg_names[2][0] == '\0')) dim_idx = 2;
+        if (array_idx >= nargs || value_idx >= nargs || args[array_idx].type != FVAL_ARRAY)
+            ofort_error(I, "FINDLOC requires ARRAY and VALUE arguments");
+        array = &args[array_idx];
+        value = &args[value_idx];
+        if (mask_idx >= 0) mask = &args[mask_idx];
+
+        if (dim_idx >= 0) {
+            int dim = (int)val_to_int(args[dim_idx]);
+            int nd = array->v.arr.n_dims;
+            int rdims[7];
+            int nrdims = 0;
+            int total = 1;
+            OfortValue result;
+            if (dim < 1 || dim > nd) ofort_error(I, "FINDLOC DIM is out of range");
+            for (int d = 0; d < nd; d++) {
+                if (d == dim - 1) continue;
+                rdims[nrdims++] = array->v.arr.dims[d];
+                total *= array->v.arr.dims[d];
+            }
+            if (nrdims == 0) {
+                rdims[0] = 1;
+                nrdims = 1;
+                total = 1;
+            }
+            result = make_array(FVAL_INTEGER, rdims, nrdims);
+            for (int out = 0; out < total; out++) {
+                int subs[7] = {0};
+                int rem = out;
+                int rd = 0;
+                int found_pos = 0;
+                for (int d = 0; d < nd; d++) {
+                    if (d == dim - 1) continue;
+                    subs[d] = rem % array->v.arr.dims[d];
+                    rem /= array->v.arr.dims[d];
+                    rd++;
+                }
+                (void)rd;
+                for (int pos = 0; pos < array->v.arr.dims[dim - 1]; pos++) {
+                    int idx = 0;
+                    int stride = 1;
+                    int include = 1;
+                    subs[dim - 1] = pos;
+                    for (int d = 0; d < nd; d++) {
+                        idx += subs[d] * stride;
+                        stride *= array->v.arr.dims[d];
+                    }
+                    if (mask) {
+                        if (mask->type == FVAL_ARRAY) {
+                            OfortValue mv = array_element_value(mask, idx);
+                            include = val_to_logical(mv);
+                            free_value(&mv);
+                        } else {
+                            include = val_to_logical(*mask);
+                        }
+                    }
+                    if (include) {
+                        OfortValue elem = array_element_value(array, idx);
+                        int eq = values_equal_fortran(I, elem, *value);
+                        free_value(&elem);
+                        if (eq) {
+                            found_pos = pos + 1;
+                            break;
+                        }
+                    }
+                }
+                free_value(&result.v.arr.data[out]);
+                result.v.arr.data[out] = make_integer(found_pos);
+            }
+            return result;
+        } else {
+            int nd = array->v.arr.n_dims;
+            int rdims[1] = {nd};
+            OfortValue result = make_array(FVAL_INTEGER, rdims, 1);
+            int found_index = -1;
+            for (int i = 0; i < array->v.arr.len; i++) {
+                int include = 1;
+                if (mask) {
+                    if (mask->type == FVAL_ARRAY) {
+                        OfortValue mv = array_element_value(mask, i);
+                        include = val_to_logical(mv);
+                        free_value(&mv);
+                    } else {
+                        include = val_to_logical(*mask);
+                    }
+                }
+                if (!include) continue;
+                OfortValue elem = array_element_value(array, i);
+                int eq = values_equal_fortran(I, elem, *value);
+                free_value(&elem);
+                if (eq) {
+                    found_index = i;
+                    break;
+                }
+            }
+            for (int d = 0; d < nd; d++) {
+                int sub = 0;
+                if (found_index >= 0) {
+                    int stride = 1;
+                    for (int k = 0; k < d; k++) stride *= array->v.arr.dims[k];
+                    sub = (found_index / stride) % array->v.arr.dims[d] + 1;
+                }
+                free_value(&result.v.arr.data[d]);
+                result.v.arr.data[d] = make_integer(sub);
+            }
+            return result;
+        }
+    }
     if (strcmp(upper, "MAXLOC") == 0 || strcmp(upper, "MINLOC") == 0) {
         int want_max = strcmp(upper, "MAXLOC") == 0;
         int dim_idx = intrinsic_arg_index(arg_names, nargs, "dim");
@@ -20022,6 +20640,69 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
 
         if (dim_idx >= 0) {
             int dim = (int)val_to_int(args[dim_idx]);
+            int nd = array->v.arr.n_dims;
+            int rdims[7];
+            int nrdims = 0;
+            int total = 1;
+            OfortValue result;
+            if (dim < 1 || dim > nd) ofort_error(I, "%s DIM is out of range", upper);
+            for (int d = 0; d < nd; d++) {
+                if (d == dim - 1) continue;
+                rdims[nrdims++] = array->v.arr.dims[d];
+                total *= array->v.arr.dims[d];
+            }
+            if (nrdims == 0) {
+                rdims[0] = 1;
+                nrdims = 1;
+                total = 1;
+            }
+            result = make_array(FVAL_INTEGER, rdims, nrdims);
+            for (int out = 0; out < total; out++) {
+                int subs[7] = {0};
+                int rem = out;
+                int best_pos = 0;
+                int found = 0;
+                OfortValue best = make_void_val();
+                for (int d = 0; d < nd; d++) {
+                    if (d == dim - 1) continue;
+                    subs[d] = rem % array->v.arr.dims[d];
+                    rem /= array->v.arr.dims[d];
+                }
+                for (int pos = 0; pos < array->v.arr.dims[dim - 1]; pos++) {
+                    int idx = 0;
+                    int stride = 1;
+                    int include = 1;
+                    subs[dim - 1] = pos;
+                    for (int d = 0; d < nd; d++) {
+                        idx += subs[d] * stride;
+                        stride *= array->v.arr.dims[d];
+                    }
+                    if (mask) {
+                        if (mask->type == FVAL_ARRAY) {
+                            OfortValue mv = array_element_value(mask, idx);
+                            include = val_to_logical(mv);
+                            free_value(&mv);
+                        } else {
+                            include = val_to_logical(*mask);
+                        }
+                    }
+                    if (include) {
+                        OfortValue elem = array_element_value(array, idx);
+                        if (!found || (want_max ? values_compare_fortran(I, elem, best) > 0
+                                                : values_compare_fortran(I, elem, best) < 0)) {
+                            free_value(&best);
+                            best = copy_value(elem);
+                            best_pos = pos + 1;
+                            found = 1;
+                        }
+                        free_value(&elem);
+                    }
+                }
+                free_value(&best);
+                free_value(&result.v.arr.data[out]);
+                result.v.arr.data[out] = make_integer(found ? best_pos : 0);
+            }
+            return result;
             if (array->v.arr.n_dims == 1) {
                 int rdims[1] = {1};
                 OfortValue result = make_array(FVAL_INTEGER, rdims, 1);
@@ -20832,6 +21513,15 @@ int ofort_check(OfortInterpreter *interp, const char *source) {
     interp->timing.parse = ofort_monotonic_seconds() - stage_start;
     stage_start = ofort_monotonic_seconds();
     if (interp->ast && interp->ast->type == FND_BLOCK) {
+        for (int i = 0; i < interp->ast->n_stmts; i++) {
+            OfortNode *s = interp->ast->stmts[i];
+            if (!s) continue;
+            if (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION ||
+                s->type == FND_STMT_FUNCTION || s->type == FND_MODULE ||
+                s->type == FND_BLOCK_DATA) {
+                exec_node(interp, s);
+            }
+        }
         check_semantics_block(interp, interp->ast);
     }
     interp->timing.register_time = ofort_monotonic_seconds() - stage_start;
