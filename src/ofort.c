@@ -77,7 +77,7 @@ typedef struct {
     OfortNode *node;
     int is_function; /* 1=function, 0=subroutine */
     char module_name[256]; /* "" if not in a module */
-    OfortVar saved_vars[OFORT_MAX_VARS];
+    OfortVar saved_vars[OFORT_MAX_SAVED_VARS];
     int n_saved_vars;
 } OfortFunc;
 
@@ -112,8 +112,8 @@ typedef struct {
 
 typedef struct {
     char name[128];
-    OfortVar vars[OFORT_MAX_VARS];
-    int var_public[OFORT_MAX_VARS];
+    OfortVar vars[OFORT_MAX_MODULE_VARS];
+    int var_public[OFORT_MAX_MODULE_VARS];
     int n_vars;
     OfortTypeDef types[32];
     int n_types;
@@ -1532,7 +1532,7 @@ static void store_saved_vars(OfortFunc *func, OfortScope *scope) {
         if (!src->is_save) continue;
         dst = find_saved_var(func, src->name);
         if (!dst) {
-            if (func->n_saved_vars >= OFORT_MAX_VARS) continue;
+            if (func->n_saved_vars >= OFORT_MAX_SAVED_VARS) continue;
             dst = &func->saved_vars[func->n_saved_vars++];
             memset(dst, 0, sizeof(*dst));
             copy_cstr(dst->name, sizeof(dst->name), src->name);
@@ -14974,7 +14974,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
             /* Copy module variables */
             OfortScope *ms = I->current_scope;
-            for (int i = 0; i < ms->n_vars && i < OFORT_MAX_VARS; i++) {
+            for (int i = 0; i < ms->n_vars && i < OFORT_MAX_MODULE_VARS; i++) {
                 int is_public = mod->default_private ? 0 : 1;
                 if (name_in_list_nocase(ms->vars[i].name, public_names, n_public_names)) is_public = 1;
                 if (name_in_list_nocase(ms->vars[i].name, private_names, n_private_names)) is_public = 0;
@@ -21979,7 +21979,8 @@ void ofort_destroy(OfortInterpreter *interp) {
     /* Free module vars */
     for (int m = 0; m < interp->n_modules; m++) {
         for (int i = 0; i < interp->modules[m].n_vars; i++) {
-            free_value(&interp->modules[m].vars[i].val);
+            if (!interp->modules[m].vars[i].is_alias)
+                free_value(&interp->modules[m].vars[i].val);
         }
     }
     for (int f = 0; f < interp->n_funcs; f++) {
