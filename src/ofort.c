@@ -8573,7 +8573,21 @@ static OfortValue make_derived_array_from_decl(OfortInterpreter *I, OfortNode *n
         if (dims[i] < 0) dims[i] = 0;
     }
 
-    OfortValue arr = make_derived_array(I, n->str_val, dims, ndims);
+    OfortValue arr;
+    if (n->n_type_param_exprs > 0) {
+        arr = make_array(FVAL_DERIVED, dims, ndims);
+        copy_cstr(arr.v.arr.elem_type_name, sizeof(arr.v.arr.elem_type_name), n->str_val);
+        if (arr.v.arr.data) {
+            for (int i = 0; i < arr.v.arr.len; i++) {
+                free_value(&arr.v.arr.data[i]);
+                arr.v.arr.data[i] = default_derived_value_with_params(I, n->str_val,
+                                                                       n->type_param_exprs,
+                                                                       n->n_type_param_exprs);
+            }
+        }
+    } else {
+        arr = make_derived_array(I, n->str_val, dims, ndims);
+    }
     set_array_lower_bounds(&arr, lower_bounds, ndims);
     return arr;
 }
@@ -14154,6 +14168,13 @@ static void check_semantics_block(OfortInterpreter *I, OfortNode *block) {
     if (!block) return;
     for (int i = 0; i < block->n_stmts; i++) {
         OfortNode *s = block->stmts[i];
+        if (s && (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION ||
+                  s->type == FND_STMT_FUNCTION)) {
+            (void)register_func(I, s->name, s, s->type == FND_FUNCTION || s->type == FND_STMT_FUNCTION);
+        }
+    }
+    for (int i = 0; i < block->n_stmts; i++) {
+        OfortNode *s = block->stmts[i];
         if (!s) continue;
         if (check_semantics_is_spec_node(s)) {
             exec_node(I, s);
@@ -14906,6 +14927,25 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 break;
             }
             if (strcmp(upper, "ISO_C_BINDING") == 0) {
+                if (n->n_params > 0) {
+                    for (int i = 0; i < n->n_params; i++) {
+                        const char *local = n->param_names[i];
+                        const char *remote = n->binding_proc_names[i][0] ? n->binding_proc_names[i] : local;
+                        char ru[256];
+                        str_upper(ru, remote, sizeof(ru));
+                        if (strcmp(ru, "C_INT") == 0) declare_var(I, local, make_integer(4));
+                        else if (strcmp(ru, "C_SIZE_T") == 0) declare_var(I, local, make_integer(8));
+                        else if (strcmp(ru, "C_DOUBLE") == 0) declare_var(I, local, make_integer(8));
+                        else if (strcmp(ru, "C_FLOAT") == 0) declare_var(I, local, make_integer(4));
+                        else if (strcmp(ru, "C_BOOL") == 0) declare_var(I, local, make_integer(1));
+                    }
+                } else {
+                    declare_var(I, "c_int", make_integer(4));
+                    declare_var(I, "c_size_t", make_integer(8));
+                    declare_var(I, "c_double", make_integer(8));
+                    declare_var(I, "c_float", make_integer(4));
+                    declare_var(I, "c_bool", make_integer(1));
+                }
                 break;
             }
             ofort_error(I, "Module '%s' not found", n->name);
@@ -17064,6 +17104,18 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
         }
         if (!func) {
+            if (find_module_proc_spec(I, n->name)) {
+                for (int i = 0; i < nargs; i++) free_value(&args[i]);
+                free(args);
+                break;
+            }
+            for (int i = 0; i < nargs; i++) {
+                if (procedure_ref_name(&args[i])) {
+                    for (int j = 0; j < nargs; j++) free_value(&args[j]);
+                    free(args);
+                    goto unresolved_external_call_done;
+                }
+            }
             ofort_error(I, "Unknown subroutine '%s' at line %d", n->name, n->line);
         }
         if (func->is_function) {
@@ -17151,6 +17203,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         }
         for (int i = 0; i < nargs; i++) free_value(&args[i]);
         free(args);
+unresolved_external_call_done:
         break;
     }
 
@@ -17607,7 +17660,7 @@ static const char *intrinsic_names[] = {
     "SINH", "COSH", "TANH",
     "EXP", "LOG", "LOG10", "GAMMA", "LOG_GAMMA", "MOD", "MODULO", "DIM", "MAX", "MIN", "FLOOR", "CEILING", "AINT", "NINT",
     "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND", "TRANSFER",
-    "BIT_SIZE", "STORAGE_SIZE", "BTEST", "IAND", "IEOR", "IOR", "IBCLR", "IBITS", "IBSET", "ISHFT", "ISHFTC", "MASKL", "MASKR",
+    "BIT_SIZE", "STORAGE_SIZE", "BTEST", "IAND", "IEOR", "IOR", "IBCLR", "IBITS", "IBSET", "ISHFT", "ISHFTC", "DSHIFTL", "DSHIFTR", "MASKL", "MASKR",
     "MERGE_BITS", "BGE", "BGT", "BLE", "BLT",
     "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE", "TINY", "NEAREST", "PRECISION", "RANGE", "RRSPACING", "SPACING", "SCALE",
     "SET_EXPONENT",
@@ -17622,7 +17675,7 @@ static const char *intrinsic_names[] = {
     /* Type conversion */
     "FLOAT", "DFLOAT", "SNGL", "LOGICAL",
     /* Command line */
-    "COMMAND_ARGUMENT_COUNT",
+    "COMMAND_ARGUMENT_COUNT", "C_SIZEOF",
     NULL
 };
 
@@ -19285,6 +19338,109 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         return make_void_val();
     }
 
+    if (strcmp(upper, "DSHIFTL") == 0 || strcmp(upper, "DSHIFTR") == 0) {
+        int i_idx = intrinsic_arg_index(arg_names, nargs, "i");
+        int j_idx = intrinsic_arg_index(arg_names, nargs, "j");
+        int shift_idx = intrinsic_arg_index(arg_names, nargs, "shift");
+        OfortValue *shape_arg = NULL;
+        int idxs[3];
+        if (i_idx < 0) i_idx = 0;
+        if (j_idx < 0) j_idx = 1;
+        if (shift_idx < 0) shift_idx = 2;
+        if (nargs < 3 || i_idx >= nargs || j_idx >= nargs || shift_idx >= nargs)
+            ofort_error(I, "%s requires 3 arguments", upper);
+        idxs[0] = i_idx; idxs[1] = j_idx; idxs[2] = shift_idx;
+        for (int ai = 0; ai < 3; ai++) {
+            OfortValue *arg = &args[idxs[ai]];
+            if (arg->type == FVAL_ARRAY) {
+                if (!shape_arg) shape_arg = arg;
+                else if (arg->v.arr.len != shape_arg->v.arr.len)
+                    ofort_error(I, "%s array arguments have different sizes", upper);
+            }
+        }
+        if (shape_arg) {
+            OfortValue result = make_array(FVAL_INTEGER, shape_arg->v.arr.dims, shape_arg->v.arr.n_dims);
+            for (int ri = 0; ri < result.v.arr.len; ri++) {
+                OfortValue iv = args[i_idx].type == FVAL_ARRAY ? array_element_value(&args[i_idx], ri) : copy_value(args[i_idx]);
+                OfortValue jv = args[j_idx].type == FVAL_ARRAY ? array_element_value(&args[j_idx], ri) : copy_value(args[j_idx]);
+                OfortValue sv = args[shift_idx].type == FVAL_ARRAY ? array_element_value(&args[shift_idx], ri) : copy_value(args[shift_idx]);
+                int kind, bits, shift;
+                unsigned long long mask, ia, ja, out;
+                if (iv.type != FVAL_INTEGER || jv.type != FVAL_INTEGER || sv.type != FVAL_INTEGER)
+                    ofort_error(I, "%s requires integer arguments", upper);
+                kind = iv.kind ? iv.kind : 4;
+                bits = integer_kind_bits(kind);
+                shift = (int)sv.v.i;
+                if (shift < 0 || shift > bits) ofort_error(I, "%s SHIFT out of range", upper);
+                mask = bits >= 64 ? ~0ULL : ((1ULL << (unsigned int)bits) - 1ULL);
+                ia = ((unsigned long long)iv.v.i) & mask;
+                ja = ((unsigned long long)jv.v.i) & mask;
+                if (shift == 0) out = strcmp(upper, "DSHIFTL") == 0 ? ia : ja;
+                else if (strcmp(upper, "DSHIFTL") == 0) out = ((ia << (unsigned int)shift) | (ja >> (unsigned int)(bits - shift))) & mask;
+                else out = ((ia << (unsigned int)(bits - shift)) | (ja >> (unsigned int)shift)) & mask;
+                free_value(&result.v.arr.data[ri]);
+                result.v.arr.data[ri] = make_integer_kind(signed_mask_value(out, bits), kind);
+                free_value(&iv); free_value(&jv); free_value(&sv);
+            }
+            return result;
+        } else {
+            int kind, bits, shift;
+            unsigned long long mask, ia, ja, out;
+            if (args[i_idx].type != FVAL_INTEGER || args[j_idx].type != FVAL_INTEGER || args[shift_idx].type != FVAL_INTEGER)
+                ofort_error(I, "%s requires integer arguments", upper);
+            kind = args[i_idx].kind ? args[i_idx].kind : 4;
+            bits = integer_kind_bits(kind);
+            shift = (int)args[shift_idx].v.i;
+            if (shift < 0 || shift > bits) ofort_error(I, "%s SHIFT out of range", upper);
+            mask = bits >= 64 ? ~0ULL : ((1ULL << (unsigned int)bits) - 1ULL);
+            ia = ((unsigned long long)args[i_idx].v.i) & mask;
+            ja = ((unsigned long long)args[j_idx].v.i) & mask;
+            if (shift == 0) out = strcmp(upper, "DSHIFTL") == 0 ? ia : ja;
+            else if (strcmp(upper, "DSHIFTL") == 0) out = ((ia << (unsigned int)shift) | (ja >> (unsigned int)(bits - shift))) & mask;
+            else out = ((ia << (unsigned int)(bits - shift)) | (ja >> (unsigned int)shift)) & mask;
+            return make_integer_kind(signed_mask_value(out, bits), kind);
+        }
+    }
+
+    if (strcmp(upper, "MASKL") == 0 || strcmp(upper, "MASKR") == 0) {
+        int i_idx = intrinsic_arg_index(arg_names, nargs, "i");
+        int kind_idx = intrinsic_arg_index(arg_names, nargs, "kind");
+        OfortValue *shape_arg = NULL;
+        if (i_idx < 0) i_idx = 0;
+        if (kind_idx < 0 && nargs > 1 && (!arg_names || arg_names[1][0] == '\0')) kind_idx = 1;
+        if (nargs < 1 || i_idx >= nargs) ofort_error(I, "%s requires I", upper);
+        if (args[i_idx].type == FVAL_ARRAY) shape_arg = &args[i_idx];
+        if (kind_idx >= 0 && args[kind_idx].type == FVAL_ARRAY) {
+            if (!shape_arg) shape_arg = &args[kind_idx];
+            else if (args[kind_idx].v.arr.len != shape_arg->v.arr.len)
+                ofort_error(I, "%s array arguments have different sizes", upper);
+        }
+        if (shape_arg) {
+            OfortValue result = make_array(FVAL_INTEGER, shape_arg->v.arr.dims, shape_arg->v.arr.n_dims);
+            for (int ri = 0; ri < result.v.arr.len; ri++) {
+                OfortValue iv = args[i_idx].type == FVAL_ARRAY ? array_element_value(&args[i_idx], ri) : copy_value(args[i_idx]);
+                OfortValue kv = make_integer(4);
+                int kind, bits;
+                long long count;
+                unsigned long long value;
+                if (kind_idx >= 0) kv = args[kind_idx].type == FVAL_ARRAY ? array_element_value(&args[kind_idx], ri) : copy_value(args[kind_idx]);
+                if (iv.type != FVAL_INTEGER || kv.type != FVAL_INTEGER) ofort_error(I, "%s requires integer arguments", upper);
+                kind = (int)kv.v.i;
+                bits = integer_kind_bits(kind);
+                count = iv.v.i;
+                if (count < 0 || count > bits) ofort_error(I, "%s bit count out of range", upper);
+                if (count == 0) value = 0;
+                else if (count == bits) value = ~0ULL;
+                else if (strcmp(upper, "MASKR") == 0) value = (1ULL << (unsigned int)count) - 1ULL;
+                else value = (~0ULL) << (unsigned int)(bits - count);
+                free_value(&result.v.arr.data[ri]);
+                result.v.arr.data[ri] = make_integer_kind(signed_mask_value(value, bits), kind);
+                free_value(&iv); free_value(&kv);
+            }
+            return result;
+        }
+    }
+
     if (strcmp(upper, "MERGE_BITS") == 0 ||
         strcmp(upper, "BGE") == 0 || strcmp(upper, "BGT") == 0 ||
         strcmp(upper, "BLE") == 0 || strcmp(upper, "BLT") == 0) {
@@ -19781,6 +19937,13 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     if (strcmp(upper, "STORAGE_SIZE") == 0) {
         if (nargs < 1) ofort_error(I, "STORAGE_SIZE requires 1 argument");
         return make_integer(storage_size_bits(&args[0]));
+    }
+    if (strcmp(upper, "C_SIZEOF") == 0) {
+        long long bytes;
+        if (nargs < 1) ofort_error(I, "C_SIZEOF requires 1 argument");
+        bytes = storage_size_bits(&args[0]) / 8;
+        if (args[0].type == FVAL_ARRAY) bytes *= args[0].v.arr.len;
+        return make_integer_kind(bytes, 8);
     }
     if (strcmp(upper, "BTEST") == 0) {
         int kind, bits;
