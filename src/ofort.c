@@ -1640,6 +1640,9 @@ typedef struct {
 typedef struct {
     char name[128];
     char replacement[512];
+    int is_function;
+    int n_params;
+    char params[16][64];
 } OfortMacro;
 
 static void append_text(char **buf, size_t *len, size_t *cap, const char *text, size_t n) {
@@ -1674,6 +1677,107 @@ static int pp_macro_defined(OfortMacro *macros, int n_macros, const char *name, 
     return macro_index(macros, n_macros, name, name_len) >= 0;
 }
 
+static int pp_find_param(char params[][64], int n_params, const char *name, size_t name_len) {
+    for (int i = 0; i < n_params; i++) {
+        if (strlen(params[i]) == name_len && strncmp(params[i], name, name_len) == 0)
+            return i;
+    }
+    return -1;
+}
+
+static void append_macro_substituted_text(char **buf, size_t *len, size_t *cap,
+                                          OfortMacro *macros, int n_macros,
+                                          OfortMacro *macro,
+                                          char args[][512], int depth);
+static void append_macro_expanded_text(char **buf, size_t *len, size_t *cap,
+                                       OfortMacro *macros, int n_macros,
+                                       const char *text, size_t n, int depth);
+
+static int pp_parse_macro_call_args(const char **qptr, const char *end,
+                                    char args[][512], int *n_args) {
+    const char *q = *qptr;
+    int depth = 0;
+    int arg_len = 0;
+    *n_args = 0;
+    if (q >= end || *q != '(') return 0;
+    q++;
+    depth = 1;
+    while (q < end && depth > 0) {
+        char c = *q++;
+        if (c == '\'' || c == '"') {
+            char quote = c;
+            if (*n_args < 16 && arg_len < 511) args[*n_args][arg_len++] = c;
+            while (q < end) {
+                c = *q++;
+                if (*n_args < 16 && arg_len < 511) args[*n_args][arg_len++] = c;
+                if (c == quote) {
+                    if (q < end && *q == quote) {
+                        c = *q++;
+                        if (*n_args < 16 && arg_len < 511) args[*n_args][arg_len++] = c;
+                        continue;
+                    }
+                    break;
+                }
+            }
+        } else if (c == '(') {
+            depth++;
+            if (*n_args < 16 && arg_len < 511) args[*n_args][arg_len++] = c;
+        } else if (c == ')') {
+            depth--;
+            if (depth == 0) {
+                if (*n_args < 16) {
+                    while (arg_len > 0 && isspace((unsigned char)args[*n_args][arg_len - 1])) arg_len--;
+                    args[*n_args][arg_len] = '\0';
+                    (*n_args)++;
+                }
+                *qptr = q;
+                return 1;
+            }
+            if (*n_args < 16 && arg_len < 511) args[*n_args][arg_len++] = c;
+        } else if (c == ',' && depth == 1) {
+            if (*n_args < 16) {
+                while (arg_len > 0 && isspace((unsigned char)args[*n_args][arg_len - 1])) arg_len--;
+                args[*n_args][arg_len] = '\0';
+                (*n_args)++;
+            }
+            arg_len = 0;
+            while (q < end && isspace((unsigned char)*q)) q++;
+        } else {
+            if (*n_args < 16 && arg_len < 511) args[*n_args][arg_len++] = c;
+        }
+    }
+    return 0;
+}
+
+static void append_macro_substituted_text(char **buf, size_t *len, size_t *cap,
+                                          OfortMacro *macros, int n_macros,
+                                          OfortMacro *macro,
+                                          char args[][512], int depth) {
+    const char *q = macro->replacement;
+    const char *end = macro->replacement + strlen(macro->replacement);
+    if (depth > 16) {
+        append_text(buf, len, cap, macro->replacement, strlen(macro->replacement));
+        return;
+    }
+    while (q < end) {
+        if (isalpha((unsigned char)*q) || *q == '_') {
+            const char *id_start = q;
+            int pi;
+            q++;
+            while (q < end && (isalnum((unsigned char)*q) || *q == '_')) q++;
+            pi = pp_find_param(macro->params, macro->n_params, id_start, (size_t)(q - id_start));
+            if (pi >= 0) {
+                append_macro_expanded_text(buf, len, cap, macros, n_macros,
+                                           args[pi], strlen(args[pi]), depth + 1);
+            } else {
+                append_text(buf, len, cap, id_start, (size_t)(q - id_start));
+            }
+        } else {
+            append_char_text(buf, len, cap, *q++);
+        }
+    }
+}
+
 static void append_macro_expanded_text(char **buf, size_t *len, size_t *cap,
                                        OfortMacro *macros, int n_macros,
                                        const char *text, size_t n, int depth) {
@@ -1691,10 +1795,25 @@ static void append_macro_expanded_text(char **buf, size_t *len, size_t *cap,
             while (q < end && (isalnum((unsigned char)*q) || *q == '_')) q++;
             mi = macro_index(macros, n_macros, id_start, (size_t)(q - id_start));
             if (mi >= 0) {
-                append_macro_expanded_text(buf, len, cap, macros, n_macros,
-                                           macros[mi].replacement,
-                                           strlen(macros[mi].replacement),
-                                           depth + 1);
+                if (macros[mi].is_function) {
+                    const char *after_id = q;
+                    char args[16][512] = {{0}};
+                    int n_args = 0;
+                    while (after_id < end && isspace((unsigned char)*after_id)) after_id++;
+                    if (pp_parse_macro_call_args(&after_id, end, args, &n_args) &&
+                        n_args == macros[mi].n_params) {
+                        append_macro_substituted_text(buf, len, cap, macros, n_macros,
+                                                      &macros[mi], args, depth + 1);
+                        q = after_id;
+                    } else {
+                        append_text(buf, len, cap, id_start, (size_t)(q - id_start));
+                    }
+                } else {
+                    append_macro_expanded_text(buf, len, cap, macros, n_macros,
+                                               macros[mi].replacement,
+                                               strlen(macros[mi].replacement),
+                                               depth + 1);
+                }
             } else {
                 append_text(buf, len, cap, id_start, (size_t)(q - id_start));
             }
@@ -1774,6 +1893,8 @@ static char *preprocess_source(OfortInterpreter *I, const char *source) {
         while (q < line_end && (*q == ' ' || *q == '\t')) q++;
 
         if (q < line_end && *q == '#') {
+            if (I && I->standard_mode == OFORT_STD_F2023)
+                ofort_error(I, "Preprocessor directives are not valid Fortran 2023; run a preprocessor before using --std=f2023");
             q++;
             while (q < line_end && (*q == ' ' || *q == '\t')) q++;
             if ((size_t)(line_end - q) >= 6 && strncmp(q, "define", 6) == 0 &&
@@ -1790,8 +1911,34 @@ static char *preprocess_source(OfortInterpreter *I, const char *source) {
                 q++;
                 while (q < line_end && (isalnum((unsigned char)*q) || *q == '_')) q++;
                 name_end = q;
-                if (q < line_end && *q == '(')
-                    ofort_error(I, "Unsupported function-like #define");
+                int is_function = 0;
+                int n_params = 0;
+                char params[16][64] = {{0}};
+                if (q < line_end && *q == '(') {
+                    is_function = 1;
+                    q++;
+                    while (q < line_end && *q != ')') {
+                        const char *ps;
+                        const char *pe;
+                        while (q < line_end && isspace((unsigned char)*q)) q++;
+                        if (q < line_end && *q == ')') break;
+                        ps = q;
+                        if (!(q < line_end && (isalpha((unsigned char)*q) || *q == '_')))
+                            ofort_error(I, "Invalid function-like #define parameter");
+                        q++;
+                        while (q < line_end && (isalnum((unsigned char)*q) || *q == '_')) q++;
+                        pe = q;
+                        if (n_params >= 16) ofort_error(I, "Too many function-like #define parameters");
+                        if ((size_t)(pe - ps) >= sizeof(params[0])) ofort_error(I, "#define parameter is too long");
+                        memcpy(params[n_params], ps, (size_t)(pe - ps));
+                        params[n_params][pe - ps] = '\0';
+                        n_params++;
+                        while (q < line_end && isspace((unsigned char)*q)) q++;
+                        if (q < line_end && *q == ',') q++;
+                    }
+                    if (!(q < line_end && *q == ')')) ofort_error(I, "Unterminated function-like #define parameter list");
+                    q++;
+                }
                 while (q < line_end && (*q == ' ' || *q == '\t')) q++;
                 rep_start = q;
                 rep_end = line_end;
@@ -1808,6 +1955,10 @@ static char *preprocess_source(OfortInterpreter *I, const char *source) {
                         macros[n_macros].name[name_len] = '\0';
                         memcpy(macros[n_macros].replacement, rep_start, rep_len);
                         macros[n_macros].replacement[rep_len] = '\0';
+                        macros[n_macros].is_function = is_function;
+                        macros[n_macros].n_params = n_params;
+                        for (int pi = 0; pi < n_params; pi++)
+                            copy_cstr(macros[n_macros].params[pi], sizeof(macros[n_macros].params[pi]), params[pi]);
                         n_macros++;
                     }
                 }
@@ -1938,11 +2089,27 @@ static char *preprocess_source(OfortInterpreter *I, const char *source) {
                     while (q < line_end && (isalnum((unsigned char)*q) || *q == '_')) q++;
                     mi = macro_index(macros, n_macros, id_start, (size_t)(q - id_start));
                     if (mi >= 0) {
-                        append_macro_expanded_text(&out, &out_len, &out_cap,
-                                                   macros, n_macros,
-                                                   macros[mi].replacement,
-                                                   strlen(macros[mi].replacement),
-                                                   0);
+                        if (macros[mi].is_function) {
+                            const char *after_id = q;
+                            char args[16][512] = {{0}};
+                            int n_args = 0;
+                            while (after_id < line_end && isspace((unsigned char)*after_id)) after_id++;
+                            if (pp_parse_macro_call_args(&after_id, line_end, args, &n_args) &&
+                                n_args == macros[mi].n_params) {
+                                append_macro_substituted_text(&out, &out_len, &out_cap,
+                                                              macros, n_macros,
+                                                              &macros[mi], args, 0);
+                                q = after_id;
+                            } else {
+                                append_text(&out, &out_len, &out_cap, id_start, (size_t)(q - id_start));
+                            }
+                        } else {
+                            append_macro_expanded_text(&out, &out_len, &out_cap,
+                                                       macros, n_macros,
+                                                       macros[mi].replacement,
+                                                       strlen(macros[mi].replacement),
+                                                       0);
+                        }
                     } else {
                         append_text(&out, &out_len, &out_cap, id_start, (size_t)(q - id_start));
                     }
@@ -5790,10 +5957,9 @@ static OfortNode *parse_intent_statement(OfortInterpreter *I) {
 
 static OfortNode *parse_attribute_name_list_statement(OfortInterpreter *I) {
     OfortToken *et = advance(I); /* attribute keyword */
-    int create_decl = token_ident_upper(et, "TARGET");
-    OfortNode *n = alloc_node(I, create_decl ? FND_BLOCK : FND_CONTINUE);
-    int cap = 0;
+    OfortNode *n = alloc_node(I, FND_ATTR_STMT);
     n->line = et->line;
+    copy_cstr(n->name, sizeof(n->name), token_name_text(et));
 
     if (check(I, FTOK_DCOLON)) advance(I);
     while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
@@ -5801,24 +5967,10 @@ static OfortNode *parse_attribute_name_list_statement(OfortInterpreter *I) {
             advance(I);
             continue;
         }
-        if (create_decl && token_can_be_name(peek(I))) {
-            int has_type = 0;
+        if (token_can_be_name(peek(I))) {
             OfortToken *name = advance(I);
-            OfortNode *decl = alloc_node(I, FND_VARDECL);
-            copy_cstr(decl->name, sizeof(decl->name), token_name_text(name));
-            decl->line = name->line;
-            decl->val_type = implicit_type_for_name(I, decl->name, &has_type);
-            if (!has_type) decl->val_type = FVAL_REAL;
-            if (decl->val_type == FVAL_DERIVED) {
-                const char *type_name = implicit_type_name_for_name(I, decl->name);
-                if (type_name[0]) copy_cstr(decl->str_val, sizeof(decl->str_val), type_name);
-            }
-            if (n->n_stmts >= cap) {
-                cap = cap ? cap * 2 : 4;
-                n->stmts = (OfortNode **)realloc(n->stmts, sizeof(OfortNode *) * (size_t)cap);
-                if (!n->stmts) ofort_error(I, "Out of memory parsing attribute statement");
-            }
-            n->stmts[n->n_stmts++] = decl;
+            if (n->n_params >= OFORT_MAX_PARAMS) too_many_params_error(I, "attribute names");
+            copy_cstr(n->param_names[n->n_params++], sizeof(n->param_names[0]), token_name_text(name));
         } else {
             advance(I);
         }
@@ -7651,7 +7803,9 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     }
 
     if (token_ident_upper(t, "EXTERNAL") || token_ident_upper(t, "INTRINSIC") ||
-        token_ident_upper(t, "TARGET")) {
+        token_ident_upper(t, "TARGET") || token_ident_upper(t, "PROTECTED") ||
+        token_ident_upper(t, "VOLATILE") || token_ident_upper(t, "ASYNCHRONOUS") ||
+        token_ident_upper(t, "VALUE") || t->type == FTOK_ALLOCATABLE) {
         return parse_attribute_name_list_statement(I);
     }
 
@@ -14174,6 +14328,7 @@ static int check_semantics_is_spec_node(OfortNode *n) {
         case FND_TYPE_DEF:
         case FND_USE:
         case FND_INTERFACE:
+        case FND_ATTR_STMT:
         case FND_MODULE:
         case FND_SUBROUTINE:
         case FND_FUNCTION:
@@ -14992,6 +15147,37 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         pop_scope(I);
         free(public_names);
         free(private_names);
+        break;
+    }
+
+    case FND_ATTR_STMT: {
+        char attr[256];
+        str_upper(attr, n->name, sizeof(attr));
+        for (int ai = 0; ai < n->n_params; ai++) {
+            OfortVar *v = find_var_in_current_scope(I, n->param_names[ai]);
+            if (!v && (strcmp(attr, "TARGET") == 0 || strcmp(attr, "ALLOCATABLE") == 0 ||
+                       strcmp(attr, "PROTECTED") == 0)) {
+                int has_type = 0;
+                OfortValType t = implicit_type_for_name(I, n->param_names[ai], &has_type);
+                if (!has_type) t = FVAL_REAL;
+                v = declare_var(I, n->param_names[ai], default_value(t, 0));
+                v->declared_type = t;
+            }
+            if (!v) continue;
+            if (strcmp(attr, "TARGET") == 0) {
+                v->is_target = 1;
+            } else if (strcmp(attr, "ALLOCATABLE") == 0) {
+                v->is_allocatable = 1;
+                v->scalar_allocated = 0;
+                if (v->val.type == FVAL_ARRAY) v->val.v.arr.allocated = 0;
+                else if (v->val.type != FVAL_VOID) {
+                    free_value(&v->val);
+                    v->val = make_void_val();
+                }
+            } else if (strcmp(attr, "PROTECTED") == 0) {
+                v->is_protected = 1;
+            }
+        }
         break;
     }
 
@@ -17842,6 +18028,7 @@ static const char *intrinsic_names[] = {
     "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND", "TRANSFER",
     "BIT_SIZE", "STORAGE_SIZE", "BTEST", "IAND", "IEOR", "IOR", "IBCLR", "IBITS", "IBSET", "ISHFT", "ISHFTC", "DSHIFTL", "DSHIFTR", "MASKL", "MASKR",
     "MERGE_BITS", "BGE", "BGT", "BLE", "BLT",
+    "LGE", "LGT", "LLE", "LLT",
     "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE", "TINY", "NEAREST", "PRECISION", "RANGE", "RRSPACING", "SPACING", "SCALE",
     "SET_EXPONENT",
     "SELECTED_INT_KIND", "SELECTED_REAL_KIND",
@@ -17850,7 +18037,7 @@ static const char *intrinsic_names[] = {
     "CHAR", "ICHAR", "ACHAR", "IACHAR", "REPEAT",
     /* Array */
     "SIZE", "SHAPE", "RANK", "PACK", "UNPACK", "MERGE", "SUM", "PRODUCT", "REDUCE", "MAXVAL", "MINVAL", "MAXLOC", "MINLOC", "FINDLOC",
-    "DOT_PRODUCT", "MATMUL", "TRANSPOSE", "RESHAPE", "SPREAD", "EOSHIFT", "CSHIFT",
+    "DOT_PRODUCT", "MATMUL", "NORM2", "TRANSPOSE", "RESHAPE", "SPREAD", "EOSHIFT", "CSHIFT",
     "COUNT", "ANY", "ALL", "PARITY", "ALLOCATED", "ASSOCIATED", "NULL", "LBOUND", "UBOUND",
     /* Type conversion */
     "FLOAT", "DFLOAT", "SNGL", "LOGICAL",
@@ -19713,6 +19900,53 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         }
     }
 
+    if (strcmp(upper, "LGE") == 0 || strcmp(upper, "LGT") == 0 ||
+        strcmp(upper, "LLE") == 0 || strcmp(upper, "LLT") == 0) {
+        int s1_idx = intrinsic_arg_index(arg_names, nargs, "string_a");
+        int s2_idx = intrinsic_arg_index(arg_names, nargs, "string_b");
+        OfortValue *shape_arg = NULL;
+        if (s1_idx < 0) s1_idx = 0;
+        if (s2_idx < 0) s2_idx = 1;
+        if (nargs < 2 || s1_idx >= nargs || s2_idx >= nargs)
+            ofort_error(I, "%s requires 2 character arguments", upper);
+        if (args[s1_idx].type == FVAL_ARRAY) shape_arg = &args[s1_idx];
+        if (args[s2_idx].type == FVAL_ARRAY) {
+            if (!shape_arg) shape_arg = &args[s2_idx];
+            else if (args[s2_idx].v.arr.len != shape_arg->v.arr.len)
+                ofort_error(I, "%s array arguments have different sizes", upper);
+        }
+        if (shape_arg) {
+            OfortValue result = make_array(FVAL_LOGICAL, shape_arg->v.arr.dims, shape_arg->v.arr.n_dims);
+            for (int ri = 0; ri < result.v.arr.len; ri++) {
+                OfortValue av = args[s1_idx].type == FVAL_ARRAY ? array_element_value(&args[s1_idx], ri) : copy_value(args[s1_idx]);
+                OfortValue bv = args[s2_idx].type == FVAL_ARRAY ? array_element_value(&args[s2_idx], ri) : copy_value(args[s2_idx]);
+                char abuf[OFORT_MAX_STRLEN], bbuf[OFORT_MAX_STRLEN];
+                int cmp, ok;
+                value_to_string(I, av, abuf, sizeof(abuf));
+                value_to_string(I, bv, bbuf, sizeof(bbuf));
+                cmp = strcmp(abuf, bbuf);
+                ok = strcmp(upper, "LGE") == 0 ? cmp >= 0 :
+                     strcmp(upper, "LGT") == 0 ? cmp > 0 :
+                     strcmp(upper, "LLE") == 0 ? cmp <= 0 : cmp < 0;
+                free_value(&result.v.arr.data[ri]);
+                result.v.arr.data[ri] = make_logical(ok);
+                free_value(&av);
+                free_value(&bv);
+            }
+            return result;
+        } else {
+            char abuf[OFORT_MAX_STRLEN], bbuf[OFORT_MAX_STRLEN];
+            int cmp, ok;
+            value_to_string(I, args[s1_idx], abuf, sizeof(abuf));
+            value_to_string(I, args[s2_idx], bbuf, sizeof(bbuf));
+            cmp = strcmp(abuf, bbuf);
+            ok = strcmp(upper, "LGE") == 0 ? cmp >= 0 :
+                 strcmp(upper, "LGT") == 0 ? cmp > 0 :
+                 strcmp(upper, "LLE") == 0 ? cmp <= 0 : cmp < 0;
+            return make_logical(ok);
+        }
+    }
+
     if (nargs > 0 && args[0].type == FVAL_ARRAY && is_elemental_unary_intrinsic(upper)) {
         OfortValue result = copy_value(args[0]);
         result.v.arr.elem_type = elemental_result_type(upper, args[0].v.arr.elem_type);
@@ -21370,6 +21604,90 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             sum += val_to_real(args[0].v.arr.data[i]) * val_to_real(args[1].v.arr.data[i]);
         if (args[0].v.arr.elem_type == FVAL_INTEGER) return make_integer((long long)sum);
         return make_real(sum);
+    }
+    if (strcmp(upper, "NORM2") == 0) {
+        int x_idx = intrinsic_arg_index(arg_names, nargs, "x");
+        int dim_idx = intrinsic_arg_index(arg_names, nargs, "dim");
+        if (x_idx < 0) x_idx = 0;
+        if (dim_idx < 0 && nargs > 1) dim_idx = x_idx == 0 ? 1 : 0;
+        if (nargs < 1 || x_idx >= nargs) ofort_error(I, "NORM2 requires ARRAY");
+        if (args[x_idx].type != FVAL_ARRAY) return make_real(fabs(val_to_real(args[x_idx])));
+        OfortValue *array = &args[x_idx];
+        OfortValType result_type = array->v.arr.elem_type == FVAL_DOUBLE ? FVAL_DOUBLE : FVAL_REAL;
+        if (dim_idx >= 0 && dim_idx < nargs) {
+            int dim = (int)val_to_int(args[dim_idx]);
+            int rank = array->v.arr.n_dims;
+            int result_dims[7];
+            int result_rank = 0;
+            if (dim < 1 || dim > rank) ofort_error(I, "NORM2 DIM out of range");
+            for (int i = 0; i < rank; i++) {
+                if (i != dim - 1) result_dims[result_rank++] = array->v.arr.dims[i];
+            }
+            if (result_rank == 0) {
+                double sumsq = 0.0;
+                for (int i = 0; i < array->v.arr.len; i++) {
+                    OfortValue elem = array_element_value(array, i);
+                    double x = val_to_real(elem);
+                    sumsq += x * x;
+                    free_value(&elem);
+                }
+                return result_type == FVAL_DOUBLE ? make_double(sqrt(sumsq)) : make_real(sqrt(sumsq));
+            }
+            OfortValue result = make_array(result_type, result_dims, result_rank);
+            int result_len = result.v.arr.len;
+            int dim_extent = array->v.arr.dims[dim - 1];
+            int stride = 1;
+            for (int i = 0; i < dim - 1; i++) stride *= array->v.arr.dims[i];
+            for (int ri = 0; ri < result_len; ri++) {
+                int rem = ri;
+                int base = 0;
+                int out_axis = 0;
+                double sumsq = 0.0;
+                for (int axis = 0; axis < rank; axis++) {
+                    if (axis == dim - 1) continue;
+                    int coord = rem % result_dims[out_axis];
+                    rem /= result_dims[out_axis];
+                    {
+                        int axis_stride = 1;
+                        for (int si = 0; si < axis; si++) axis_stride *= array->v.arr.dims[si];
+                        base += coord * axis_stride;
+                    }
+                    out_axis++;
+                }
+                for (int k = 0; k < dim_extent; k++) {
+                    OfortValue elem = array_element_value(array, base + k * stride);
+                    double x = val_to_real(elem);
+                    sumsq += x * x;
+                    free_value(&elem);
+                }
+                free_value(&result.v.arr.data[ri]);
+                result.v.arr.data[ri] = result_type == FVAL_DOUBLE ? make_double(sqrt(sumsq)) : make_real(sqrt(sumsq));
+            }
+            return result;
+        } else {
+            double sumsq = 0.0;
+            if (array->v.arr.real_data &&
+                (array->v.arr.elem_type == FVAL_REAL || array->v.arr.elem_type == FVAL_DOUBLE)) {
+                for (int i = 0; i < array->v.arr.len; i++) {
+                    double x = array->v.arr.real_data[i];
+                    sumsq += x * x;
+                }
+            } else if (array->v.arr.int_data && array->v.arr.elem_type == FVAL_INTEGER) {
+                for (int i = 0; i < array->v.arr.len; i++) {
+                    double x = (double)array->v.arr.int_data[i];
+                    sumsq += x * x;
+                }
+            } else {
+                for (int i = 0; i < array->v.arr.len; i++) {
+                    OfortValue elem = array_element_value(array, i);
+                    double x = val_to_real(elem);
+                    sumsq += x * x;
+                    free_value(&elem);
+                }
+            }
+            if (array->v.arr.elem_type == FVAL_DOUBLE) return make_double(sqrt(sumsq));
+            return make_real(sqrt(sumsq));
+        }
     }
     if (strcmp(upper, "MATMUL") == 0) {
         if (nargs < 2) ofort_error(I, "MATMUL requires 2 arguments");
