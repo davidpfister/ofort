@@ -17531,7 +17531,7 @@ static const char *intrinsic_names[] = {
     /* Array */
     "SIZE", "SHAPE", "RANK", "PACK", "UNPACK", "MERGE", "SUM", "PRODUCT", "REDUCE", "MAXVAL", "MINVAL", "MAXLOC", "MINLOC", "FINDLOC",
     "DOT_PRODUCT", "MATMUL", "TRANSPOSE", "RESHAPE", "SPREAD", "EOSHIFT", "CSHIFT",
-    "COUNT", "ANY", "ALL", "ALLOCATED", "ASSOCIATED", "NULL", "LBOUND", "UBOUND",
+    "COUNT", "ANY", "ALL", "PARITY", "ALLOCATED", "ASSOCIATED", "NULL", "LBOUND", "UBOUND",
     /* Type conversion */
     "FLOAT", "DFLOAT", "SNGL", "LOGICAL",
     /* Command line */
@@ -21254,6 +21254,74 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             if (!val_to_logical(args[0].v.arr.data[i])) return make_logical(0);
         }
         return make_logical(1);
+    }
+    if (strcmp(upper, "PARITY") == 0) {
+        int array_idx = intrinsic_arg_index(arg_names, nargs, "array");
+        int dim_idx = intrinsic_arg_index(arg_names, nargs, "dim");
+        OfortValue *array;
+        if (array_idx < 0) array_idx = 0;
+        if (dim_idx < 0 && nargs > 1 && (!arg_names || arg_names[1][0] == '\0')) dim_idx = 1;
+        if (nargs <= array_idx) ofort_error(I, "PARITY requires ARRAY");
+        array = &args[array_idx];
+        if (array->type != FVAL_ARRAY) return make_logical(val_to_logical(*array));
+        if (dim_idx < 0) {
+            int parity = 0;
+            for (int i = 0; i < array->v.arr.len; i++) {
+                OfortValue elem = array_element_value(array, i);
+                parity ^= val_to_logical(elem) ? 1 : 0;
+                free_value(&elem);
+            }
+            return make_logical(parity);
+        } else {
+            int dim = (int)val_to_int(args[dim_idx]);
+            int rank = array->v.arr.n_dims;
+            int reduce_dim;
+            int result_rank = rank - 1;
+            int result_dims[7] = {0};
+            int result_len = 1;
+            int strides[7] = {0};
+            if (dim < 1 || dim > rank) ofort_error(I, "PARITY DIM is out of range");
+            reduce_dim = dim - 1;
+            for (int d = 0; d < rank; d++) {
+                if (d != reduce_dim) {
+                    result_dims[d < reduce_dim ? d : d - 1] = array->v.arr.dims[d];
+                    result_len *= array->v.arr.dims[d];
+                }
+            }
+            strides[0] = 1;
+            for (int d = 1; d < rank; d++) strides[d] = strides[d - 1] * array->v.arr.dims[d - 1];
+            if (result_rank == 0) {
+                int parity = 0;
+                for (int k = 0; k < array->v.arr.dims[reduce_dim]; k++) {
+                    OfortValue elem = array_element_value(array, k * strides[reduce_dim]);
+                    parity ^= val_to_logical(elem) ? 1 : 0;
+                    free_value(&elem);
+                }
+                return make_logical(parity);
+            } else {
+                OfortValue result = make_array(FVAL_LOGICAL, result_dims, result_rank);
+                for (int out = 0; out < result_len; out++) {
+                    int rem = out;
+                    int full_subs[7] = {0};
+                    int base_index = 0;
+                    int parity = 0;
+                    for (int rd = 0; rd < result_rank; rd++) {
+                        int sub = result_dims[rd] ? rem % result_dims[rd] : 0;
+                        if (result_dims[rd]) rem /= result_dims[rd];
+                        full_subs[rd < reduce_dim ? rd : rd + 1] = sub;
+                    }
+                    for (int d = 0; d < rank; d++) base_index += full_subs[d] * strides[d];
+                    for (int k = 0; k < array->v.arr.dims[reduce_dim]; k++) {
+                        OfortValue elem = array_element_value(array, base_index + k * strides[reduce_dim]);
+                        parity ^= val_to_logical(elem) ? 1 : 0;
+                        free_value(&elem);
+                    }
+                    free_value(&result.v.arr.data[out]);
+                    result.v.arr.data[out] = make_logical(parity);
+                }
+                return result;
+            }
+        }
     }
     if (strcmp(upper, "ALLOCATED") == 0) {
         if (args[0].type == FVAL_ARRAY) return make_logical(args[0].v.arr.allocated);
