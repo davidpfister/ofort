@@ -7,6 +7,7 @@
 #include <time.h>
 #include <math.h>
 #include <stdint.h>
+#include <sys/stat.h>
 
 #ifdef _WIN32
 #include <io.h>
@@ -2607,6 +2608,42 @@ static int has_glob_wildcard(const char *path) {
     return path && (strchr(path, '*') || strchr(path, '?'));
 }
 
+static int path_is_file(const char *path) {
+    struct stat st;
+    if (!path || stat(path, &st) != 0) return 0;
+    return (st.st_mode & S_IFDIR) == 0;
+}
+
+static int path_has_extension(const char *path) {
+    const char *slash1;
+    const char *slash2;
+    const char *base;
+    const char *dot;
+
+    if (!path || !path[0]) return 0;
+    slash1 = strrchr(path, '\\');
+    slash2 = strrchr(path, '/');
+    base = slash1 > slash2 ? slash1 + 1 : slash2 ? slash2 + 1 : path;
+    dot = strrchr(base, '.');
+    return dot && dot != base;
+}
+
+static char *resolve_source_path_shortcut(const char *arg) {
+    char candidate[2048];
+
+    if (!arg || !arg[0]) return copy_string(arg ? arg : "");
+    if (path_is_file(arg) || path_has_extension(arg)) return copy_string(arg);
+    if (snprintf(candidate, sizeof(candidate), "%s.f90", arg) >= (int)sizeof(candidate)) {
+        return copy_string(arg);
+    }
+    if (path_is_file(candidate)) return copy_string(candidate);
+    if (snprintf(candidate, sizeof(candidate), "%s.F90", arg) >= (int)sizeof(candidate)) {
+        return copy_string(arg);
+    }
+    if (path_is_file(candidate)) return copy_string(candidate);
+    return copy_string(arg);
+}
+
 static int path_is_absolute(const char *path) {
     if (!path || !path[0]) return 0;
     if (path[0] == '/' || path[0] == '\\') return 1;
@@ -2676,13 +2713,22 @@ static int path_list_add_manifest(PathList *list, const char *manifest_path) {
 }
 
 static int add_source_path_arg(PathList *list, const char *arg, int expand_globs) {
+    char *resolved;
+    int ok;
     if (arg && arg[0] == '@' && arg[1] != '\0') {
         return path_list_add_manifest(list, arg + 1);
     }
     if (expand_globs && has_glob_wildcard(arg)) {
         return 2;
     }
-    return path_list_add(list, arg);
+    if (expand_globs || has_glob_wildcard(arg)) {
+        return path_list_add(list, arg);
+    }
+    resolved = resolve_source_path_shortcut(arg);
+    if (!resolved) return 0;
+    ok = path_list_add(list, resolved);
+    free(resolved);
+    return ok;
 }
 
 #ifdef _WIN32
@@ -3900,14 +3946,26 @@ int main(int argc, char **argv) {
                 return 2;
             }
             if (strcmp(opt, "--load") == 0) {
-                load_path = argv[i];
+                load_path = resolve_source_path_shortcut(argv[i]);
             } else if (strcmp(opt, "--load-run") == 0) {
-                load_path = argv[i];
+                load_path = resolve_source_path_shortcut(argv[i]);
                 run_after_load = 1;
             } else if (strcmp(opt, "--check") == 0) {
-                syntax_check_path = argv[i];
+                syntax_check_path = resolve_source_path_shortcut(argv[i]);
             } else {
-                check_path = argv[i];
+                check_path = resolve_source_path_shortcut(argv[i]);
+            }
+            if ((strcmp(opt, "--load") == 0 || strcmp(opt, "--load-run") == 0) && !load_path) {
+                path_list_free(&source_paths);
+                return 2;
+            }
+            if (strcmp(opt, "--check") == 0 && !syntax_check_path) {
+                path_list_free(&source_paths);
+                return 2;
+            }
+            if (strcmp(opt, "--check-gfortran") == 0 && !check_path) {
+                path_list_free(&source_paths);
+                return 2;
             }
         } else if (argv[i][0] == '-') {
             print_usage(argv[0]);
