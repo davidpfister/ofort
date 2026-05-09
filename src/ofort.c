@@ -5659,6 +5659,9 @@ static OfortNode *parse_backspace_stmt(OfortInterpreter *I) {
                 if (str_eq_nocase(name, "unit")) {
                     n->children[0] = parse_expr(I);
                     n->n_children = 1;
+                } else if (str_eq_nocase(name, "iostat")) {
+                    n->children[4] = parse_expr(I);
+                    if (n->n_children < 5) n->n_children = 5;
                 } else {
                     parse_expr(I);
                 }
@@ -10198,12 +10201,17 @@ static void set_unit_file(OfortInterpreter *I, int unit, const char *path) {
     copy_cstr(entry->position, sizeof(entry->position), "asis");
 }
 
+static void default_unit_path(int unit, char *path, size_t path_size) {
+    if (!path || path_size == 0) return;
+    snprintf(path, path_size, "fort.%d", unit);
+}
+
 static OfortUnitFile *ensure_unit_file(OfortInterpreter *I, int unit, int for_write) {
     OfortUnitFile *entry = find_unit_file(I, unit);
     char path[64];
     if (entry) return entry;
     if (unit < 0 || unit == 5 || unit == 6) return NULL;
-    snprintf(path, sizeof(path), "fort.%d", unit);
+    default_unit_path(unit, path, sizeof(path));
     ofort_warning(I, I->current_line,
                   "warning: implicit external unit %d uses default file '%s'; prefer OPEN with FILE=",
                   unit, path);
@@ -17205,11 +17213,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         break;
 
     case FND_OPEN: {
-        if (!n->children[0] || !n->children[1])
-            ofort_error(I, "OPEN requires UNIT and FILE");
-        OfortValue fv = eval_node(I, n->children[1]);
+        if (!n->children[0])
+            ofort_error(I, "OPEN requires UNIT");
+        if (!n->children[1] && I->standard_mode == OFORT_STD_F2023)
+            ofort_error(I, "OPEN without FILE= is a legacy extension");
+        OfortValue fv = make_void_val();
         int unit;
         OfortUnitFile *entry;
+        char open_path[512];
         char access_opt[64];
         char form_opt[64];
         char action_opt[64];
@@ -17217,12 +17228,11 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         int recl = 0;
         int is_direct = 0;
         int is_formatted = 1;
+        open_path[0] = '\0';
         access_opt[0] = '\0';
         form_opt[0] = '\0';
         action_opt[0] = '\0';
         position_opt[0] = '\0';
-        if (fv.type != FVAL_CHARACTER)
-            ofort_error(I, "OPEN FILE must be CHARACTER");
         if (n->children[5]) {
             OfortValue av = eval_node(I, n->children[5]);
             if (av.type == FVAL_CHARACTER) {
@@ -17268,7 +17278,20 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             unit = (int)val_to_int(uv);
             free_value(&uv);
         }
-        set_unit_file(I, unit, fv.v.s ? fv.v.s : "");
+        if (n->children[1]) {
+            fv = eval_node(I, n->children[1]);
+            if (fv.type != FVAL_CHARACTER)
+                ofort_error(I, "OPEN FILE must be CHARACTER");
+            copy_trimmed_path(open_path, sizeof(open_path), fv.v.s ? fv.v.s : "");
+        } else {
+            if (unit < 0 || unit == 5 || unit == 6)
+                ofort_error(I, "OPEN without FILE= requires an external numeric unit");
+            default_unit_path(unit, open_path, sizeof(open_path));
+            ofort_warning(I, n->line,
+                          "warning: OPEN without FILE= uses legacy default file '%s'",
+                          open_path);
+        }
+        set_unit_file(I, unit, open_path);
         entry = find_unit_file(I, unit);
         if (entry) {
             entry->is_direct = is_direct;
@@ -17282,7 +17305,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         if (n->children[2]) {
             OfortValue sv = eval_node(I, n->children[2]);
             if (sv.type == FVAL_CHARACTER && sv.v.s && str_eq_nocase(sv.v.s, "replace")) {
-                FILE *fp = fopen(fv.v.s ? fv.v.s : "", "w");
+                FILE *fp = fopen(open_path, "w");
                 if (fp) fclose(fp);
             }
             free_value(&sv);
@@ -17457,6 +17480,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             ofort_error(I, "BACKSPACE requires a sequential file");
         }
         entry->stream_pos = previous_sequential_record_pos(entry->path, entry->stream_pos);
+        if (n->children[4] && n->children[4]->type == FND_IDENT) {
+            set_var(I, n->children[4]->name, make_integer(0));
+        }
         break;
     }
 
