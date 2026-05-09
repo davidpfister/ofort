@@ -15241,7 +15241,8 @@ static void check_semantics_node(OfortInterpreter *I, OfortNode *n) {
                 return;
             }
             if (!find_var(I, n->name) && !find_func(I, n->name) &&
-                !find_generic(I, n->name) && !is_intrinsic(n->name) &&
+                !find_generic(I, n->name) && !find_type_def(I, n->name) &&
+                !is_intrinsic(n->name) &&
                 !find_imported_extension_intrinsic(I, n->name) &&
                 current_scope_has_implicit_none(I)) {
                 ofort_error(I, "Undefined variable '%s' at line %d", n->name, n->line);
