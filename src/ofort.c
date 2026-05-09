@@ -4640,6 +4640,37 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
             expect(I, FTOK_RPAREN);
         }
 
+        if (vtype == FVAL_CHARACTER && check(I, FTOK_STAR)) {
+            advance(I);
+            if (check(I, FTOK_LPAREN)) {
+                advance(I);
+                if (check(I, FTOK_STAR)) {
+                    advance(I);
+                    decl->char_len = OFORT_MAX_STRLEN - 1;
+                    decl->char_len_expr = NULL;
+                } else if (check(I, FTOK_COLON)) {
+                    advance(I);
+                    decl->char_len = 0;
+                    decl->char_len_expr = NULL;
+                } else {
+                    decl->char_len_expr = parse_expr(I);
+                    if (decl->char_len_expr->type == FND_INT_LIT)
+                        decl->char_len = (int)decl->char_len_expr->int_val;
+                }
+                expect(I, FTOK_RPAREN);
+            } else {
+                if (check(I, FTOK_COLON)) {
+                    advance(I);
+                    decl->char_len = 0;
+                    decl->char_len_expr = NULL;
+                } else {
+                    OfortToken *len_tok = expect(I, FTOK_INT_LIT);
+                    decl->char_len = (int)len_tok->int_val;
+                    decl->char_len_expr = NULL;
+                }
+            }
+        }
+
         /* optional initialization: = expr */
         if (check(I, FTOK_ASSIGN)) {
             advance(I);
@@ -6930,6 +6961,9 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
             expect(I, FTOK_LPAREN);
             while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
                 if (check(I, FTOK_COLON)) {
+                    advance(I);
+                    decl_dims[n_decl_dims++] = 0;
+                } else if (check(I, FTOK_STAR)) {
                     advance(I);
                     decl_dims[n_decl_dims++] = 0;
                 } else {
