@@ -362,6 +362,7 @@ static int node_is_profiled_statement(const OfortNode *n) {
     case FND_OPEN:
     case FND_CLOSE:
     case FND_REWIND:
+    case FND_BACKSPACE:
     case FND_INQUIRE:
     case FND_SELECT_RANK:
     case FND_ALLOCATE:
@@ -2173,6 +2174,7 @@ static const KeywordEntry fortran_keywords[] = {
     {"SAVE", FTOK_SAVE}, {"DATA", FTOK_DATA},
     {"PRINT", FTOK_PRINT}, {"WRITE", FTOK_WRITE}, {"READ", FTOK_READ},
     {"OPEN", FTOK_OPEN}, {"CLOSE", FTOK_CLOSE}, {"REWIND", FTOK_REWIND},
+    {"BACKSPACE", FTOK_BACKSPACE},
     {"INQUIRE", FTOK_INQUIRE},
     {NULL, FTOK_EOF}
 };
@@ -2769,6 +2771,7 @@ static const char *token_type_name(OfortTokenType type) {
         case FTOK_OPEN: return "OPEN";
         case FTOK_CLOSE: return "CLOSE";
         case FTOK_REWIND: return "REWIND";
+        case FTOK_BACKSPACE: return "BACKSPACE";
         case FTOK_INQUIRE: return "INQUIRE";
         case FTOK_TRUE: return ".TRUE.";
         case FTOK_FALSE: return ".FALSE.";
@@ -2872,7 +2875,7 @@ static int token_can_be_name(OfortToken *t) {
                  t->type == FTOK_SUBROUTINE || t->type == FTOK_USE ||
                  t->type == FTOK_READ || t->type == FTOK_WRITE ||
                  t->type == FTOK_OPEN || t->type == FTOK_CLOSE ||
-                 t->type == FTOK_REWIND || t->type == FTOK_INQUIRE ||
+                 t->type == FTOK_REWIND || t->type == FTOK_BACKSPACE || t->type == FTOK_INQUIRE ||
                  t->type == FTOK_END || t->type == FTOK_STOP || t->type == FTOK_RETURN ||
                  t->type == FTOK_EXIT || t->type == FTOK_CYCLE ||
                  t->type == FTOK_ENTRY);
@@ -2923,6 +2926,7 @@ static const char *token_name_text(OfortToken *t) {
     if (t->type == FTOK_OPEN) return "open";
     if (t->type == FTOK_CLOSE) return "close";
     if (t->type == FTOK_REWIND) return "rewind";
+    if (t->type == FTOK_BACKSPACE) return "backspace";
     if (t->type == FTOK_INQUIRE) return "inquire";
     if (t->type == FTOK_END) return "end";
     if (t->type == FTOK_STOP) return "stop";
@@ -2957,6 +2961,7 @@ static const char *token_arg_name(OfortToken *t) {
     if (t->type == FTOK_OPEN) return "open";
     if (t->type == FTOK_CLOSE) return "close";
     if (t->type == FTOK_REWIND) return "rewind";
+    if (t->type == FTOK_BACKSPACE) return "backspace";
     if (t->type == FTOK_INQUIRE) return "inquire";
     if (t->type == FTOK_IN) return "in";
     if (t->type == FTOK_OUT) return "out";
@@ -5630,6 +5635,42 @@ static OfortNode *parse_rewind_stmt(OfortInterpreter *I) {
     return n;
 }
 
+static OfortNode *parse_backspace_stmt(OfortInterpreter *I) {
+    OfortToken *bt = advance(I); /* BACKSPACE */
+    OfortNode *n = alloc_node(I, FND_BACKSPACE);
+    n->line = bt->line;
+
+    if (check(I, FTOK_LPAREN)) {
+        advance(I);
+        while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+            if (check_keyword_arg(I)) {
+                const char *name = token_arg_name(advance(I));
+                advance(I); /* = */
+                if (str_eq_nocase(name, "unit")) {
+                    n->children[0] = parse_expr(I);
+                    n->n_children = 1;
+                } else {
+                    parse_expr(I);
+                }
+            } else if (!n->children[0]) {
+                n->children[0] = parse_expr(I);
+                n->n_children = 1;
+            } else {
+                parse_expr(I);
+            }
+            if (check(I, FTOK_COMMA)) advance(I);
+            else break;
+        }
+        expect(I, FTOK_RPAREN);
+    } else {
+        n->children[0] = parse_expr(I);
+        n->n_children = 1;
+    }
+
+    if (!n->children[0]) ofort_error(I, "BACKSPACE requires UNIT");
+    return n;
+}
+
 static OfortNode *parse_block_construct(OfortInterpreter *I) {
     OfortToken *bt = advance(I); /* BLOCK */
     OfortNode *n = alloc_node(I, FND_BLOCK_CONSTRUCT);
@@ -8025,6 +8066,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     if (t->type == FTOK_OPEN) { leave_spec_section(I); return parse_open_stmt(I); }
     if (t->type == FTOK_CLOSE) { leave_spec_section(I); return parse_close_stmt(I); }
     if (t->type == FTOK_REWIND) { leave_spec_section(I); return parse_rewind_stmt(I); }
+    if (t->type == FTOK_BACKSPACE) { leave_spec_section(I); return parse_backspace_stmt(I); }
     if (t->type == FTOK_INQUIRE) { leave_spec_section(I); return parse_inquire_stmt(I); }
 
     /* CALL */
@@ -10151,6 +10193,26 @@ static int file_size_bytes(const char *path, long long *size_out) {
     if (stat(path, &st) != 0) return 0;
     if (size_out) *size_out = (long long)st.st_size;
     return 1;
+}
+
+static int previous_sequential_record_pos(const char *path, int current_pos) {
+    FILE *fp;
+    int c;
+    int pos = 0;
+    int prev_start = 0;
+    int this_start = 0;
+    if (!path || !*path || current_pos <= 0) return 0;
+    fp = fopen(path, "rb");
+    if (!fp) return 0;
+    while (pos < current_pos && (c = fgetc(fp)) != EOF) {
+        pos++;
+        if (c == '\n' && pos < current_pos) {
+            prev_start = this_start;
+            this_start = pos;
+        }
+    }
+    fclose(fp);
+    return this_start > 0 ? this_start : prev_start;
 }
 
 static OfortUnitFile *find_unit_by_file(OfortInterpreter *I, const char *path) {
@@ -14551,6 +14613,7 @@ static const char *io_statement_name(OfortNodeType type) {
         case FND_OPEN: return "OPEN";
         case FND_CLOSE: return "CLOSE";
         case FND_REWIND: return "REWIND";
+        case FND_BACKSPACE: return "BACKSPACE";
         case FND_INQUIRE: return "INQUIRE";
         default: return NULL;
     }
@@ -17290,6 +17353,20 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         if (!entry) entry = ensure_unit_file(I, unit, 0);
         if (!entry) ofort_error(I, "Unit %d is not open", unit);
         entry->stream_pos = 0;
+        break;
+    }
+
+    case FND_BACKSPACE: {
+        OfortValue uv = eval_node(I, n->children[0]);
+        int unit = (int)val_to_int(uv);
+        OfortUnitFile *entry = find_unit_file(I, unit);
+        free_value(&uv);
+        if (!entry) entry = ensure_unit_file(I, unit, 0);
+        if (!entry) ofort_error(I, "Unit %d is not open", unit);
+        if (entry->is_direct || strcmp(entry->access, "stream") == 0) {
+            ofort_error(I, "BACKSPACE requires a sequential file");
+        }
+        entry->stream_pos = previous_sequential_record_pos(entry->path, entry->stream_pos);
         break;
     }
 
