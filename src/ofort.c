@@ -234,6 +234,9 @@ struct OfortInterpreter {
     char decl_shape_name[256];
     int decl_shape_dims[7];
     int decl_shape_rank;
+    char decl_init_name[256];
+    OfortValType decl_init_type;
+    int decl_init_kind;
     /* node pool for memory management */
     OfortNode **node_pool;
     int node_pool_len;
@@ -5365,6 +5368,9 @@ static OfortNode *parse_data_statement(OfortInterpreter *I) {
             }
             continue;
         }
+        if (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
+            continue;
+        }
         break;
     }
 
@@ -9361,16 +9367,28 @@ static int decl_explicit_shape_dims(OfortInterpreter *I, OfortNode *decl, int *d
 
 static OfortValue eval_decl_initializer(OfortInterpreter *I, OfortNode *decl, OfortNode *expr) {
     char old_name[256];
+    char old_init_name[256];
     int old_dims[7];
     int old_rank;
+    OfortValType old_init_type;
+    int old_init_kind;
     int dims[7] = {0};
     int rank = 0;
     int set_shape_context = 0;
 
     if (!I || !expr) return make_void_val();
     copy_cstr(old_name, sizeof(old_name), I->decl_shape_name);
+    copy_cstr(old_init_name, sizeof(old_init_name), I->decl_init_name);
     memcpy(old_dims, I->decl_shape_dims, sizeof(old_dims));
     old_rank = I->decl_shape_rank;
+    old_init_type = I->decl_init_type;
+    old_init_kind = I->decl_init_kind;
+
+    if (decl && decl->name[0]) {
+        copy_cstr(I->decl_init_name, sizeof(I->decl_init_name), decl->name);
+        I->decl_init_type = decl->val_type;
+        I->decl_init_kind = decl->kind;
+    }
 
     if (decl && decl->n_dims > 0 &&
         node_contains_shape_of_name(expr, decl->name) &&
@@ -9388,6 +9406,9 @@ static OfortValue eval_decl_initializer(OfortInterpreter *I, OfortNode *decl, Of
         memcpy(I->decl_shape_dims, old_dims, sizeof(I->decl_shape_dims));
         I->decl_shape_rank = old_rank;
     }
+    copy_cstr(I->decl_init_name, sizeof(I->decl_init_name), old_init_name);
+    I->decl_init_type = old_init_type;
+    I->decl_init_kind = old_init_kind;
     return result;
 }
 
@@ -12447,6 +12468,10 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 case FND_MUL: res = a * b; break;
                 case FND_DIV:
                     if (b == 0) ofort_error(I, "Division by zero");
+                    if (a == LLONG_MIN && b == -1) {
+                        res = LLONG_MIN;
+                        break;
+                    }
                     res = a / b; break;
                 default: res = 0; break;
             }
@@ -12831,6 +12856,22 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 result.v.arr.data[i] = make_integer(I->decl_shape_dims[i]);
             }
             return result;
+        }
+
+        if (str_eq_nocase(n->name, "huge") && nargs == 1 &&
+            n->stmts[0]->type == FND_IDENT &&
+            I->decl_init_name[0] &&
+            str_eq_nocase(n->stmts[0]->name, I->decl_init_name)) {
+            int kind = I->decl_init_kind ? I->decl_init_kind : 4;
+            if (I->decl_init_type == FVAL_INTEGER) {
+                if (kind == 1) return make_integer_kind(127, 1);
+                if (kind == 2) return make_integer_kind(32767, 2);
+                if (kind == 8) return make_integer_kind(LLONG_MAX, 8);
+                if (kind == 16) return make_integer128(parse_int128_text("170141183460469231731687303715884105727"));
+                return make_integer_kind(2147483647LL, 4);
+            }
+            if (I->decl_init_type == FVAL_DOUBLE || kind == 8) return make_double(DBL_MAX);
+            return make_real(FLT_MAX);
         }
 
         /* Evaluate all args */
@@ -17240,12 +17281,22 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 }
                 OfortNode *assign = alloc_node(I, FND_ASSIGN);
                 OfortNode *rhs = data_node_from_values(I, vals, value_pos, needed);
+                OfortVar *protected_var = NULL;
+                int saved_protected = 0;
                 assign->children[0] = target_list[ti].target;
                 assign->children[1] = rhs;
                 assign->n_children = 2;
                 assign->line = n->line;
                 value_pos += needed;
+                if (assign->children[0] && assign->children[0]->type == FND_IDENT) {
+                    protected_var = find_var(I, assign->children[0]->name);
+                    if (protected_var) {
+                        saved_protected = protected_var->is_protected;
+                        protected_var->is_protected = 0;
+                    }
+                }
                 exec_node(I, assign);
+                if (protected_var) protected_var->is_protected = saved_protected;
             }
 
             if (value_pos != n_vals && !I->check_mode) {
@@ -21744,8 +21795,10 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (nargs < 2) ofort_error(I, "MOD requires 2 arguments");
         if (strcmp(upper, "MOD") == 0 && args[0].type == FVAL_INTEGER && args[1].type == FVAL_INTEGER) {
             long long b = val_to_int(args[1]);
+            long long a = val_to_int(args[0]);
             if (b == 0) ofort_error(I, "MOD: division by zero");
-            return make_integer(val_to_int(args[0]) % b);
+            if (a == LLONG_MIN && b == -1) return make_integer_kind(0, args[0].kind ? args[0].kind : 4);
+            return make_integer_kind(a % b, args[0].kind ? args[0].kind : 4);
         }
         return make_real(fmod(val_to_real(args[0]), val_to_real(args[1])));
     }
