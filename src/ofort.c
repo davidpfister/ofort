@@ -218,6 +218,9 @@ struct OfortInterpreter {
     OfortValue *where_mask;
     int where_mask_invert;
     int where_mask_index;
+    char decl_shape_name[256];
+    int decl_shape_dims[7];
+    int decl_shape_rank;
     /* node pool for memory management */
     OfortNode **node_pool;
     int node_pool_len;
@@ -8957,6 +8960,78 @@ static void infer_decl_dims_from_initializer(OfortInterpreter *I, OfortNode *n) 
     free_value(&init);
 }
 
+static int node_contains_shape_of_name(OfortNode *n, const char *name) {
+    if (!n || !name || !name[0]) return 0;
+    if (n->type == FND_FUNC_CALL && str_eq_nocase(n->name, "shape") &&
+        n->n_stmts > 0 && n->stmts && n->stmts[0] &&
+        n->stmts[0]->type == FND_IDENT &&
+        str_eq_nocase(n->stmts[0]->name, name)) {
+        return 1;
+    }
+    for (int i = 0; i < n->n_children; i++) {
+        if (node_contains_shape_of_name(n->children[i], name)) return 1;
+    }
+    for (int i = 0; i < n->n_stmts; i++) {
+        if (node_contains_shape_of_name(n->stmts[i], name)) return 1;
+    }
+    return 0;
+}
+
+static int decl_explicit_shape_dims(OfortInterpreter *I, OfortNode *decl, int *dims, int *rank) {
+    if (!I || !decl || !dims || !rank || decl->n_dims <= 0 || decl->n_dims > 7) return 0;
+    *rank = decl->n_dims;
+    for (int i = 0; i < decl->n_dims; i++) {
+        int lower = decl->has_lower_bound[i] ? decl->lower_bounds[i] : 1;
+        int extent = decl->dims[i];
+        if (decl->has_lower_bound[i] && decl->lower_bound_exprs[i]) {
+            OfortValue lv = eval_node(I, decl->lower_bound_exprs[i]);
+            lower = (int)val_to_int(lv);
+            free_value(&lv);
+        }
+        if (extent <= 0 && decl->stmts && i < decl->n_stmts && decl->stmts[i]) {
+            OfortValue dv = eval_node(I, decl->stmts[i]);
+            extent = (int)val_to_int(dv);
+            free_value(&dv);
+        }
+        if (decl->has_lower_bound[i]) extent = extent - lower + 1;
+        if (extent < 0) extent = 0;
+        dims[i] = extent;
+    }
+    return 1;
+}
+
+static OfortValue eval_decl_initializer(OfortInterpreter *I, OfortNode *decl, OfortNode *expr) {
+    char old_name[256];
+    int old_dims[7];
+    int old_rank;
+    int dims[7] = {0};
+    int rank = 0;
+    int set_shape_context = 0;
+
+    if (!I || !expr) return make_void_val();
+    copy_cstr(old_name, sizeof(old_name), I->decl_shape_name);
+    memcpy(old_dims, I->decl_shape_dims, sizeof(old_dims));
+    old_rank = I->decl_shape_rank;
+
+    if (decl && decl->n_dims > 0 &&
+        node_contains_shape_of_name(expr, decl->name) &&
+        decl_explicit_shape_dims(I, decl, dims, &rank)) {
+        copy_cstr(I->decl_shape_name, sizeof(I->decl_shape_name), decl->name);
+        memcpy(I->decl_shape_dims, dims, sizeof(I->decl_shape_dims));
+        I->decl_shape_rank = rank;
+        set_shape_context = 1;
+    }
+
+    OfortValue result = eval_node(I, expr);
+
+    if (set_shape_context) {
+        copy_cstr(I->decl_shape_name, sizeof(I->decl_shape_name), old_name);
+        memcpy(I->decl_shape_dims, old_dims, sizeof(I->decl_shape_dims));
+        I->decl_shape_rank = old_rank;
+    }
+    return result;
+}
+
 static int can_reuse_fast_local_array(OfortInterpreter *I, OfortNode *n) {
     return I && I->fast_mode && I->procedure_depth > 0 &&
            n && n->type == FND_VARDECL &&
@@ -12307,6 +12382,19 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 int char_len = implicit_char_len_for_name(I, n->stmts[0]->name);
                 return make_integer(char_len > 0 ? char_len : 1);
             }
+        }
+
+        if (str_eq_nocase(n->name, "shape") && nargs == 1 &&
+            n->stmts[0]->type == FND_IDENT &&
+            I->decl_shape_rank > 0 &&
+            str_eq_nocase(n->stmts[0]->name, I->decl_shape_name)) {
+            int result_dims[1] = {I->decl_shape_rank};
+            OfortValue result = make_array(FVAL_INTEGER, result_dims, 1);
+            for (int i = 0; i < I->decl_shape_rank; i++) {
+                free_value(&result.v.arr.data[i]);
+                result.v.arr.data[i] = make_integer(I->decl_shape_dims[i]);
+            }
+            return result;
         }
 
         /* Evaluate all args */
@@ -15892,7 +15980,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             break;
         }
         if (existing && n->type == FND_PARAMDECL && n->n_children > 0 && n->children[0]) {
-            val = eval_node(I, n->children[0]);
+            val = eval_decl_initializer(I, n, n->children[0]);
             val = coerce_assignment_value(I, n->name, existing->val.type, val);
             val = resize_character_value(val, existing->char_len);
             free_value(&existing->val);
@@ -15928,7 +16016,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         infer_decl_dims_from_initializer(I, n);
         if (n->is_pointer && n->n_dims > 0) {
             if (n->n_children > 0 && n->children[0]) {
-                val = eval_node(I, n->children[0]);
+                val = eval_decl_initializer(I, n, n->children[0]);
             } else {
                 val.type = FVAL_ARRAY;
                 memset(&val.v.arr, 0, sizeof(val.v.arr));
@@ -15963,7 +16051,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         } else if (n->is_allocatable) {
             val = make_void_val();
         } else if (n->n_children > 0 && n->children[0]) {
-            val = eval_node(I, n->children[0]);
+            val = eval_decl_initializer(I, n, n->children[0]);
         } else if (n->val_type == FVAL_DERIVED) {
             val = default_derived_value_with_params(I, n->str_val,
                                                     n->type_param_exprs,
@@ -15996,7 +16084,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         /* If there's an initializer and it's an array, set elements */
         if (n->n_dims > 0 && !n->is_allocatable && !n->is_pointer &&
             n->n_children > 0 && n->children[0]) {
-            OfortValue init = eval_node(I, n->children[0]);
+            OfortValue init = eval_decl_initializer(I, n, n->children[0]);
             if (init.type == FVAL_ARRAY) {
                 /* copy elements */
                 int count = init.v.arr.len < val.v.arr.len ? init.v.arr.len : val.v.arr.len;
