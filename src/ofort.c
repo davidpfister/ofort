@@ -29,6 +29,7 @@
 #endif
 
 #define OFORT_ALLOC_TARGET_CHILD (OFORT_MAX_CHILDREN - 1)
+#define OFORT_MAX_TYPE_ACTUALS 16
 #ifdef _WIN32
 #include <windows.h>
 #include <io.h>
@@ -101,6 +102,8 @@ typedef struct {
     OfortNode *field_char_len_exprs[OFORT_MAX_FIELDS];
     OfortNode *field_kind_exprs[OFORT_MAX_FIELDS];
     OfortNode *field_init_exprs[OFORT_MAX_FIELDS];
+    OfortNode *field_type_param_exprs[OFORT_MAX_FIELDS][OFORT_MAX_TYPE_ACTUALS];
+    int field_n_type_param_exprs[OFORT_MAX_FIELDS];
     int field_dims[OFORT_MAX_FIELDS][7];
     OfortNode *field_dim_exprs[OFORT_MAX_FIELDS][7];
     int field_n_dims[OFORT_MAX_FIELDS];
@@ -108,6 +111,7 @@ typedef struct {
     int field_is_allocatable[OFORT_MAX_FIELDS];
     int n_fields;
     char type_param_names[OFORT_MAX_PARAMS][64];
+    OfortNode *type_param_default_exprs[OFORT_MAX_PARAMS];
     int n_type_params;
     char binding_names[OFORT_MAX_PARAMS][256];
     char binding_proc_names[OFORT_MAX_PARAMS][256];
@@ -1606,6 +1610,69 @@ static void copy_var_payload_and_attrs(OfortVar *dst, const OfortVar *src) {
     copy_imported_var_attrs(dst, src);
 }
 
+static OfortValue make_named_derived_scalar(const char *type_name, long long tag) {
+    OfortValue v;
+    memset(&v, 0, sizeof(v));
+    v.type = FVAL_DERIVED;
+    v.v.dt.n_fields = 1;
+    v.v.dt.fields = (OfortValue *)calloc(1, sizeof(OfortValue));
+    v.v.dt.field_names = (char(*)[64])calloc(1, sizeof(char[64]));
+    copy_cstr(v.v.dt.type_name, sizeof(v.v.dt.type_name), type_name);
+    if (!v.v.dt.fields || !v.v.dt.field_names) {
+        free_value(&v);
+        return make_void_val();
+    }
+    copy_cstr(v.v.dt.field_names[0], sizeof(v.v.dt.field_names[0]), "tag");
+    v.v.dt.fields[0] = make_integer(tag);
+    return v;
+}
+
+static int ieee_name_kind(const char *name, const char **type_name, long long *tag) {
+    char upper[256];
+    str_upper(upper, name, sizeof(upper));
+    if (strcmp(upper, "IEEE_INVALID") == 0) { *type_name = "ieee_flag_type"; *tag = 1; return 1; }
+    if (strcmp(upper, "IEEE_OVERFLOW") == 0) { *type_name = "ieee_flag_type"; *tag = 2; return 1; }
+    if (strcmp(upper, "IEEE_DIVIDE_BY_ZERO") == 0) { *type_name = "ieee_flag_type"; *tag = 3; return 1; }
+    if (strcmp(upper, "IEEE_UNDERFLOW") == 0) { *type_name = "ieee_flag_type"; *tag = 4; return 1; }
+    if (strcmp(upper, "IEEE_INEXACT") == 0) { *type_name = "ieee_flag_type"; *tag = 5; return 1; }
+    if (strcmp(upper, "IEEE_USUAL") == 0) { *type_name = "ieee_round_type"; *tag = 10; return 1; }
+    if (strcmp(upper, "IEEE_OTHER") == 0) { *type_name = "ieee_round_type"; *tag = 15; return 1; }
+    if (strcmp(upper, "IEEE_NEAREST") == 0) { *type_name = "ieee_round_type"; *tag = 11; return 1; }
+    if (strcmp(upper, "IEEE_TO_ZERO") == 0) { *type_name = "ieee_round_type"; *tag = 12; return 1; }
+    if (strcmp(upper, "IEEE_UP") == 0) { *type_name = "ieee_round_type"; *tag = 13; return 1; }
+    if (strcmp(upper, "IEEE_DOWN") == 0) { *type_name = "ieee_round_type"; *tag = 14; return 1; }
+    return 0;
+}
+
+static void declare_ieee_name(OfortInterpreter *I, const char *local_name, const char *remote_name) {
+    const char *type_name = NULL;
+    long long tag = 0;
+    if (!ieee_name_kind(remote_name, &type_name, &tag)) return;
+    OfortVar *v = declare_var(I, local_name, make_named_derived_scalar(type_name, tag));
+    if (v) {
+        v->is_parameter = 1;
+        copy_cstr(v->declared_type_name, sizeof(v->declared_type_name), type_name);
+    }
+}
+
+static void declare_default_ieee_names(OfortInterpreter *I) {
+    const char *names[] = {
+        "ieee_invalid", "ieee_overflow", "ieee_divide_by_zero", "ieee_underflow", "ieee_inexact",
+        "ieee_usual", "ieee_nearest", "ieee_to_zero", "ieee_up", "ieee_down", "ieee_other", NULL
+    };
+    for (int i = 0; names[i]; i++) declare_ieee_name(I, names[i], names[i]);
+}
+
+static OfortNode *find_top_level_module_node(OfortInterpreter *I, const char *name) {
+    if (!I || !I->ast || !name || !name[0]) return NULL;
+    if (I->ast->type == FND_MODULE && str_eq_nocase(I->ast->name, name)) return I->ast;
+    for (int i = 0; i < I->ast->n_stmts; i++) {
+        OfortNode *s = I->ast->stmts[i];
+        if (s && s->type == FND_MODULE && str_eq_nocase(s->name, name)) return s;
+    }
+    return NULL;
+}
+
 static void sync_module_vars_from_scope(OfortInterpreter *I, const char *module_name) {
     if (!module_name || !module_name[0] || !I->current_scope) return;
     OfortModule *mod = find_module(I, module_name);
@@ -2181,6 +2248,7 @@ static const KeywordEntry fortran_keywords[] = {
     {"OPEN", FTOK_OPEN}, {"CLOSE", FTOK_CLOSE}, {"REWIND", FTOK_REWIND},
     {"BACKSPACE", FTOK_BACKSPACE},
     {"ENDFILE", FTOK_ENDFILE},
+    {"WAIT", FTOK_WAIT},
     {"INQUIRE", FTOK_INQUIRE},
     {NULL, FTOK_EOF}
 };
@@ -2778,6 +2846,7 @@ static const char *token_type_name(OfortTokenType type) {
         case FTOK_CLOSE: return "CLOSE";
         case FTOK_REWIND: return "REWIND";
         case FTOK_BACKSPACE: return "BACKSPACE";
+        case FTOK_WAIT: return "WAIT";
         case FTOK_ENDFILE: return "ENDFILE";
         case FTOK_INQUIRE: return "INQUIRE";
         case FTOK_TRUE: return ".TRUE.";
@@ -2882,7 +2951,7 @@ static int token_can_be_name(OfortToken *t) {
                  t->type == FTOK_SUBROUTINE || t->type == FTOK_USE ||
                  t->type == FTOK_READ || t->type == FTOK_WRITE ||
                  t->type == FTOK_OPEN || t->type == FTOK_CLOSE ||
-                 t->type == FTOK_REWIND || t->type == FTOK_BACKSPACE ||
+                 t->type == FTOK_REWIND || t->type == FTOK_BACKSPACE || t->type == FTOK_WAIT ||
                  t->type == FTOK_ENDFILE || t->type == FTOK_INQUIRE ||
                  t->type == FTOK_END || t->type == FTOK_STOP || t->type == FTOK_RETURN ||
                  t->type == FTOK_EXIT || t->type == FTOK_CYCLE ||
@@ -2935,6 +3004,7 @@ static const char *token_name_text(OfortToken *t) {
     if (t->type == FTOK_CLOSE) return "close";
     if (t->type == FTOK_REWIND) return "rewind";
     if (t->type == FTOK_BACKSPACE) return "backspace";
+    if (t->type == FTOK_WAIT) return "wait";
     if (t->type == FTOK_ENDFILE) return "endfile";
     if (t->type == FTOK_INQUIRE) return "inquire";
     if (t->type == FTOK_END) return "end";
@@ -2971,6 +3041,7 @@ static const char *token_arg_name(OfortToken *t) {
     if (t->type == FTOK_CLOSE) return "close";
     if (t->type == FTOK_REWIND) return "rewind";
     if (t->type == FTOK_BACKSPACE) return "backspace";
+    if (t->type == FTOK_WAIT) return "wait";
     if (t->type == FTOK_ENDFILE) return "endfile";
     if (t->type == FTOK_INQUIRE) return "inquire";
     if (t->type == FTOK_IN) return "in";
@@ -5684,6 +5755,45 @@ static OfortNode *parse_backspace_stmt(OfortInterpreter *I) {
     return n;
 }
 
+static OfortNode *parse_wait_stmt(OfortInterpreter *I) {
+    OfortToken *wt = advance(I); /* WAIT */
+    OfortNode *n = alloc_node(I, FND_WAIT);
+    n->line = wt->line;
+
+    if (check(I, FTOK_LPAREN)) {
+        advance(I);
+        while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+            if (check_keyword_arg(I)) {
+                const char *name = token_arg_name(advance(I));
+                advance(I); /* = */
+                if (str_eq_nocase(name, "unit")) {
+                    n->children[0] = parse_expr(I);
+                    n->n_children = 1;
+                } else if (str_eq_nocase(name, "iostat")) {
+                    n->children[4] = parse_expr(I);
+                    if (n->n_children < 5) n->n_children = 5;
+                } else {
+                    parse_expr(I);
+                }
+            } else if (!n->children[0]) {
+                n->children[0] = parse_expr(I);
+                n->n_children = 1;
+            } else {
+                parse_expr(I);
+            }
+            if (check(I, FTOK_COMMA)) advance(I);
+            else break;
+        }
+        expect(I, FTOK_RPAREN);
+    } else {
+        n->children[0] = parse_expr(I);
+        n->n_children = 1;
+    }
+
+    if (!n->children[0]) ofort_error(I, "WAIT requires UNIT");
+    return n;
+}
+
 static OfortNode *parse_endfile_stmt(OfortInterpreter *I) {
     OfortToken *et = advance(I); /* ENDFILE */
     OfortNode *n = alloc_node(I, FND_ENDFILE);
@@ -6769,6 +6879,7 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
     OfortNode *decl_lower_bound_exprs[7] = {0};
     int n_decl_dims = 0;
     OfortNode *type_param_exprs[OFORT_MAX_PARAMS] = {0};
+    char type_param_actual_names[OFORT_MAX_PARAMS][256] = {{0}};
     int n_type_param_exprs = 0;
     OfortNode *block;
     int cap = 0;
@@ -6780,10 +6891,11 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
         advance(I);
         while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
             OfortNode *param_expr;
+            char param_name[256] = "";
             if (n_type_param_exprs >= OFORT_MAX_PARAMS)
                 too_many_params_error(I, "parameterized derived type actual parameters");
             if (token_can_be_name(peek(I)) && peek_ahead(I, 1)->type == FTOK_ASSIGN) {
-                advance(I);
+                copy_cstr(param_name, sizeof(param_name), token_name_text(advance(I)));
                 advance(I);
             }
             if (check(I, FTOK_COLON)) {
@@ -6794,7 +6906,10 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
             } else {
                 param_expr = parse_expr(I);
             }
-            type_param_exprs[n_type_param_exprs++] = param_expr;
+            type_param_exprs[n_type_param_exprs] = param_expr;
+            if (param_name[0]) copy_cstr(type_param_actual_names[n_type_param_exprs],
+                                         sizeof(type_param_actual_names[0]), param_name);
+            n_type_param_exprs++;
             if (check(I, FTOK_COMMA)) advance(I);
             else break;
         }
@@ -6913,6 +7028,8 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
         decl->n_type_param_exprs = n_type_param_exprs;
         for (int pi = 0; pi < n_type_param_exprs; pi++) {
             decl->type_param_exprs[pi] = type_param_exprs[pi];
+            copy_cstr(decl->param_names[pi], sizeof(decl->param_names[0]),
+                      type_param_actual_names[pi]);
         }
         memcpy(decl->dims, decl_dims, sizeof(decl_dims));
         memcpy(decl->lower_bounds, decl_lower_bounds, sizeof(decl_lower_bounds));
@@ -8116,6 +8233,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     if (t->type == FTOK_CLOSE) { leave_spec_section(I); return parse_close_stmt(I); }
     if (t->type == FTOK_REWIND) { leave_spec_section(I); return parse_rewind_stmt(I); }
     if (t->type == FTOK_BACKSPACE) { leave_spec_section(I); return parse_backspace_stmt(I); }
+    if (t->type == FTOK_WAIT) { leave_spec_section(I); return parse_wait_stmt(I); }
     if (t->type == FTOK_ENDFILE) { leave_spec_section(I); return parse_endfile_stmt(I); }
     if (t->type == FTOK_INQUIRE) { leave_spec_section(I); return parse_inquire_stmt(I); }
 
@@ -8541,8 +8659,15 @@ static OfortValue make_array_with_char_len(OfortValType elem_type, int *dims, in
 static int assign_packed_array_element(OfortValue *arr, int index, OfortValue rhs);
 static OfortValue array_element_value(const OfortValue *arr, int index);
 static OfortValue make_derived_array(OfortInterpreter *I, const char *type_name, int *dims, int n_dims);
+static OfortValue make_derived_array_with_params(OfortInterpreter *I, const char *type_name,
+                                                 OfortNode **param_exprs,
+                                                 char param_names[OFORT_MAX_PARAMS][256],
+                                                 int n_param_exprs,
+                                                 int *dims, int n_dims);
 static OfortValue default_derived_value_with_params(OfortInterpreter *I, const char *type_name,
-                                                    OfortNode **param_exprs, int n_param_exprs);
+                                                    OfortNode **param_exprs,
+                                                    char param_names[OFORT_MAX_PARAMS][256],
+                                                    int n_param_exprs);
 
 static OfortValue default_derived_value(OfortInterpreter *I, const char *type_name) {
     OfortTypeDef *td = find_type_def(I, type_name);
@@ -8607,14 +8732,20 @@ static OfortValue default_derived_value(OfortInterpreter *I, const char *type_na
             v.v.dt.fields[i] = make_void_val();
         } else if (td->field_n_dims[i] > 0) {
             if (field_type == FVAL_DERIVED && td->field_type_names[i][0]) {
-                v.v.dt.fields[i] = make_derived_array(I, td->field_type_names[i],
-                                                       field_dims, td->field_n_dims[i]);
+                v.v.dt.fields[i] = make_derived_array_with_params(I, td->field_type_names[i],
+                                                                  td->field_type_param_exprs[i],
+                                                                  NULL,
+                                                                  td->field_n_type_param_exprs[i],
+                                                                  field_dims, td->field_n_dims[i]);
             } else {
                 v.v.dt.fields[i] = make_array_with_char_len(field_type, field_dims,
                                                             td->field_n_dims[i], field_char_len);
             }
         } else if (field_type == FVAL_DERIVED && td->field_type_names[i][0]) {
-            v.v.dt.fields[i] = default_derived_value_with_params(I, td->field_type_names[i], NULL, 0);
+            v.v.dt.fields[i] = default_derived_value_with_params(I, td->field_type_names[i],
+                                                                 td->field_type_param_exprs[i],
+                                                                 NULL,
+                                                                 td->field_n_type_param_exprs[i]);
         } else {
             v.v.dt.fields[i] = default_value(field_type, field_char_len);
             if (field_kind > 0) v.v.dt.fields[i].kind = field_kind;
@@ -8670,26 +8801,46 @@ static OfortValue default_derived_value(OfortInterpreter *I, const char *type_na
 }
 
 static OfortValue default_derived_value_with_params(OfortInterpreter *I, const char *type_name,
-                                                    OfortNode **param_exprs, int n_param_exprs) {
+                                                    OfortNode **param_exprs,
+                                                    char param_names[OFORT_MAX_PARAMS][256],
+                                                    int n_param_exprs) {
     OfortTypeDef *td = find_type_def(I, type_name);
     OfortValue param_vals[OFORT_MAX_PARAMS];
-    int n_params;
     OfortValue result;
     if (!td) return make_void_val();
-    n_params = td->n_type_params < n_param_exprs ? td->n_type_params : n_param_exprs;
-    for (int i = 0; i < n_params; i++) {
-        param_vals[i] = eval_node(I, param_exprs[i]);
+    for (int i = 0; i < td->n_type_params && i < OFORT_MAX_PARAMS; i++) {
+        if (td->type_param_default_exprs[i]) {
+            param_vals[i] = eval_node(I, td->type_param_default_exprs[i]);
+        } else {
+            param_vals[i] = make_integer(1);
+        }
     }
-    if (n_params > 0) {
+    for (int i = 0; i < n_param_exprs && i < OFORT_MAX_PARAMS; i++) {
+        int target = i;
+        if (param_names && param_names[i][0]) {
+            target = -1;
+            for (int j = 0; j < td->n_type_params; j++) {
+                if (str_eq_nocase(param_names[i], td->type_param_names[j])) {
+                    target = j;
+                    break;
+                }
+            }
+            if (target < 0) continue;
+        }
+        if (target >= td->n_type_params) continue;
+        free_value(&param_vals[target]);
+        param_vals[target] = eval_node(I, param_exprs[i]);
+    }
+    if (td->n_type_params > 0) {
         push_scope(I);
-        for (int i = 0; i < n_params; i++) {
+        for (int i = 0; i < td->n_type_params && i < OFORT_MAX_PARAMS; i++) {
             declare_var(I, td->type_param_names[i], copy_value(param_vals[i]));
         }
     }
     result = default_derived_value(I, type_name);
-    if (n_params > 0) {
+    if (td->n_type_params > 0) {
         pop_scope(I);
-        for (int i = 0; i < n_params; i++) free_value(&param_vals[i]);
+        for (int i = 0; i < td->n_type_params && i < OFORT_MAX_PARAMS; i++) free_value(&param_vals[i]);
     }
     return result;
 }
@@ -8790,25 +8941,24 @@ static OfortValue *member_lvalue(OfortInterpreter *I, OfortNode *n) {
 }
 
 static int assign_derived_array_member(OfortInterpreter *I, OfortNode *lhs, OfortValue *rhs) {
-    OfortVar *var;
+    OfortValue *array_obj;
     int field_idx;
     OfortValue *first_field;
-    if (!lhs || lhs->type != FND_MEMBER || !lhs->children[0] ||
-        lhs->children[0]->type != FND_IDENT) {
+    if (!lhs || lhs->type != FND_MEMBER || !lhs->children[0]) {
         return 0;
     }
-    var = find_var(I, lhs->children[0]->name);
-    if (!var || var->val.type != FVAL_ARRAY || !var->val.v.arr.data ||
-        var->val.v.arr.len <= 0 || var->val.v.arr.data[0].type != FVAL_DERIVED) {
+    array_obj = member_lvalue(I, lhs->children[0]);
+    if (!array_obj || array_obj->type != FVAL_ARRAY || !array_obj->v.arr.data ||
+        array_obj->v.arr.len <= 0 || array_obj->v.arr.data[0].type != FVAL_DERIVED) {
         return 0;
     }
-    field_idx = derived_field_index(&var->val.v.arr.data[0], lhs->name);
+    field_idx = derived_field_index(&array_obj->v.arr.data[0], lhs->name);
     if (field_idx < 0) ofort_error(I, "Unknown member '%s'", lhs->name);
-    first_field = &var->val.v.arr.data[0].v.dt.fields[field_idx];
-    if (rhs->type == FVAL_ARRAY && rhs->v.arr.len != var->val.v.arr.len)
+    first_field = &array_obj->v.arr.data[0].v.dt.fields[field_idx];
+    if (rhs->type == FVAL_ARRAY && rhs->v.arr.len != array_obj->v.arr.len)
         ofort_error(I, "Array assignment shape mismatch");
-    for (int i = 0; i < var->val.v.arr.len; i++) {
-        OfortValue *field = &var->val.v.arr.data[i].v.dt.fields[field_idx];
+    for (int i = 0; i < array_obj->v.arr.len; i++) {
+        OfortValue *field = &array_obj->v.arr.data[i].v.dt.fields[field_idx];
         OfortValue elem = rhs->type == FVAL_ARRAY ? array_element_value(rhs, i) : copy_value(*rhs);
         elem = coerce_assignment_value(I, lhs->name, first_field->type, elem);
         free_value(field);
@@ -8968,6 +9118,24 @@ static OfortValue make_derived_array(OfortInterpreter *I, const char *type_name,
     return v;
 }
 
+static OfortValue make_derived_array_with_params(OfortInterpreter *I, const char *type_name,
+                                                 OfortNode **param_exprs,
+                                                 char param_names[OFORT_MAX_PARAMS][256],
+                                                 int n_param_exprs,
+                                                 int *dims, int n_dims) {
+    OfortValue v = make_array(FVAL_DERIVED, dims, n_dims);
+    copy_cstr(v.v.arr.elem_type_name, sizeof(v.v.arr.elem_type_name), type_name);
+    if (v.v.arr.data) {
+        for (int i = 0; i < v.v.arr.len; i++) {
+            free_value(&v.v.arr.data[i]);
+            v.v.arr.data[i] = default_derived_value_with_params(I, type_name,
+                                                                param_exprs, param_names,
+                                                                n_param_exprs);
+        }
+    }
+    return v;
+}
+
 static OfortValue make_derived_array_from_decl(OfortInterpreter *I, OfortNode *n) {
     int dims[7];
     int lower_bounds[7];
@@ -9001,6 +9169,7 @@ static OfortValue make_derived_array_from_decl(OfortInterpreter *I, OfortNode *n
                 free_value(&arr.v.arr.data[i]);
                 arr.v.arr.data[i] = default_derived_value_with_params(I, n->str_val,
                                                                        n->type_param_exprs,
+                                                                       n->param_names,
                                                                        n->n_type_param_exprs);
             }
         }
@@ -12456,8 +12625,15 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
 
         if (str_eq_nocase(n->name, "associated")) {
             OfortVar *ptr;
-            if (nargs < 1 || n->stmts[0]->type != FND_IDENT)
-                ofort_error(I, "ASSOCIATED requires a pointer argument");
+            if (nargs < 1) ofort_error(I, "ASSOCIATED requires a pointer argument");
+            if (n->stmts[0]->type != FND_IDENT) {
+                OfortValue *target = member_lvalue(I, n->stmts[0]);
+                if (target) return make_logical(target->type != FVAL_VOID);
+                OfortValue av = eval_node(I, n->stmts[0]);
+                int present = av.type != FVAL_VOID;
+                free_value(&av);
+                return make_logical(present);
+            }
             ptr = find_var(I, n->stmts[0]->name);
             if (!ptr || !ptr->is_pointer) return make_logical(0);
             if (nargs == 1) return make_logical(ptr->pointer_associated);
@@ -14712,6 +14888,7 @@ static const char *io_statement_name(OfortNodeType type) {
         case FND_REWIND: return "REWIND";
         case FND_BACKSPACE: return "BACKSPACE";
         case FND_ENDFILE: return "ENDFILE";
+        case FND_WAIT: return "WAIT";
         case FND_INQUIRE: return "INQUIRE";
         default: return NULL;
     }
@@ -15470,6 +15647,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
     case FND_MODULE: {
         /* Register module: execute declarations, collect functions */
         if (I->n_modules >= OFORT_MAX_MODULES) ofort_error(I, "Too many modules");
+        if (find_module(I, n->name)) break;
         OfortModule *mod = &I->modules[I->n_modules++];
         char (*public_names)[256] = (char (*)[256])calloc(OFORT_MAX_PARAMS, sizeof(*public_names));
         char (*private_names)[256] = (char (*)[256])calloc(OFORT_MAX_PARAMS, sizeof(*private_names));
@@ -15580,6 +15758,17 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (strcmp(upper, mu) == 0) { mod = &I->modules[i]; break; }
         }
         if (!mod) {
+            OfortNode *late_module = find_top_level_module_node(I, n->name);
+            if (late_module) {
+                exec_node(I, late_module);
+                for (int i = 0; i < I->n_modules; i++) {
+                    char mu[256];
+                    str_upper(mu, I->modules[i].name, 256);
+                    if (strcmp(upper, mu) == 0) { mod = &I->modules[i]; break; }
+                }
+            }
+        }
+        if (!mod) {
             if (ofort_extension_module_exists(n->name)) {
                 if (n->n_params > 0) {
                     for (int i = 0; i < n->n_params; i++) {
@@ -15642,9 +15831,27 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 break;
             }
             if (strcmp(upper, "IEEE_ARITHMETIC") == 0) {
+                if (n->n_params > 0) {
+                    for (int i = 0; i < n->n_params; i++) {
+                        const char *local = n->param_names[i];
+                        const char *remote = n->binding_proc_names[i][0] ? n->binding_proc_names[i] : local;
+                        declare_ieee_name(I, local, remote);
+                    }
+                } else {
+                    declare_default_ieee_names(I);
+                }
                 break;
             }
             if (strcmp(upper, "IEEE_EXCEPTIONS") == 0 || strcmp(upper, "IEEE_FEATURES") == 0) {
+                if (n->n_params > 0) {
+                    for (int i = 0; i < n->n_params; i++) {
+                        const char *local = n->param_names[i];
+                        const char *remote = n->binding_proc_names[i][0] ? n->binding_proc_names[i] : local;
+                        declare_ieee_name(I, local, remote);
+                    }
+                } else {
+                    declare_default_ieee_names(I);
+                }
                 break;
             }
             if (strcmp(upper, "ISO_C_BINDING") == 0) {
@@ -15757,6 +15964,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 td->field_n_dims[i] = parent->field_n_dims[i];
                 td->field_is_pointer[i] = parent->field_is_pointer[i];
                 td->field_is_allocatable[i] = parent->field_is_allocatable[i];
+                td->field_n_type_param_exprs[i] = parent->field_n_type_param_exprs[i];
+                memcpy(td->field_type_param_exprs[i], parent->field_type_param_exprs[i],
+                       sizeof(td->field_type_param_exprs[i]));
                 memcpy(td->field_dims[i], parent->field_dims[i], sizeof(td->field_dims[i]));
                 memcpy(td->field_dim_exprs[i], parent->field_dim_exprs[i], sizeof(td->field_dim_exprs[i]));
             }
@@ -15765,11 +15975,20 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 copy_cstr(td->binding_names[i], sizeof(td->binding_names[i]), parent->binding_names[i]);
                 copy_cstr(td->binding_proc_names[i], sizeof(td->binding_proc_names[i]), parent->binding_proc_names[i]);
             }
+            td->n_type_params = parent->n_type_params;
+            for (int i = 0; i < parent->n_type_params && i < OFORT_MAX_PARAMS; i++) {
+                copy_cstr(td->type_param_names[i], sizeof(td->type_param_names[i]),
+                          parent->type_param_names[i]);
+                td->type_param_default_exprs[i] = parent->type_param_default_exprs[i];
+            }
         }
-        td->n_type_params = n->n_type_params;
         for (int i = 0; i < n->n_type_params && i < OFORT_MAX_PARAMS; i++) {
-            copy_cstr(td->type_param_names[i], sizeof(td->type_param_names[i]),
+            int target = td->n_type_params;
+            if (target >= OFORT_MAX_PARAMS) break;
+            copy_cstr(td->type_param_names[target], sizeof(td->type_param_names[target]),
                       n->type_param_names[i]);
+            td->type_param_default_exprs[target] = NULL;
+            td->n_type_params++;
         }
         for (int i = 0; i < n->n_params && i < OFORT_MAX_PARAMS; i++) {
             int binding_index = -1;
@@ -15807,7 +16026,16 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                                 break;
                             }
                         }
-                        if (is_type_param) continue;
+                        if (is_type_param) {
+                            for (int tp = 0; tp < td->n_type_params; tp++) {
+                                if (str_eq_nocase(d->name, td->type_param_names[tp])) {
+                                    td->type_param_default_exprs[tp] =
+                                        (d->n_children > 0 && d->children[0]) ? d->children[0] : NULL;
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
                         OfortValType field_type = d->val_type;
                         int kind_is_type_param = 0;
                         if (d->kind_expr && d->kind_expr->type == FND_IDENT) {
@@ -15834,6 +16062,11 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         td->field_char_lens[td->n_fields] = d->char_len;
                         td->field_char_len_exprs[td->n_fields] = d->char_len_expr;
                         td->field_kind_exprs[td->n_fields] = d->kind_expr;
+                        td->field_n_type_param_exprs[td->n_fields] =
+                            d->n_type_param_exprs < OFORT_MAX_TYPE_ACTUALS ? d->n_type_param_exprs : OFORT_MAX_TYPE_ACTUALS;
+                        for (int pi = 0; pi < d->n_type_param_exprs && pi < OFORT_MAX_TYPE_ACTUALS; pi++) {
+                            td->field_type_param_exprs[td->n_fields][pi] = d->type_param_exprs[pi];
+                        }
                         td->field_init_exprs[td->n_fields] =
                             (d->n_children > 0 && d->children[0]) ? d->children[0] : NULL;
                         if (d->is_pointer && td->field_init_exprs[td->n_fields]) {
@@ -15859,7 +16092,16 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         break;
                     }
                 }
-                if (is_type_param) continue;
+                if (is_type_param) {
+                    for (int tp = 0; tp < td->n_type_params; tp++) {
+                        if (str_eq_nocase(s->name, td->type_param_names[tp])) {
+                            td->type_param_default_exprs[tp] =
+                                (s->n_children > 0 && s->children[0]) ? s->children[0] : NULL;
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 OfortValType field_type = s->val_type;
                 int kind_is_type_param = 0;
                 if (s->kind_expr && s->kind_expr->type == FND_IDENT) {
@@ -15886,6 +16128,11 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 td->field_char_lens[td->n_fields] = s->char_len;
                 td->field_char_len_exprs[td->n_fields] = s->char_len_expr;
                 td->field_kind_exprs[td->n_fields] = s->kind_expr;
+                td->field_n_type_param_exprs[td->n_fields] =
+                    s->n_type_param_exprs < OFORT_MAX_TYPE_ACTUALS ? s->n_type_param_exprs : OFORT_MAX_TYPE_ACTUALS;
+                for (int pi = 0; pi < s->n_type_param_exprs && pi < OFORT_MAX_TYPE_ACTUALS; pi++) {
+                    td->field_type_param_exprs[td->n_fields][pi] = s->type_param_exprs[pi];
+                }
                 td->field_init_exprs[td->n_fields] =
                     (s->n_children > 0 && s->children[0]) ? s->children[0] : NULL;
                 if (s->is_pointer && td->field_init_exprs[td->n_fields]) {
@@ -16266,6 +16513,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         } else if (n->val_type == FVAL_DERIVED) {
             val = default_derived_value_with_params(I, n->str_val,
                                                     n->type_param_exprs,
+                                                    n->param_names,
                                                     n->n_type_param_exprs);
         } else {
             val = default_value(n->val_type, n->val_type == FVAL_CHARACTER ? decl_char_len : n->char_len);
@@ -17502,6 +17750,15 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         break;
     }
 
+    case FND_WAIT: {
+        OfortValue uv = eval_node(I, n->children[0]);
+        free_value(&uv);
+        if (n->children[4] && n->children[4]->type == FND_IDENT) {
+            set_var(I, n->children[4]->name, make_integer(0));
+        }
+        break;
+    }
+
     case FND_CALL: {
         char call_upper[256];
         str_upper(call_upper, n->name, 256);
@@ -18547,8 +18804,13 @@ unresolved_external_call_done:
             OfortNode *call = n->children[0];
             for (int i = 0; i < call->n_stmts; i++) {
                 OfortVar *v;
-                if (call->stmts[i]->type != FND_IDENT)
-                    ofort_error(I, "NULLIFY requires pointer variable arguments");
+                if (call->stmts[i]->type != FND_IDENT) {
+                    OfortValue *target = member_lvalue(I, call->stmts[i]);
+                    if (!target) continue;
+                    free_value(target);
+                    *target = make_void_val();
+                    continue;
+                }
                 v = find_var(I, call->stmts[i]->name);
                 if (!v || !v->is_pointer)
                     ofort_error(I, "NULLIFY argument is not a pointer");
@@ -18567,8 +18829,13 @@ unresolved_external_call_done:
             OfortNode *call = n->children[0];
             for (int i = 0; i < call->n_stmts; i++) {
                 OfortVar *v;
-                if (call->stmts[i]->type != FND_IDENT)
-                    ofort_error(I, "NULLIFY requires pointer variable arguments");
+                if (call->stmts[i]->type != FND_IDENT) {
+                    OfortValue *target = member_lvalue(I, call->stmts[i]);
+                    if (!target) continue;
+                    free_value(target);
+                    *target = make_void_val();
+                    continue;
+                }
                 v = find_var(I, call->stmts[i]->name);
                 if (!v || !v->is_pointer)
                     ofort_error(I, "NULLIFY argument is not a pointer");
@@ -18613,12 +18880,13 @@ static const char *intrinsic_names[] = {
     "DACOS", "DASIN",
     "CSQRT", "CEXP", "CSIN", "CCOS", "CABS",
     "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND", "TRANSFER",
-    "BIT_SIZE", "STORAGE_SIZE", "BTEST", "POPCNT", "POPPAR", "LEADZ", "TRAILZ", "IAND", "IEOR", "IOR", "IBCLR", "IBITS", "IBSET", "ISHFT", "ISHFTC", "SHIFTA", "SHIFTL", "SHIFTR", "DSHIFTL", "DSHIFTR", "MASKL", "MASKR",
+    "BIT_SIZE", "STORAGE_SIZE", "BTEST", "POPCNT", "POPPAR", "LEADZ", "TRAILZ", "IAND", "IEOR", "IOR", "IALL", "IANY", "IPARITY", "IBCLR", "IBITS", "IBSET", "ISHFT", "ISHFTC", "SHIFTA", "SHIFTL", "SHIFTR", "DSHIFTL", "DSHIFTR", "MASKL", "MASKR",
     "MERGE_BITS", "BGE", "BGT", "BLE", "BLT",
     "LGE", "LGT", "LLE", "LLT",
     "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE", "TINY", "NEAREST", "PRECISION", "RANGE", "RRSPACING", "SPACING", "SCALE",
     "SET_EXPONENT",
     "SELECTED_INT_KIND", "SELECTED_REAL_KIND", "IEEE_SELECTED_REAL_KIND", "SELECTED_CHAR_KIND",
+    "IEEE_SUPPORT_FLAG", "IEEE_SUPPORT_HALTING", "IEEE_SUPPORT_ROUNDING", "IEEE_ALL", "IEEE_USUAL",
     /* String */
     "LEN", "LEN_TRIM", "TRIM", "NEW_LINE", "ADJUSTL", "ADJUSTR", "INDEX", "SCAN", "VERIFY",
     "CHAR", "ICHAR", "ACHAR", "IACHAR", "REPEAT",
@@ -18630,7 +18898,7 @@ static const char *intrinsic_names[] = {
     /* Type conversion */
     "FLOAT", "DFLOAT", "SNGL", "LOGICAL",
     /* Command line */
-    "COMMAND_ARGUMENT_COUNT", "C_SIZEOF",
+    "COMMAND_ARGUMENT_COUNT", "C_SIZEOF", "IS_IOSTAT_END", "IS_IOSTAT_EOR",
     NULL
 };
 
@@ -20550,6 +20818,63 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     if (strcmp(upper, "NULL") == 0) {
         if (nargs > 1) ofort_error(I, "NULL accepts at most one MOLD argument");
         return make_void_val();
+    }
+    if (strcmp(upper, "IEEE_SUPPORT_FLAG") == 0 ||
+        strcmp(upper, "IEEE_SUPPORT_HALTING") == 0 ||
+        strcmp(upper, "IEEE_SUPPORT_ROUNDING") == 0) {
+        if (nargs < 1) ofort_error(I, "%s requires at least 1 argument", upper);
+        return make_logical(1);
+    }
+    if (strcmp(upper, "IEEE_ALL") == 0) {
+        int idx = 1;
+        if (nargs > 0) idx = (int)val_to_int(args[0]);
+        switch (idx) {
+            case 1: return make_named_derived_scalar("ieee_flag_type", 1);
+            case 2: return make_named_derived_scalar("ieee_flag_type", 2);
+            case 3: return make_named_derived_scalar("ieee_flag_type", 3);
+            case 4: return make_named_derived_scalar("ieee_flag_type", 4);
+            default: return make_named_derived_scalar("ieee_flag_type", 5);
+        }
+    }
+    if (strcmp(upper, "IEEE_USUAL") == 0) {
+        int idx = 1;
+        if (nargs > 0) idx = (int)val_to_int(args[0]);
+        switch (idx) {
+            case 1: return make_named_derived_scalar("ieee_round_type", 10);
+            case 2: return make_named_derived_scalar("ieee_round_type", 11);
+            case 3: return make_named_derived_scalar("ieee_round_type", 12);
+            case 4: return make_named_derived_scalar("ieee_round_type", 13);
+            default: return make_named_derived_scalar("ieee_round_type", 14);
+        }
+    }
+    if (strcmp(upper, "IS_IOSTAT_END") == 0 || strcmp(upper, "IS_IOSTAT_EOR") == 0) {
+        if (nargs < 1) ofort_error(I, "%s requires 1 argument", upper);
+        long long code = val_to_int(args[0]);
+        if (strcmp(upper, "IS_IOSTAT_END") == 0) return make_logical(code == -1);
+        return make_logical(code == -2);
+    }
+    if (strcmp(upper, "IALL") == 0 || strcmp(upper, "IANY") == 0 || strcmp(upper, "IPARITY") == 0) {
+        OfortValue array;
+        int has_value = 0;
+        long long result = 0;
+        if (nargs < 1 || args[0].type != FVAL_ARRAY)
+            ofort_error(I, "%s requires an integer array argument", upper);
+        array = args[0];
+        for (int i = 0; i < array.v.arr.len; i++) {
+            OfortValue elem = array_element_value(&array, i);
+            long long v = val_to_int(elem);
+            if (!has_value) {
+                result = v;
+                has_value = 1;
+            } else if (strcmp(upper, "IALL") == 0) {
+                result &= v;
+            } else {
+                result ^= v;
+            }
+            free_value(&elem);
+        }
+        if (!has_value) result = strcmp(upper, "IALL") == 0 ? -1LL : 0LL;
+        return make_integer(result);
     }
     if (strcmp(upper, "IS_CONTIGUOUS") == 0) {
         if (nargs < 1) ofort_error(I, "IS_CONTIGUOUS requires 1 argument");
