@@ -303,6 +303,7 @@ static OfortValue call_ofort_extension_intrinsic(OfortInterpreter *I, const char
                                                  OfortValue *args, int nargs);
 static int call_ofort_extension_subroutine(OfortInterpreter *I, OfortNode *n);
 static void value_to_string(OfortInterpreter *I, OfortValue v, char *buf, int bufsize);
+static OfortValue array_element_value(const OfortValue *arr, int index);
 static int assign_token_to_read_target(OfortInterpreter *I, OfortNode *target, const char *tok);
 static int paren_item_is_implied_do(OfortInterpreter *I);
 static int procedure_body_declares_name(OfortNode *body, const char *name);
@@ -866,6 +867,31 @@ static OfortValue coerce_assignment_value(OfortInterpreter *I, const char *name,
     return val;
 }
 
+static int character_value_would_truncate(const OfortValue *val, int char_len) {
+    if (!val || char_len <= 0) return 0;
+    if (val->type == FVAL_CHARACTER) {
+        return val->v.s && (int)strlen(val->v.s) > char_len;
+    }
+    if (val->type == FVAL_ARRAY && val->v.arr.elem_type == FVAL_CHARACTER) {
+        for (int i = 0; i < val->v.arr.len; i++) {
+            OfortValue elem = array_element_value(val, i);
+            int truncates = elem.type == FVAL_CHARACTER && elem.v.s && (int)strlen(elem.v.s) > char_len;
+            free_value(&elem);
+            if (truncates) return 1;
+        }
+    }
+    return 0;
+}
+
+static void warn_character_truncation(OfortInterpreter *I, const char *name,
+                                      const OfortValue *val, int char_len) {
+    if (!I || !I->print_expr_statements) return;
+    if (!character_value_would_truncate(val, char_len)) return;
+    ofort_warning(I, I->current_line,
+                  "warning: assigning CHARACTER value to CHARACTER(LEN=%d) variable '%s' truncates",
+                  char_len, name ? name : "");
+}
+
 static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) {
     /* look in current scope first */
     OfortScope *s = I->current_scope;
@@ -924,6 +950,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                 }
             }
             val = coerce_assignment_value(I, name, target_type, val);
+            if (target_type == FVAL_CHARACTER) warn_character_truncation(I, name, &val, assign_char_len);
             val = resize_character_value(val, assign_char_len);
             if (deferred_char_alloc) {
                 s->vars[i].scalar_allocated = 1;
@@ -992,6 +1019,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                     }
                 }
                 val = coerce_assignment_value(I, name, target_type, val);
+                if (target_type == FVAL_CHARACTER) warn_character_truncation(I, name, &val, assign_char_len);
                 val = resize_character_value(val, assign_char_len);
                 if (deferred_char_alloc) {
                     ps->vars[i].scalar_allocated = 1;
@@ -1025,8 +1053,11 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
         } else {
             val = coerce_assignment_value(I, name, implicit_type, val);
         }
-        val = resize_character_value(val, implicit_type == FVAL_CHARACTER ?
-                                     (implicit_char_len > 0 ? implicit_char_len : OFORT_MAX_STRLEN - 1) : 0);
+        if (implicit_type == FVAL_CHARACTER) {
+            int assign_char_len = implicit_char_len > 0 ? implicit_char_len : OFORT_MAX_STRLEN - 1;
+            warn_character_truncation(I, name, &val, assign_char_len);
+            val = resize_character_value(val, assign_char_len);
+        }
     }
     if (s->n_vars >= OFORT_MAX_VARS) ofort_error(I, "Too many variables");
     OfortVar *v = &s->vars[s->n_vars++];
@@ -9418,6 +9449,102 @@ static OfortValue make_array(OfortValType elem_type, int *dims, int n_dims) {
     return make_array_with_char_len(elem_type, dims, n_dims, 1);
 }
 
+static int value_declared_kind(const OfortValue *v) {
+    if (!v) return 4;
+    if (v->type == FVAL_ARRAY) {
+        if (v->kind > 0) return v->kind;
+        if (v->v.arr.data && v->v.arr.len > 0 && v->v.arr.data[0].kind > 0)
+            return v->v.arr.data[0].kind;
+        switch (v->v.arr.elem_type) {
+            case FVAL_DOUBLE: return 8;
+            case FVAL_CHARACTER: return 1;
+            default: return 4;
+        }
+    }
+    if (v->kind > 0) return v->kind;
+    if (v->type == FVAL_DOUBLE) return 8;
+    if (v->type == FVAL_CHARACTER) return 1;
+    return 4;
+}
+
+static int eval_optional_dim_arg(OfortInterpreter *I, OfortNode *call, int nargs) {
+    OfortValue dim_v;
+    int dim;
+    if (nargs < 2) return 0;
+    dim_v = eval_node(I, call->stmts[1]);
+    dim = (int)val_to_int(dim_v);
+    free_value(&dim_v);
+    return dim;
+}
+
+static OfortValue eval_inquiry_intrinsic_for_ident(OfortInterpreter *I, OfortNode *call, OfortVar *var) {
+    const char *name = call ? call->name : "";
+    OfortValue *val = var ? &var->val : NULL;
+    int nargs = call ? call->n_stmts : 0;
+    if (!call || !var || nargs < 1 || !call->stmts || call->stmts[0]->type != FND_IDENT) return make_void_val();
+
+    if (str_eq_nocase(name, "kind")) {
+        return make_integer(value_declared_kind(val));
+    }
+
+    if (str_eq_nocase(name, "rank")) {
+        return make_integer(val && val->type == FVAL_ARRAY ? val->v.arr.n_dims : 0);
+    }
+
+    if (str_eq_nocase(name, "size")) {
+        int dim;
+        if (!val || val->type != FVAL_ARRAY) return make_void_val();
+        if (nargs == 1) return make_integer(val->v.arr.len);
+        dim = eval_optional_dim_arg(I, call, nargs);
+        if (dim >= 1 && dim <= val->v.arr.n_dims) return make_integer(val->v.arr.dims[dim - 1]);
+        return make_integer(0);
+    }
+
+    if (str_eq_nocase(name, "shape")) {
+        int result_dims[1];
+        OfortValue result;
+        if (!val || val->type != FVAL_ARRAY) return make_void_val();
+        result_dims[0] = val->v.arr.n_dims;
+        result = make_array(FVAL_INTEGER, result_dims, 1);
+        for (int i = 0; i < val->v.arr.n_dims; i++) {
+            if (result.v.arr.data) {
+                free_value(&result.v.arr.data[i]);
+                result.v.arr.data[i] = make_integer(val->v.arr.dims[i]);
+            }
+        }
+        return result;
+    }
+
+    if (str_eq_nocase(name, "lbound") || str_eq_nocase(name, "ubound")) {
+        int want_upper = str_eq_nocase(name, "ubound");
+        int dim = eval_optional_dim_arg(I, call, nargs);
+        if (!val || val->type != FVAL_ARRAY) return make_void_val();
+        if (dim > 0) {
+            if (dim > val->v.arr.n_dims) return make_integer(0);
+            return make_integer(want_upper ?
+                                val->v.arr.lower_bounds[dim - 1] + val->v.arr.dims[dim - 1] - 1 :
+                                val->v.arr.lower_bounds[dim - 1]);
+        } else {
+            int result_dims[1];
+            OfortValue result;
+            result_dims[0] = val->v.arr.n_dims;
+            result = make_array(FVAL_INTEGER, result_dims, 1);
+            for (int i = 0; i < val->v.arr.n_dims; i++) {
+                long long bound = want_upper ?
+                                  val->v.arr.lower_bounds[i] + val->v.arr.dims[i] - 1 :
+                                  val->v.arr.lower_bounds[i];
+                if (result.v.arr.data) {
+                    free_value(&result.v.arr.data[i]);
+                    result.v.arr.data[i] = make_integer(bound);
+                }
+            }
+            return result;
+        }
+    }
+
+    return make_void_val();
+}
+
 static OfortValue make_derived_array(OfortInterpreter *I, const char *type_name, int *dims, int n_dims) {
     OfortValue v = make_array(FVAL_DERIVED, dims, n_dims);
     copy_cstr(v.v.arr.elem_type_name, sizeof(v.v.arr.elem_type_name), type_name);
@@ -13123,6 +13250,17 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             if (has_type && implicit_type == FVAL_CHARACTER) {
                 int char_len = implicit_char_len_for_name(I, n->stmts[0]->name);
                 return make_integer(char_len > 0 ? char_len : 1);
+            }
+        }
+
+        if ((str_eq_nocase(n->name, "kind") || str_eq_nocase(n->name, "size") ||
+             str_eq_nocase(n->name, "lbound") || str_eq_nocase(n->name, "ubound") ||
+             str_eq_nocase(n->name, "shape") || str_eq_nocase(n->name, "rank")) &&
+            nargs >= 1 && n->stmts[0]->type == FND_IDENT) {
+            OfortVar *inquiry_var = find_var(I, n->stmts[0]->name);
+            if (inquiry_var) {
+                OfortValue inquiry = eval_inquiry_intrinsic_for_ident(I, n, inquiry_var);
+                if (inquiry.type != FVAL_VOID) return inquiry;
             }
         }
 
@@ -17414,6 +17552,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (v && v->is_protected) ofort_error(I, "Cannot assign to PROTECTED variable '%s'", lhs->name);
             if (v && v->intent == 1) ofort_error(I, "Cannot assign to INTENT(IN) argument '%s'", lhs->name);
             if (v && v->val.type == FVAL_ARRAY) {
+                if (v->val.v.arr.elem_type == FVAL_CHARACTER) {
+                    warn_character_truncation(I, lhs->name, &rhs, v->char_len);
+                }
                 if (rhs.type == FVAL_ARRAY) {
                     if (!v->val.v.arr.allocated || v->val.v.arr.len == 0 ||
                         (v->is_allocatable && rhs.v.arr.len != v->val.v.arr.len)) {
