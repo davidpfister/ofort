@@ -15228,6 +15228,14 @@ static void validate_pure_procedure_tree(OfortInterpreter *I, OfortNode *proc, O
                            "Impure intrinsic subroutine '%s' is not allowed in PURE procedure '%s'",
                            n->name, proc->name);
     }
+    if (n->type == FND_FUNC_CALL) {
+        OfortFunc *func = find_func(I, n->name);
+        if (func && func->node && !func->node->is_pure) {
+            ofort_append_error(I, n->line > 0 ? n->line : proc->line,
+                               "Reference to impure function '%s' within PURE procedure '%s'",
+                               n->name, proc->name);
+        }
+    }
     validate_pure_assignment_target(I, proc, n, local_names, n_local_names);
     for (int i = 0; i < n->n_children; i++) {
         validate_pure_procedure_tree(I, proc, n->children[i], local_names, n_local_names);
@@ -15555,7 +15563,17 @@ static void check_semantics_node(OfortInterpreter *I, OfortNode *n) {
                     OfortNode *s = body->stmts[i];
                     if (s && (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION ||
                               s->type == FND_STMT_FUNCTION)) {
-                        exec_node(I, s);
+                        annotate_procedure_params(s);
+                        (void)register_func(I, s->name, s,
+                                            s->type == FND_FUNCTION || s->type == FND_STMT_FUNCTION);
+                    }
+                }
+                for (int i = 0; i < body->n_stmts; i++) {
+                    OfortNode *s = body->stmts[i];
+                    if (s && (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION ||
+                              s->type == FND_STMT_FUNCTION)) {
+                        validate_pure_procedure_node(I, s);
+                        validate_intent_in_assignments(I, s);
                     }
                 }
             }
@@ -15984,9 +16002,15 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 if (s && (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION ||
                           s->type == FND_STMT_FUNCTION)) {
                     annotate_procedure_params(s);
+                    (void)register_func(I, s->name, s, s->type == FND_FUNCTION || s->type == FND_STMT_FUNCTION);
+                }
+            }
+            for (int i = 0; i < body->n_stmts; i++) {
+                OfortNode *s = body->stmts[i];
+                if (s && (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION ||
+                          s->type == FND_STMT_FUNCTION)) {
                     validate_pure_procedure_node(I, s);
                     validate_intent_in_assignments(I, s);
-                    (void)register_func(I, s->name, s, s->type == FND_FUNCTION || s->type == FND_STMT_FUNCTION);
                 }
             }
             for (int i = 0; i < body->n_stmts; i++) {
@@ -16063,18 +16087,24 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
             for (int i = 0; i < body->n_stmts; i++) {
                 OfortNode *s = body->stmts[i];
+                if (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION ||
+                    s->type == FND_STMT_FUNCTION) {
+                    OfortFunc *func;
+                    annotate_procedure_params(s);
+                    func = register_func(I, s->name, s, s->type == FND_FUNCTION || s->type == FND_STMT_FUNCTION);
+                    copy_cstr(func->module_name, sizeof(func->module_name), mod->name);
+                }
+            }
+            for (int i = 0; i < body->n_stmts; i++) {
+                OfortNode *s = body->stmts[i];
                 if (s->type == FND_ACCESS) {
                     continue;
                 } else if (s->type == FND_INTERFACE) {
                     register_generic(I, s);
                 } else if (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION ||
                            s->type == FND_STMT_FUNCTION) {
-                    OfortFunc *func;
-                    annotate_procedure_params(s);
                     validate_pure_procedure_node(I, s);
                     validate_intent_in_assignments(I, s);
-                    func = register_func(I, s->name, s, s->type == FND_FUNCTION || s->type == FND_STMT_FUNCTION);
-                    copy_cstr(func->module_name, sizeof(func->module_name), mod->name);
                 } else if (s->type == FND_TYPE_DEF) {
                     exec_node(I, s);
                 } else {
