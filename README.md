@@ -471,6 +471,35 @@ against the current source buffer and prints its value. For example, after
 entering `x = 3`, a line containing only `x` displays `3` immediately. Bare
 expression lines are not added to the source buffer.
 
+The REPL also accepts two convenience forms for quick interactive work:
+
+```fortran
+let x = 2.5
+const n = 100
+```
+
+`let` infers a scalar type from the right-hand side, appends a standard
+declaration, and then appends an assignment. For example, `let x = 2.5` is
+stored as ordinary Fortran source equivalent to:
+
+```fortran
+real :: x
+x = 2.5
+```
+
+`const` infers a scalar named constant and stores a standard `PARAMETER`
+declaration. For example, `const n = 100` is stored as:
+
+```fortran
+integer, parameter :: n = 100
+```
+
+Use `let` only for the first definition of a variable; after that, use normal
+assignment such as `x = 3.0`. To change a named constant during a session, use
+`reconst name = value`, which replaces the earlier parameter declaration in the
+editable source buffer. These forms are REPL conveniences, not Fortran syntax,
+and saved/autosaved source uses standard Fortran declarations.
+
 The REPL preflights source after each entered program line. Lines with syntax
 errors, such as malformed declarations, are rejected and are not kept in the
 editable source buffer.
