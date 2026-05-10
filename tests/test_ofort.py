@@ -110,6 +110,238 @@ def test_keywords_can_be_variable_names_like_gfortran(tmp_path):
     assert result.stdout.split() == expected.stdout.split()
 
 
+def test_intent_in_assignment_rejected_by_check(tmp_path):
+    source = tmp_path / "xintent_in_assign.f90"
+    source.write_text(
+        """
+module m
+  implicit none
+contains
+  function f(i)
+    integer, intent(in) :: i
+    integer :: f
+    i = 2*i
+    f = i
+  end function f
+end module m
+
+program main
+  use m
+  implicit none
+  print *, f(3)
+end program main
+""",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), "--check", str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode != 0
+    assert "Cannot assign to INTENT(IN) argument 'i' in procedure 'f'" in result.stderr
+
+
+def test_check_uninitialized_option_rejects_uninitialized_variable_read(tmp_path):
+    source = tmp_path / "xundef.f90"
+    source.write_text(
+        """
+implicit none
+integer :: i
+print *, i
+end
+""",
+        encoding="utf-8",
+    )
+
+    default_result = subprocess.run(
+        [str(OFORT), str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert default_result.returncode == 0, default_result.stderr
+    assert default_result.stdout.split() == ["0"]
+
+    result = subprocess.run(
+        [str(OFORT), "--check-uninitialized", str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode != 0
+    assert "Variable 'i' is used before it is set" in result.stderr
+    assert "line 4: print *, i" in result.stderr
+
+    synonym_result = subprocess.run(
+        [str(OFORT), "--check-uninit", str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert synonym_result.returncode != 0
+    assert "Variable 'i' is used before it is set" in synonym_result.stderr
+
+
+def test_init_int_and_init_real_options_set_debug_defaults(tmp_path):
+    source = tmp_path / "xinit_debug.f90"
+    source.write_text(
+        """
+implicit none
+integer :: i, a(2)
+real :: x, r(2)
+double precision :: d
+print *, i, a
+print *, x, r
+print *, d
+end
+""",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), "--init-int", "-999", "--init-real", "-1.5", str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    assert result.stdout.split() == ["-999", "-999", "-999", "-1.5", "-1.5", "-1.5", "-1.5"]
+
+
+def test_init_real_accepts_nan(tmp_path):
+    source = tmp_path / "xinit_nan.f90"
+    source.write_text(
+        """
+implicit none
+real :: x
+double precision :: d
+print *, x /= x, d /= d
+end
+""",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), "--init-real", "nan", str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    assert result.stdout.split() == ["T", "T"]
+
+
+def test_init_char_option_sets_debug_defaults(tmp_path):
+    source = tmp_path / "xinit_char.f90"
+    source.write_text(
+        """
+implicit none
+character(len=5) :: s
+character(len=3) :: a(2)
+character(len=4) :: explicit = "ok"
+print *, "[" // s // "]"
+print *, "[" // a(1) // "]", "[" // a(2) // "]"
+print *, "[" // trim(explicit) // "]"
+end
+""",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), "--init-char", "?", str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    assert result.stdout.split() == ["[?????]", "[???]", "[???]", "[ok]"]
+
+
+def test_pure_function_requires_result_type_and_intent_in_dummy(tmp_path):
+    source = tmp_path / "xcheck_pure_func.f90"
+    source.write_text(
+        """
+program main
+implicit none
+print *, f(3)
+contains
+pure function f(i)
+integer :: i
+f = 2*i
+end function f
+end program main
+""",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), "--check", str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode != 0
+    assert "Function result 'f' in PURE function 'f' has no declared type" in result.stderr
+    assert "Argument 'i' of PURE function 'f' must be INTENT(IN) or VALUE" in result.stderr
+
+
+def test_pure_function_rejects_impure_function_reference(tmp_path):
+    source = tmp_path / "xcheck_pure_func_call.f90"
+    source.write_text(
+        """
+program main
+implicit none
+print *, f(3)
+contains
+pure integer function f(i)
+integer, intent(in) :: i
+f = g(i)
+end function f
+
+integer function g(i)
+integer, intent(in) :: i
+g = 2*i
+end function g
+end program main
+""",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode != 0
+    assert "Reference to impure function 'g'" in result.stderr
+    assert "within PURE procedure" in result.stderr
+
+
 def test_namelist_read_write_roundtrip(tmp_path):
     source = tmp_path / "xnamelist.f90"
     source.write_text(
@@ -551,7 +783,7 @@ def test_allocate_rejects_already_allocated_variable():
 
 def test_parser_expected_token_errors_are_readable(tmp_path):
     source = tmp_path / "xbad_syntax.f90"
-    source.write_text("integer : i\n", encoding="utf-8")
+    source.write_text("integer : i\nend\n", encoding="utf-8")
     result = subprocess.run(
         [str(OFORT), str(source)],
         cwd=ROOT,
@@ -1032,8 +1264,8 @@ def test_manifest_each_mode_runs_files_separately(tmp_path):
     first = tmp_path / "a.f90"
     second = tmp_path / "b.f90"
     manifest = tmp_path / "files.txt"
-    first.write_text("print *, 11\n", encoding="utf-8")
-    second.write_text("print *, 22\n", encoding="utf-8")
+    first.write_text("print *, 11\nend\n", encoding="utf-8")
+    second.write_text("print *, 22\nend\n", encoding="utf-8")
     manifest.write_text("a.f90\nb.f90\n", encoding="utf-8")
 
     result = subprocess.run(
@@ -1181,7 +1413,8 @@ def test_implicit_external_unit_warns(tmp_path):
         "write(12,*) 70, 80\n"
         "rewind 12\n"
         "read(12,*) i, j\n"
-        "print *, i, j\n",
+        "print *, i, j\n"
+        "end\n",
         encoding="utf-8",
     )
 
@@ -1206,7 +1439,8 @@ def test_w_option_suppresses_implicit_external_unit_warning(tmp_path):
         "write(12,*) 70, 80\n"
         "rewind 12\n"
         "read(12,*) i, j\n"
-        "print *, i, j\n",
+        "print *, i, j\n"
+        "end\n",
         encoding="utf-8",
     )
 
@@ -1260,7 +1494,8 @@ def test_real_star_8_extension_warns_and_runs(tmp_path):
     source.write_text(
         "real*8 :: x\n"
         "x = 1.25d0\n"
-        "print *, kind(x), x\n",
+        "print *, kind(x), x\n"
+        "end\n",
         encoding="utf-8",
     )
     result = subprocess.run(
@@ -1281,7 +1516,8 @@ def test_w_option_suppresses_real_star_8_warning(tmp_path):
     source.write_text(
         "real*8 :: x\n"
         "x = 1.25d0\n"
-        "print *, kind(x), x\n",
+        "print *, kind(x), x\n"
+        "end\n",
         encoding="utf-8",
     )
     result = subprocess.run(
@@ -1715,6 +1951,125 @@ def test_repl_warns_when_implicit_save_line_is_entered(tmp_path):
     assert "warning: local variable 'n' has implicit SAVE due to initialization" in result.stderr
 
 
+def test_repl_nologo_suppresses_startup_banner(tmp_path):
+    source = tmp_path / "repl_nologo.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--load", str(source)],
+        cwd=ROOT,
+        input=".quit\n",
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Enter Fortran source." not in result.stdout
+    assert "Commands:" not in result.stdout
+    assert "> " in result.stdout
+
+
+def test_repl_prompt_option_sets_prompt_text(tmp_path):
+    source = tmp_path / "repl_prompt.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--prompt", ">", "--load", str(source)],
+        cwd=ROOT,
+        input=".quit\n",
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "ofort> " not in result.stdout
+    assert ">" in result.stdout
+
+
+def test_repl_prompt_command_changes_prompt_during_session(tmp_path):
+    source = tmp_path / "repl_prompt_command.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--load", str(source)],
+        cwd=ROOT,
+        input=".prompt \">\"\n.quit\n",
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "> >" in result.stdout
+
+
+def test_repl_saveq_saves_to_named_file_and_quits(tmp_path):
+    source = tmp_path / "repl_saveq.f90"
+    output = tmp_path / "saved_program.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--load", str(source)],
+        cwd=tmp_path,
+        input=f"integer :: i\ni = 7\n.saveq {output.name}\n",
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"Saved {output.name}" in result.stdout
+    saved = output.read_text(encoding="utf-8")
+    assert "integer :: i\n" in saved
+    assert "i = 7\n" in saved
+    assert saved.rstrip().endswith("end")
+
+
+def test_repl_save_named_file_requires_overwrite(tmp_path):
+    source = tmp_path / "repl_save_overwrite.f90"
+    output = tmp_path / "saved_program.f90"
+    source.write_text("", encoding="utf-8")
+    output.write_text("old\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--load", str(source)],
+        cwd=tmp_path,
+        input=(
+            f"integer :: i\n"
+            f"i = 7\n"
+            f".save {output.name}\n"
+            f".saveq {output.name} --overwrite\n"
+        ),
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"{output.name} already exists; use --overwrite to replace it" in result.stderr
+    assert output.read_text(encoding="utf-8") != "old\n"
+    assert "i = 7\n" in output.read_text(encoding="utf-8")
+
+
+def test_repl_quit_bang_quits_without_saving(tmp_path):
+    source = tmp_path / "repl_quit_bang.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--load", str(source)],
+        cwd=tmp_path,
+        input="integer :: i\ni = 7\n.quit!\n",
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not (tmp_path / "main.f90").exists()
+
+
 def test_w_option_suppresses_repl_implicit_save_warning(tmp_path):
     source = tmp_path / "empty.f90"
     source.write_text("", encoding="utf-8")
@@ -1753,7 +2108,7 @@ def test_repl_run_repeats_with_command_arguments(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert result.stderr == ""
-    numeric_lines = re.findall(r"(?m)^(?:ofort>\s*)?([0-9]+)$", result.stdout)
+    numeric_lines = re.findall(r"(?m)^(?:(?:ofort>|>)\s*)?([0-9]+)$", result.stdout)
     assert numeric_lines == ["2", "2", "1"]
 
 
@@ -1777,7 +2132,7 @@ def test_repl_time_repeats_and_prints_summary(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert result.stderr == ""
-    numeric_lines = re.findall(r"(?m)^(?:ofort>\s*)?(123)$", result.stdout)
+    numeric_lines = re.findall(r"(?m)^(?:(?:ofort>|>)\s*)?(123)$", result.stdout)
     assert numeric_lines == ["123", "123"]
     assert re.search(r"(?m)^\s+total\s+avg\s+sd\s+min\s+max$", result.stdout)
     assert re.search(
@@ -1806,7 +2161,7 @@ def test_repl_time_single_run_prints_only_total(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert result.stderr == ""
-    assert re.search(r"(?m)^(?:ofort>\s*)?456$", result.stdout)
+    assert re.search(r"(?m)^(?:(?:ofort>|>)\s*)?456$", result.stdout)
     assert re.search(r"(?m)^\s+total$", result.stdout)
     assert re.search(r"(?m)^\s*\d+\.\d{6} s$", result.stdout)
     assert not re.search(r"(?m)^\s+total\s+avg\s+sd\s+min\s+max$", result.stdout)
@@ -1994,9 +2349,10 @@ def test_repl_del_deletes_lines_and_ranges(tmp_path):
     assert result.returncode == 0, result.stderr
     assert result.stderr == ""
     assert "   1  program xdel\n" in result.stdout
-    assert "   2    integer :: i\n" in result.stdout
-    assert "   3    print *, i\n" in result.stdout
-    assert "   4  end program xdel\n" in result.stdout
+    assert "   2    implicit none\n" in result.stdout
+    assert "   3    integer :: i\n" in result.stdout
+    assert "   4    print *, i\n" in result.stdout
+    assert "   5  end program xdel\n" in result.stdout
     assert "   4    i = 1\n" not in result.stdout
     assert "i = 2" not in result.stdout
 
@@ -2023,11 +2379,11 @@ def test_repl_del_open_ended_ranges(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert result.stderr == ""
-    assert "   1  i = 1\n" in result.stdout
-    assert "   2  print *, i\n" in result.stdout
+    assert "   1  implicit none\n" in result.stdout
+    assert "   2  i = 1\n" in result.stdout
+    assert "   3  print *, i\n" in result.stdout
     assert "end program xdelopen" in result.stdout
-    assert result.stdout.count("   1  i = 1\n") == 2
-    assert "   2  end program xdelopen\n" in result.stdout
+    assert "   3  end program xdelopen\n" in result.stdout
 
 
 def test_repl_del_rejects_footer_line(tmp_path):
@@ -2050,7 +2406,7 @@ def test_repl_del_rejects_footer_line(tmp_path):
 
     assert result.returncode == 0
     assert ".del range is outside the editable source buffer" in result.stderr
-    assert "   3  end program xdelfooter\n" in result.stdout
+    assert "   4  end program xdelfooter\n" in result.stdout
 
 
 def test_repl_ins_and_rep_edit_lines(tmp_path):
@@ -2083,12 +2439,13 @@ def test_repl_ins_and_rep_edit_lines(tmp_path):
     assert result.returncode == 0, result.stderr
     assert result.stderr == ""
     assert "   1  program xedit\n" in result.stdout
-    assert "   2    integer :: i\n" in result.stdout
-    assert "   3    integer :: j\n" in result.stdout
-    assert "   4    i = 10\n" in result.stdout
-    assert "   5    print *, i\n" in result.stdout
+    assert "   2    implicit none\n" in result.stdout
+    assert "   3    integer :: i\n" in result.stdout
+    assert "   4    integer :: j\n" in result.stdout
+    assert "   5    i = 10\n" in result.stdout
     assert "   6    print *, i\n" in result.stdout
-    assert "   7  end program xedit\n" in result.stdout
+    assert "   7    print *, i\n" in result.stdout
+    assert "   8  end program xedit\n" in result.stdout
     assert "   4    i = 1\n" not in result.stdout
 
 
@@ -2113,7 +2470,7 @@ def test_repl_ins_rep_reject_footer_line(tmp_path):
     assert result.returncode == 0
     assert ".rep line is outside the editable source buffer" in result.stderr
     assert ".ins line is outside the editable source buffer" in result.stderr
-    assert "   3  end program xeditfooter\n" in result.stdout
+    assert "   4  end program xeditfooter\n" in result.stdout
 
 
 def test_repl_rename_variable_tokens(tmp_path):
@@ -2261,13 +2618,14 @@ def test_repl_list_auto_indents_blocks(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert result.stderr == ""
-    assert "   3    do i = 1, 2\n" in result.stdout
-    assert "   4      if (i == 1) then\n" in result.stdout
-    assert "   5        print *, i\n" in result.stdout
-    assert "   6      else\n" in result.stdout
-    assert "   8      end if\n" in result.stdout
-    assert "   9    end do\n" in result.stdout
-    assert "  10  end program x\n" in result.stdout
+    assert "   3    integer :: i\n" in result.stdout
+    assert "   4    do i = 1, 2\n" in result.stdout
+    assert "   5      if (i == 1) then\n" in result.stdout
+    assert "   6        print *, i\n" in result.stdout
+    assert "   7      else\n" in result.stdout
+    assert "   9      end if\n" in result.stdout
+    assert "  10    end do\n" in result.stdout
+    assert "  11  end program x\n" in result.stdout
 
 
 def test_rejects_type_changing_assignment():
@@ -2286,6 +2644,142 @@ def test_rejects_type_changing_assignment():
     assert 'line 4: i = "a"' in result.stderr
 
 
+def test_repl_list_dash_n_omits_line_numbers(tmp_path):
+    source = tmp_path / "repl_list_no_numbers.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--load", str(source)],
+        cwd=ROOT,
+        input="integer :: i\ni = 7\n.list -n\n.clear\n.quit\n",
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "integer :: i\n" in result.stdout
+    assert "i = 7\n" in result.stdout
+    assert "   1  integer :: i\n" not in result.stdout
+    assert "   2  i = 7\n" not in result.stdout
+
+
+def test_repl_group_decl_groups_simple_declarations(tmp_path):
+    source = tmp_path / "repl_group_decl.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--load", str(source)],
+        cwd=ROOT,
+        input=(
+            "integer :: i\n"
+            "logical :: tf1\n"
+            "integer :: j\n"
+            "logical :: tf2\n"
+            ".group-decl\n"
+            ".list -n\n"
+            ".clear\n"
+            ".quit\n"
+        ),
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "integer :: i, j\n" in result.stdout
+    assert "logical :: tf1, tf2\n" in result.stdout
+    assert "integer :: j\n" not in result.stdout
+    assert "logical :: tf2\n" not in result.stdout
+
+
+def test_repl_unused_lists_unused_simple_declarations(tmp_path):
+    source = tmp_path / "repl_unused.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--load", str(source)],
+        cwd=ROOT,
+        input=(
+            "integer :: i, j\n"
+            "logical :: tf1, tf2\n"
+            "i = 3\n"
+            "tf1 = .true.\n"
+            "print *, i, tf1\n"
+            ".unused\n"
+            ".clear\n"
+            ".quit\n"
+        ),
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "unused declarations:\n" in result.stdout
+    assert "  j\n" in result.stdout
+    assert "  tf2\n" in result.stdout
+    assert "  i\n" not in result.stdout
+    assert "  tf1\n" not in result.stdout
+
+
+def test_repl_undecl_removes_named_simple_declarations(tmp_path):
+    source = tmp_path / "repl_undecl.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--load", str(source)],
+        cwd=ROOT,
+        input=(
+            "integer :: i, j, k\n"
+            "logical :: tf1, tf2\n"
+            ".undecl j tf2\n"
+            ".list -n\n"
+            ".clear\n"
+            ".quit\n"
+        ),
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "integer :: i, k\n" in result.stdout
+    assert "logical :: tf1\n" in result.stdout
+    assert "integer :: i, j, k\n" not in result.stdout
+    assert "logical :: tf1, tf2\n" not in result.stdout
+
+
+def test_repl_drop_unused_removes_unused_simple_declarations(tmp_path):
+    source = tmp_path / "repl_drop_unused.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--load", str(source)],
+        cwd=ROOT,
+        input=(
+            "integer :: i, j\n"
+            "logical :: tf1, tf2\n"
+            "i = 3\n"
+            "tf1 = .true.\n"
+            "print *, i, tf1\n"
+            ".drop-unused\n"
+            ".list -n\n"
+            ".clear\n"
+            ".quit\n"
+        ),
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "integer :: i\n" in result.stdout
+    assert "logical :: tf1\n" in result.stdout
+    assert "integer :: i, j\n" not in result.stdout
+    assert "logical :: tf1, tf2\n" not in result.stdout
+
+
 def test_repl_print_shortcut_is_stored_as_fortran(tmp_path):
     source = tmp_path / "repl_print_shortcut.f90"
     source.write_text("integer :: i = 2\n", encoding="utf-8")
@@ -2300,8 +2794,489 @@ def test_repl_print_shortcut_is_stored_as_fortran(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert "   2  print *, i,i+1,\"x\"\n" in result.stdout
+    assert "   3  print *, i,i+1,\"x\"\n" in result.stdout
     assert "2 3 x\n" in result.stdout
+
+
+def test_repl_print_quoted_format_is_not_rewritten(tmp_path):
+    source = tmp_path / "repl_print_quoted_format.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--prompt", "", "--load", str(source)],
+        cwd=ROOT,
+        input='real :: x\nx = 0.5\nprint "(f8.3)", x\n.list\n.\n.quit!\n',
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert 'print "(f8.3)", x\n' in result.stdout
+    assert "(f8.3) 0." not in result.stdout
+    assert "   0.500" in result.stdout
+
+
+def test_repl_inserts_colons_in_simple_declarations(tmp_path):
+    source = tmp_path / "repl_decl_colons.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--prompt", "", "--load", str(source)],
+        cwd=ROOT,
+        input=(
+            "integer n\n"
+            "real x(n)\n"
+            "real, allocatable y(:)\n"
+            "double precision z(2)\n"
+            "type(foo) obj\n"
+            ".list -n\n"
+            ".quit!\n"
+        ),
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "integer :: n" in result.stdout
+    assert "real :: x(n)" in result.stdout
+    assert "real, allocatable :: y(:)" in result.stdout
+    assert "double precision :: z(2)" in result.stdout
+    assert "type(foo) :: obj" in result.stdout
+
+
+def test_repl_rewrites_mixed_length_character_constructor(tmp_path):
+    source = tmp_path / "repl_char_constructor_shortcut.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--prompt", "", "--load", str(source)],
+        cwd=ROOT,
+        input=(
+            "character(len=10) :: s(3)\n"
+            "s = [\"one\", \"four\", \"seven\"]\n"
+            "print *, s\n"
+            ".\n"
+            ".list\n"
+            ".clear\n"
+            ".quit\n"
+        ),
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "warning: rewrote mixed-length character constructor as character(len=5)" in result.stderr
+    assert "one        four       seven" in result.stdout
+    assert "s = [character(len=5) :: \"one\", \"four\", \"seven\"]" in result.stdout
+
+
+def test_repl_warns_about_character_truncation(tmp_path):
+    source = tmp_path / "repl_char_truncation.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--prompt", "", "--load", str(source)],
+        cwd=ROOT,
+        input=(
+            "character (len=3) :: s(4)\n"
+            "s = [character(len=5) :: \"one  \", \"four \", \"seven\", \"eight\"]\n"
+            "print *, s\n"
+            ".\n"
+            ".quit\n"
+        ),
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "warning: assigning CHARACTER value to CHARACTER(LEN=3) variable 's' truncates" in result.stderr
+    assert "one fou sev eig" in result.stdout
+
+
+def test_repl_rejects_uninitialized_variable_read(tmp_path):
+    source = tmp_path / "repl_uninitialized.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--load", str(source)],
+        cwd=ROOT,
+        input="integer i\nprint *, i\n.quit\n",
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0
+    assert "Variable 'i' is used before it is set" in result.stderr
+    assert "line 1: print *, i" in result.stderr
+
+
+def test_repl_rejects_uninitialized_variable_in_assignment_rhs(tmp_path):
+    source = tmp_path / "repl_uninitialized_assignment.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--load", str(source)],
+        cwd=ROOT,
+        input="integer :: i, j\nj = 2*i\n.quit\n",
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0
+    assert "Variable 'i' is used before it is set" in result.stderr
+    assert "line 1: j = 2*i" in result.stderr
+
+
+def test_repl_random_number_marks_harvest_initialized(tmp_path):
+    source = tmp_path / "repl_random_number_initialized.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--prompt", "", "--load", str(source)],
+        cwd=ROOT,
+        input=(
+            "double precision x(3)\n"
+            "call random_number(x)\n"
+            "x\n"
+            ".quit\n"
+        ),
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Variable 'x' is used before it is set" not in result.stderr
+
+
+def test_repl_allows_inquiry_intrinsics_on_uninitialized_variables(tmp_path):
+    source = tmp_path / "repl_uninitialized_inquiries.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--prompt", "", "--load", str(source)],
+        cwd=ROOT,
+        input=(
+            "integer :: v(2)\n"
+            "print *, kind(v)\n"
+            "print *, size(v)\n"
+            "print *, lbound(v)\n"
+            "print *, ubound(v)\n"
+            "print *, shape(v)\n"
+            "print *, rank(v)\n"
+            ".\n"
+            ".quit\n"
+        ),
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    numbers = [tok for tok in result.stdout.split() if re.fullmatch(r"-?\d+", tok)]
+    assert numbers[-6:] == ["4", "2", "1", "2", "2", "1"]
+
+
+def test_repl_allocate_mold_allows_uninitialized_mold_variable(tmp_path):
+    source = tmp_path / "repl_allocate_mold.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--prompt", "", "--load", str(source)],
+        cwd=ROOT,
+        input=(
+            "real :: x(3)\n"
+            "real, allocatable :: y(:)\n"
+            "allocate (y, mold=x)\n"
+            ".quit\n"
+        ),
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+
+
+def test_repl_dot_replays_allocate_in_fresh_interpreter(tmp_path):
+    source = tmp_path / "repl_allocate_replay.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--prompt", "", "--load", str(source)],
+        cwd=ROOT,
+        input=(
+            "real :: x(3)\n"
+            "real, allocatable :: y(:)\n"
+            "allocate (y(size(x)))\n"
+            "print *, shape(x), shape(y)\n"
+            ".\n"
+            ".quit\n"
+        ),
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    numbers = [tok for tok in result.stdout.split() if re.fullmatch(r"-?\d+", tok)]
+    assert numbers[-2:] == ["3", "3"]
+
+
+def test_repl_gfortran_command_compiles_and_runs_buffer(tmp_path):
+    if not shutil.which("gfortran"):
+        pytest.skip("gfortran is required for .gfortran")
+
+    source = tmp_path / "repl_gfortran.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--prompt", "", "--load", str(source)],
+        cwd=ROOT,
+        input=(
+            "integer :: n\n"
+            "n = 21\n"
+            "print *, 2*n\n"
+            ".gfortran\n"
+            ".quit!\n"
+        ),
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "42" in result.stdout.split()
+
+
+def test_repl_gfortran_command_accepts_options_and_compile_only(tmp_path):
+    if not shutil.which("gfortran"):
+        pytest.skip("gfortran is required for .gfortran")
+
+    source = tmp_path / "repl_gfortran_compile_only.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--prompt", "", "--load", str(source)],
+        cwd=ROOT,
+        input=(
+            "print *, 99\n"
+            ".gfortran -O3 -c\n"
+            ".quit!\n"
+        ),
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "99" not in result.stdout.split()
+    assert ".gfortran: compile failed" not in result.stderr
+
+
+def test_repl_compiler_commands_can_be_chained_with_semicolon(tmp_path):
+    if not shutil.which("gfortran"):
+        pytest.skip("gfortran is required for .gfortran")
+
+    source = tmp_path / "repl_gfortran_chain.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--prompt", "", "--load", str(source)],
+        cwd=ROOT,
+        input=(
+            "print *, 77\n"
+            ".gfortran -O3 -c; .gfortran -O0\n"
+            ".quit!\n"
+        ),
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split().count("77") == 1
+
+
+def test_repl_ofort_can_be_chained_with_external_compiler(tmp_path):
+    if not shutil.which("gfortran"):
+        pytest.skip("gfortran is required for .gfortran")
+
+    source = tmp_path / "repl_ofort_gfortran_chain.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--prompt", "", "--load", str(source)],
+        cwd=ROOT,
+        input=(
+            "integer :: n\n"
+            "n = 12\n"
+            "print *, n + 1\n"
+            ".ofort; .gfortran -O0\n"
+            ".quit!\n"
+        ),
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split().count("13") == 2
+
+
+def test_repl_timec_times_ofort_command(tmp_path):
+    source = tmp_path / "repl_timec_ofort.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--prompt", "", "--load", str(source)],
+        cwd=ROOT,
+        input=(
+            "print *, 31\n"
+            ".timec .ofort\n"
+            ".quit!\n"
+        ),
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "command" in result.stdout
+    assert "compile_s" in result.stdout
+    assert "run_s" in result.stdout
+    assert "total_s" in result.stdout
+    assert ".ofort" in result.stdout
+    assert "ok" in result.stdout
+    assert "31" in result.stdout.split()
+
+
+def test_repl_timec_times_chained_compiler_commands(tmp_path):
+    if not shutil.which("gfortran"):
+        pytest.skip("gfortran is required for .gfortran")
+
+    source = tmp_path / "repl_timec_chain.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--prompt", "", "--load", str(source)],
+        cwd=ROOT,
+        input=(
+            "print *, 32\n"
+            ".timec 1 .ofort; .gfortran -O0\n"
+            ".quit!\n"
+        ),
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "compile_s" in result.stdout
+    assert "run_s" in result.stdout
+    assert "total_s" in result.stdout
+    assert ".ofort" in result.stdout
+    assert ".gfortran -O0" in result.stdout
+    assert result.stdout.split().count("32") == 2
+
+
+def test_repl_timec_accepts_ofort_fast_option(tmp_path):
+    source = tmp_path / "repl_timec_ofort_fast.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--prompt", "", "--load", str(source)],
+        cwd=ROOT,
+        input=(
+            "integer :: n\n"
+            "n = 33\n"
+            "print *, n\n"
+            ".timec 1 .ofort --fast\n"
+            ".quit!\n"
+        ),
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert ".ofort --fast" in result.stdout
+    assert "failed" not in result.stdout
+    assert "33" in result.stdout.split()
+
+
+def test_repl_timec_accepts_bare_compiler_names(tmp_path):
+    if not shutil.which("gfortran"):
+        pytest.skip("gfortran is required for .timec gfortran")
+
+    source = tmp_path / "repl_timec_bare_names.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--prompt", "", "--load", str(source)],
+        cwd=ROOT,
+        input=(
+            "integer :: n\n"
+            "n = 34\n"
+            "print *, n\n"
+            ".timec 1 ofort --fast; gfortran -O0\n"
+            ".quit!\n"
+        ),
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "ofort --fast" in result.stdout
+    assert "gfortran -O0" in result.stdout
+    assert "failed" not in result.stdout
+    assert result.stdout.split().count("34") == 2
+
+
+def test_repl_auto_end_inserts_and_advances_out_of_blocks(tmp_path):
+    source = tmp_path / "repl_auto_end.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--prompt", "", "--auto-end", "--load", str(source)],
+        cwd=ROOT,
+        input=(
+            "program main\n"
+            "integer :: i\n"
+            "do i = 1, 2\n"
+            "print *, i\n"
+            "end do\n"
+            "print *, 99\n"
+            "end program main\n"
+            ".list\n"
+            ".\n"
+            ".quit!\n"
+        ),
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.count("end do\n") == 1
+    assert result.stdout.count("end program main\n") == 1
+    assert result.stdout.find("do i = 1, 2") < result.stdout.find("print *, i")
+    assert result.stdout.find("print *, i") < result.stdout.find("end do")
+    assert result.stdout.find("end do") < result.stdout.find("print *, 99")
+    assert result.stdout.find("print *, 99") < result.stdout.find("end program main")
+    assert result.stdout.split().count("1") >= 1
+    assert result.stdout.split().count("2") >= 1
+    assert "99" in result.stdout.split()
 
 
 def test_repl_let_const_shortcuts_are_stored_as_fortran(tmp_path):
@@ -2358,6 +3333,33 @@ def test_repl_const_kind_shortcut_is_integer_parameter(tmp_path):
     assert "8\n" in result.stdout
 
 
+def test_repl_const_shortcut_supports_array_parameters(tmp_path):
+    source = tmp_path / "repl_const_array_shortcut.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--prompt", "", "--load", str(source)],
+        cwd=ROOT,
+        input=(
+            "const n = 3\n"
+            "const v(n) = [10, 20, 30]\n"
+            "print *, v\n"
+            ".\n"
+            ".list\n"
+            ".clear\n"
+            ".quit\n"
+        ),
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    assert "10 20 30" in " ".join(result.stdout.split())
+    assert "integer, parameter :: v(n) = [10, 20, 30]" in result.stdout
+
+
 def test_repl_let_const_existing_names_and_reconst(tmp_path):
     source = tmp_path / "repl_reconst_shortcut.f90"
     source.write_text("implicit none\n", encoding="utf-8")
@@ -2385,8 +3387,8 @@ def test_repl_let_const_existing_names_and_reconst(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "LET variable 'm' already exists; use assignment: m = ..." in result.stderr
     assert "CONST name 'n' already exists; use reconst n = ... to replace a parameter" in result.stderr
-    assert "ofort> 20\n" in result.stdout
-    assert "ofort> 40\n" in result.stdout
+    assert "> 20\n" in result.stdout
+    assert "> 40\n" in result.stdout
     assert "integer, parameter :: n = 8\n" in result.stdout
     assert result.stdout.count("integer :: m\n") == 1
     assert "m = 5\n" in result.stdout
@@ -2412,6 +3414,31 @@ def test_repl_implicit_none_first_line_has_no_spurious_text(tmp_path):
     assert "   2  P\n" not in result.stdout
 
 
+def test_repl_defaults_to_implicit_none(tmp_path):
+    source = tmp_path / "repl_default_implicit_none.f90"
+    source.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), "--nologo", "--prompt", "", "--load", str(source)],
+        cwd=ROOT,
+        input=(
+            "integer :: i\n"
+            "i = 4\n"
+            "print *, i\n"
+            ".list\n"
+            ".\n"
+            ".quit!\n"
+        ),
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "   1  implicit none\n" in result.stdout
+    assert "4" in result.stdout.split()
+
+
 def test_repl_malformed_let_const_are_not_shortcuts(tmp_path):
     source = tmp_path / "repl_bad_let_const_shortcut.f90"
     source.write_text("", encoding="utf-8")
@@ -2425,9 +3452,10 @@ def test_repl_malformed_let_const_are_not_shortcuts(tmp_path):
         timeout=5,
     )
 
-    assert result.returncode == 0, result.stderr
-    assert "   1  let = 3\n" in result.stdout
-    assert "   2  const = .true.\n" in result.stdout
+    assert result.returncode == 0
+    assert "Undefined variable 'let'" in result.stderr
+    assert "Undefined variable 'const'" in result.stderr
+    assert "   1  implicit none\n" in result.stdout
 
 
 def test_pure_procedure_rejects_io(tmp_path):
@@ -3104,8 +4132,8 @@ def test_type_keyword_intrinsic_call():
 
 
 def test_batch_runner_runs_file_glob(tmp_path):
-    (tmp_path / "a.f90").write_text("print *, 11\n", encoding="utf-8")
-    (tmp_path / "b.f90").write_text("print *, 22\n", encoding="utf-8")
+    (tmp_path / "a.f90").write_text("print *, 11\nend\n", encoding="utf-8")
+    (tmp_path / "b.f90").write_text("print *, 22\nend\n", encoding="utf-8")
 
     result = subprocess.run(
         [sys.executable, str(RUNNER), str(tmp_path / "*.f90")],
@@ -3120,7 +4148,7 @@ def test_batch_runner_runs_file_glob(tmp_path):
     assert "==> " in result.stdout
     assert "a.f90" in result.stdout
     assert "b.f90" in result.stdout
-    assert "(1 lines)" in result.stdout
+    assert "(2 lines)" in result.stdout
     assert "\n\n==> " in result.stdout
     assert "11" in result.stdout
     assert "22" in result.stdout
@@ -3128,8 +4156,8 @@ def test_batch_runner_runs_file_glob(tmp_path):
 
 
 def test_batch_runner_forwards_check(tmp_path):
-    (tmp_path / "a.f90").write_text("print *, 11\n", encoding="utf-8")
-    (tmp_path / "b.f90").write_text("print *, 22\n", encoding="utf-8")
+    (tmp_path / "a.f90").write_text("print *, 11\nend\n", encoding="utf-8")
+    (tmp_path / "b.f90").write_text("print *, 22\nend\n", encoding="utf-8")
 
     result = subprocess.run(
         [sys.executable, str(RUNNER), "--check", str(tmp_path / "*.f90")],
@@ -3149,9 +4177,9 @@ def test_batch_runner_forwards_check(tmp_path):
 
 
 def test_batch_runner_limit(tmp_path):
-    (tmp_path / "a.f90").write_text("print *, 11\n", encoding="utf-8")
-    (tmp_path / "b.f90").write_text("print *, 22\n", encoding="utf-8")
-    (tmp_path / "c.f90").write_text("print *, 33\n", encoding="utf-8")
+    (tmp_path / "a.f90").write_text("print *, 11\nend\n", encoding="utf-8")
+    (tmp_path / "b.f90").write_text("print *, 22\nend\n", encoding="utf-8")
+    (tmp_path / "c.f90").write_text("print *, 33\nend\n", encoding="utf-8")
 
     result = subprocess.run(
         [sys.executable, str(RUNNER), "--limit", "2", str(tmp_path / "*.f90")],
@@ -3171,15 +4199,16 @@ def test_batch_runner_limit(tmp_path):
 
 
 def test_batch_runner_max_lines_skips_long_files(tmp_path):
-    (tmp_path / "a.f90").write_text("print *, 11\n", encoding="utf-8")
+    (tmp_path / "a.f90").write_text("print *, 11\nend\n", encoding="utf-8")
     (tmp_path / "b.f90").write_text(
         "print *, 22\n"
-        "print *, 33\n",
+        "print *, 33\n"
+        "end\n",
         encoding="utf-8",
     )
 
     result = subprocess.run(
-        [sys.executable, str(RUNNER), "--max-lines", "1", str(tmp_path / "*.f90")],
+        [sys.executable, str(RUNNER), "--max-lines", "2", str(tmp_path / "*.f90")],
         cwd=ROOT,
         text=True,
         capture_output=True,
@@ -3189,19 +4218,19 @@ def test_batch_runner_max_lines_skips_long_files(tmp_path):
     assert result.returncode == 0, result.stderr
     assert result.stderr == ""
     assert "a.f90" in result.stdout
-    assert "(1 lines)" in result.stdout
+    assert "(2 lines)" in result.stdout
     output_lines = result.stdout.splitlines()
     assert "11" in output_lines
     assert "b.f90" not in result.stdout
     assert "22" not in output_lines
-    assert "(2 lines)" not in result.stdout
-    assert "skipped: longer than 1 lines" not in result.stdout
+    assert "(3 lines)" not in result.stdout
+    assert "skipped: longer than 2 lines" not in result.stdout
     assert re.search(r"1 passed, 1 skipped in \d+\.\d{2}s", result.stdout)
 
 
 def test_batch_runner_quiet_suppresses_success_output(tmp_path):
-    (tmp_path / "a.f90").write_text("print *, 11\n", encoding="utf-8")
-    (tmp_path / "b.f90").write_text("print *, 22\n", encoding="utf-8")
+    (tmp_path / "a.f90").write_text("print *, 11\nend\n", encoding="utf-8")
+    (tmp_path / "b.f90").write_text("print *, 22\nend\n", encoding="utf-8")
 
     result = subprocess.run(
         [sys.executable, str(RUNNER), "--quiet", str(tmp_path / "*.f90")],
@@ -3220,8 +4249,8 @@ def test_batch_runner_filter_skips_rejected_files(tmp_path):
     good = tmp_path / "good.f90"
     bad = tmp_path / "bad.f90"
     filter_script = tmp_path / "filter.py"
-    good.write_text("print *, 11\n", encoding="utf-8")
-    bad.write_text("print *, 22\n", encoding="utf-8")
+    good.write_text("print *, 11\nend\n", encoding="utf-8")
+    bad.write_text("print *, 22\nend\n", encoding="utf-8")
     filter_script.write_text(
         "import pathlib\n"
         "import sys\n"
@@ -3257,8 +4286,8 @@ def test_batch_runner_quiet_prints_failed_files(tmp_path):
     good = tmp_path / "good.f90"
     bad = tmp_path / "bad.f90"
     fake_ofort = tmp_path / "fake_ofort.bat"
-    good.write_text("print *, 11\n", encoding="utf-8")
-    bad.write_text("print *, 22\n", encoding="utf-8")
+    good.write_text("print *, 11\nend\n", encoding="utf-8")
+    bad.write_text("print *, 22\nend\n", encoding="utf-8")
     fake_ofort.write_text(
         "@echo off\n"
         "echo handled %~nx1\n"
@@ -3294,7 +4323,7 @@ def test_batch_runner_quiet_prints_failed_files(tmp_path):
 
 
 def test_batch_runner_rejects_bad_limit(tmp_path):
-    (tmp_path / "a.f90").write_text("print *, 11\n", encoding="utf-8")
+    (tmp_path / "a.f90").write_text("print *, 11\nend\n", encoding="utf-8")
 
     result = subprocess.run(
         [sys.executable, str(RUNNER), "--limit", "0", str(tmp_path / "*.f90")],
@@ -3312,7 +4341,7 @@ def test_batch_runner_rejects_bad_limit(tmp_path):
 def test_batch_runner_times_out_file(tmp_path):
     source = tmp_path / "a.f90"
     fake_ofort = tmp_path / "fake_ofort.bat"
-    source.write_text("print *, 11\n", encoding="utf-8")
+    source.write_text("print *, 11\nend\n", encoding="utf-8")
     fake_ofort.write_text(
         "@echo off\n"
         f"\"{sys.executable}\" -c \"import time; time.sleep(2)\"\n",
@@ -3337,13 +4366,13 @@ def test_batch_runner_times_out_file(tmp_path):
 
     assert result.returncode == 1
     assert "==> " in result.stdout
-    assert "(1 lines)" in result.stdout
+    assert "(2 lines)" in result.stdout
     assert "timed out after 0.1 seconds" in result.stderr
     assert re.search(r"1 of 1 failed in \d+\.\d{2}s", result.stderr)
 
 
 def test_batch_runner_rejects_bad_timeout(tmp_path):
-    (tmp_path / "a.f90").write_text("print *, 11\n", encoding="utf-8")
+    (tmp_path / "a.f90").write_text("print *, 11\nend\n", encoding="utf-8")
 
     result = subprocess.run(
         [sys.executable, str(RUNNER), "--timeout", "-1", str(tmp_path / "*.f90")],
@@ -3359,7 +4388,7 @@ def test_batch_runner_rejects_bad_timeout(tmp_path):
 
 
 def test_batch_runner_rejects_bad_max_lines(tmp_path):
-    (tmp_path / "a.f90").write_text("print *, 11\n", encoding="utf-8")
+    (tmp_path / "a.f90").write_text("print *, 11\nend\n", encoding="utf-8")
 
     result = subprocess.run(
         [sys.executable, str(RUNNER), "--max-lines", "-1", str(tmp_path / "*.f90")],
@@ -3579,3 +4608,237 @@ def test_derived_type_dimension_assumed_size_check(tmp_path):
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_character_array_constructor_rejects_mixed_lengths(tmp_path):
+    source = tmp_path / "xchar_array.f90"
+    source.write_text(
+        "implicit none\n"
+        "character(len=10) :: s(3)\n"
+        "s = [\"one\", \"four\", \"seven\"]\n"
+        "print *, s\n"
+        "end\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode != 0
+    assert "Different CHARACTER lengths (3/4) in array constructor" in result.stderr
+
+
+def test_missing_end_program_is_rejected(tmp_path):
+    source = tmp_path / "xno_end.f90"
+    source.write_text(
+        "program main\n"
+        "  implicit none\n"
+        "  print *, 1\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode != 0
+    assert "Unexpected end of file: missing END PROGRAM" in result.stderr
+
+
+def test_mismatched_end_program_name_is_rejected(tmp_path):
+    source = tmp_path / "xbad_end.f90"
+    source.write_text(
+        "program ab\n"
+        "print *, \"hi\"\n"
+        "end program a\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode != 0
+    assert "Expected label 'ab' for END PROGRAM statement" in result.stderr
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize(
+    ("source_text", "expected"),
+    [
+        (
+            "module mod_a\n"
+            "contains\n"
+            "subroutine s\n"
+            "end subroutine s\n"
+            "end module mod_b\n",
+            "Expected label 'mod_a' for END MODULE statement",
+        ),
+        (
+            "subroutine sub_a\n"
+            "print *, \"hi\"\n"
+            "end subroutine sub_b\n",
+            "Expected label 'sub_a' for END SUBROUTINE statement",
+        ),
+        (
+            "function fun_a()\n"
+            "integer :: fun_a\n"
+            "fun_a = 1\n"
+            "end function fun_b\n",
+            "Expected label 'fun_a' for END FUNCTION statement",
+        ),
+        (
+            "type type_a\n"
+            "integer :: i\n"
+            "end type type_b\n"
+            "type(type_a) :: x\n"
+            "x%i = 1\n"
+            "print *, x%i\n"
+            "end\n",
+            "Expected label 'type_a' for END TYPE statement",
+        ),
+        (
+            "outer: block\n"
+            "print *, 1\n"
+            "end block inner\n"
+            "end\n",
+            "Expected label 'outer' for END BLOCK statement",
+        ),
+        (
+            "integer :: i\n"
+            "i = 3\n"
+            "outer: associate (j => i)\n"
+            "print *, j\n"
+            "end associate inner\n"
+            "end\n",
+            "Expected label 'outer' for END ASSOCIATE statement",
+        ),
+        (
+            "integer :: i\n"
+            "i = 1\n"
+            "outer: select case (i)\n"
+            "case (1)\n"
+            "print *, i\n"
+            "end select inner\n"
+            "end\n",
+            "Expected label 'outer' for END SELECT statement",
+        ),
+        (
+            "integer :: i\n"
+            "outer: do i = 1, 2\n"
+            "print *, i\n"
+            "end do inner\n"
+            "end\n",
+            "Expected label 'outer' for END DO statement",
+        ),
+        (
+            "outer: if (.true.) then\n"
+            "print *, 1\n"
+            "end if inner\n"
+            "end\n",
+            "Expected label 'outer' for END IF statement",
+        ),
+        (
+            "logical :: mask(2)\n"
+            "integer :: x(2)\n"
+            "mask = [.true., .false.]\n"
+            "x = 0\n"
+            "outer: where (mask)\n"
+            "x = 1\n"
+            "end where inner\n"
+            "print *, x\n"
+            "end\n",
+            "Expected label 'outer' for END WHERE statement",
+        ),
+        (
+            "integer :: x(2), i\n"
+            "x = 0\n"
+            "outer: forall (i = 1:2)\n"
+            "x(i) = i\n"
+            "end forall inner\n"
+            "print *, x\n"
+            "end\n",
+            "Expected label 'outer' for END FORALL statement",
+        ),
+        (
+            "submodule (parent_mod) sub_a\n"
+            "end submodule sub_b\n",
+            "Expected label 'sub_a' for END SUBMODULE statement",
+        ),
+        (
+            "module procedure proc_a\n"
+            "end procedure proc_b\n",
+            "Expected label 'proc_a' for END PROCEDURE statement",
+        ),
+    ],
+)
+def test_mismatched_named_end_statements_are_rejected(tmp_path, source_text, expected):
+    source = tmp_path / "xbad_named_end.f90"
+    source.write_text(source_text, encoding="utf-8")
+
+    result = subprocess.run(
+        [str(OFORT), str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode != 0
+    assert expected in result.stderr
+    assert result.stdout == ""
+
+
+def test_file_without_terminal_end_is_rejected(tmp_path):
+    source = tmp_path / "xno_end.f90"
+    source.write_text(
+        "print *, \"hello\"\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode != 0
+    assert "Unexpected end of file in" in result.stderr
+
+
+def test_missing_end_do_is_rejected(tmp_path):
+    source = tmp_path / "xno_end_do.f90"
+    source.write_text(
+        "implicit none\n"
+        "integer :: i\n"
+        "do i = 1, 3\n"
+        "  print *, i\n"
+        "end\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode != 0
+    assert "Unexpected end of file: missing END DO" in result.stderr

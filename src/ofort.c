@@ -10681,6 +10681,7 @@ static int fill_random_number_array_section(OfortInterpreter *I, OfortVar *var, 
     fill_random_number_section_recursive(I, &var->val, specs, nargs, nargs - 1, subscripts, &rng_state);
     if (I->fast_mode) I->fast_rng_state = rng_state;
 
+    var->is_initialized = 1;
     free_subscript_specs(specs, nargs);
     return 1;
 }
@@ -14175,6 +14176,7 @@ static int exec_fast_array_affine_assignment(OfortInterpreter *I, OfortNode *n) 
         if (target->val.v.arr.real_data) target->val.v.arr.real_data[i] = y;
         else target->val.v.arr.int_data[i] = (long long)y;
     }
+    target->is_initialized = 1;
     return 1;
 }
 
@@ -14280,6 +14282,7 @@ static int exec_fast_array_poly2_assignment(OfortInterpreter *I, OfortNode *n) {
         if (target->val.v.arr.real_data) target->val.v.arr.real_data[i] = y;
         else target->val.v.arr.int_data[i] = (long long)y;
     }
+    target->is_initialized = 1;
     return 1;
 }
 
@@ -14306,6 +14309,7 @@ static int exec_fast_scalar_numeric_assignment(OfortInterpreter *I, OfortNode *n
         } else {
             array_var->val.v.arr.int_data[index] = (long long)result;
         }
+        array_var->is_initialized = 1;
         return 1;
     }
     if (lhs->type != FND_IDENT) return 0;
@@ -14327,6 +14331,7 @@ static int exec_fast_scalar_numeric_assignment(OfortInterpreter *I, OfortNode *n
     } else {
         target->val.v.r = result;
     }
+    target->is_initialized = 1;
     return 1;
 }
 
@@ -16214,6 +16219,14 @@ static int associate_selector_is_assignable(OfortInterpreter *I, OfortNode *sele
         return find_var(I, selector->name) != NULL;
     }
     return 0;
+}
+
+static OfortValue eval_allocate_mold_expr(OfortInterpreter *I, OfortNode *mold_expr) {
+    if (mold_expr && mold_expr->type == FND_IDENT) {
+        OfortVar *var = find_var(I, mold_expr->name);
+        if (var) return copy_value(var->val);
+    }
+    return eval_node(I, mold_expr);
 }
 
 /* Execute statement node */
@@ -18921,6 +18934,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             } else {
                 ofort_error(I, "RANDOM_NUMBER harvest must be REAL");
             }
+            if (harvest) harvest->is_initialized = 1;
             break;
         }
         if (strcmp(call_upper, "GET_COMMAND_ARGUMENT") == 0 || strcmp(call_upper, "GETARG") == 0) {
@@ -19402,7 +19416,7 @@ unresolved_external_call_done:
                     *target = make_array(elem_type, dims, ndims);
                 set_array_lower_bounds(target, lower_bounds, ndims);
             } else if (n->children[1]) {
-                OfortValue mold = eval_node(I, n->children[1]);
+                OfortValue mold = eval_allocate_mold_expr(I, n->children[1]);
                 if (mold.type == FVAL_ARRAY) {
                     ndims = mold.v.arr.n_dims;
                     elem_type = mold.v.arr.elem_type;
@@ -19487,7 +19501,7 @@ unresolved_external_call_done:
                 new_val = copy_value(source);
                 free_value(&source);
             } else if (n->children[1]) {
-                OfortValue mold = eval_node(I, n->children[1]);
+                OfortValue mold = eval_allocate_mold_expr(I, n->children[1]);
                 if (mold.type == FVAL_DERIVED) {
                     new_val = default_derived_value(I, mold.v.dt.type_name);
                 } else {
@@ -19539,7 +19553,7 @@ unresolved_external_call_done:
                 if (dims[i] < 0) dims[i] = 0;
             }
         } else if (n->children[1]) {
-            OfortValue mold = eval_node(I, n->children[1]);
+            OfortValue mold = eval_allocate_mold_expr(I, n->children[1]);
             if (mold.type != FVAL_ARRAY)
                 ofort_error(I, "ALLOCATE MOLD must be an array");
             ndims = mold.v.arr.n_dims;

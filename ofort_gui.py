@@ -21,6 +21,10 @@ from tkinter import filedialog, messagebox, ttk
 
 
 APP_TITLE = "ofort GUI"
+AUTO_CLOSE_PARENS = True
+AUTO_CLOSE_BRACKETS = True
+AUTO_CLOSE_QUOTES = True
+AUTO_COMPLETE_BLOCKS = True
 DEFAULT_SOURCE = """program main
   integer :: n
   n = 2**5
@@ -112,6 +116,10 @@ class OfortGui(tk.Tk):
         editor_y.grid(row=0, column=1, sticky="ns")
         editor_x.grid(row=1, column=0, sticky="ew")
         self.editor.bind("<Return>", self.on_editor_return)
+        self.editor.bind("<KeyPress-parenleft>", lambda event: self.on_editor_auto_pair(event, "(", ")", AUTO_CLOSE_PARENS))
+        self.editor.bind("<KeyPress-bracketleft>", lambda event: self.on_editor_auto_pair(event, "[", "]", AUTO_CLOSE_BRACKETS))
+        self.editor.bind("<KeyPress-quotedbl>", lambda event: self.on_editor_auto_pair(event, '"', '"', AUTO_CLOSE_QUOTES))
+        self.editor.bind("<KeyPress-apostrophe>", lambda event: self.on_editor_auto_pair(event, "'", "'", AUTO_CLOSE_QUOTES))
         self.editor.bind("<KeyRelease>", self.on_editor_key_release, add="+")
         self.configure_syntax_tags()
         paned.add(editor_frame, weight=3)
@@ -144,6 +152,16 @@ class OfortGui(tk.Tk):
 
     def on_editor_key_release(self, _event: tk.Event) -> None:
         self.after_idle(self.highlight_syntax)
+
+    def on_editor_auto_pair(self, _event: tk.Event, left: str, right: str, enabled: bool) -> str | None:
+        if not enabled:
+            return None
+        if self.editor.tag_ranges("sel"):
+            self.editor.delete("sel.first", "sel.last")
+        self.editor.insert("insert", left + right)
+        self.editor.mark_set("insert", "insert-1c")
+        self.after_idle(self.highlight_syntax)
+        return "break"
 
     def highlight_syntax(self) -> None:
         text = self.editor.get("1.0", "end-1c")
@@ -211,11 +229,67 @@ class OfortGui(tk.Tk):
         current_line_index = self.editor.index("insert linestart")
         current_line = self.editor.get(current_line_index, "insert lineend")
         indent = self.next_indent(current_line)
+        block_end = self.block_completion_end_line(current_line, indent)
         self.dedent_current_line_if_needed(current_line_index, current_line)
-        self.editor.insert("insert", "\n" + indent)
+        if block_end and not self.next_line_already_closes(block_end):
+            base = re.match(r"^[ \t]*", current_line).group(0)
+            self.editor.insert("insert", "\n" + indent + "\n" + base + block_end)
+            self.editor.mark_set("insert", "insert-1l lineend")
+        else:
+            self.editor.insert("insert", "\n" + indent)
         if self.trace_assign.get():
             self.after_idle(self.run_source)
         return "break"
+
+    def next_line_already_closes(self, block_end: str) -> bool:
+        next_line = self.editor.get("insert +1line linestart", "insert +1line lineend").strip().lower()
+        return next_line == block_end.lower()
+
+    @staticmethod
+    def block_completion_end_line(line: str, next_indent: str) -> str | None:
+        if not AUTO_COMPLETE_BLOCKS:
+            return None
+        stripped = line.strip()
+        lowered = stripped.lower()
+        if not stripped or stripped.startswith("!") or re.match(r"^end\b", lowered):
+            return None
+        if re.match(r"^(else|else\s*if|case)\b", lowered):
+            return None
+
+        def name_after(keyword: str) -> str:
+            match = re.match(rf"^{keyword}\s+([a-z_]\w*)\b", stripped, re.IGNORECASE)
+            return f" {match.group(1)}" if match else ""
+
+        if re.match(r"^program\s+[a-z_]\w*\b", lowered):
+            return "end program" + name_after("program")
+        if re.match(r"^module\s+[a-z_]\w*\b", lowered) and not re.match(r"^module\s+procedure\b", lowered):
+            return "end module" + name_after("module")
+        if re.match(r"^(?:pure\s+|elemental\s+|recursive\s+)*subroutine\s+[a-z_]\w*\b", lowered):
+            match = re.match(r"^(?:pure\s+|elemental\s+|recursive\s+)*subroutine\s+([a-z_]\w*)\b", stripped, re.IGNORECASE)
+            return "end subroutine" + (f" {match.group(1)}" if match else "")
+        if re.match(r"^(?:pure\s+|elemental\s+|recursive\s+)*(?:[a-z_]\w*(?:\([^)]*\))?\s+)*function\s+[a-z_]\w*\b", lowered):
+            match = re.match(r"^(?:pure\s+|elemental\s+|recursive\s+)*(?:[a-z_]\w*(?:\([^)]*\))?\s+)*function\s+([a-z_]\w*)\b", stripped, re.IGNORECASE)
+            return "end function" + (f" {match.group(1)}" if match else "")
+        if re.search(r"\bthen\s*$", lowered):
+            return "end if"
+        if re.match(r"^do(?:\s|$)", lowered):
+            return "end do"
+        if re.match(r"^select\s+(case|type)\b", lowered):
+            return "end select"
+        if re.match(r"^where\b", lowered):
+            return "end where"
+        if re.match(r"^forall\b", lowered):
+            return "end forall"
+        if re.match(r"^associate\b", lowered):
+            return "end associate"
+        if re.match(r"^block\b", lowered):
+            return "end block"
+        if re.match(r"^interface\b", lowered):
+            return "end interface"
+        if re.match(r"^type(?:\s*,[^:]*)?\s*::\s*[a-z_]\w*\b", lowered):
+            match = re.match(r"^type(?:\s*,[^:]*)?\s*::\s*([a-z_]\w*)\b", stripped, re.IGNORECASE)
+            return "end type" + (f" {match.group(1)}" if match else "")
+        return None
 
     def dedent_current_line_if_needed(self, line_index: str, line: str) -> None:
         stripped = line.strip().lower()

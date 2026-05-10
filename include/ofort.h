@@ -204,11 +204,13 @@ typedef struct OfortNode {
     int is_implicit_save;
     int is_parameter;
     int is_optional;
+    int is_value;
     int is_elemental;
     int is_pure;
     int access_attr;        /* 0=none, 1=PUBLIC, 2=PRIVATE */
     int no_advance;         /* WRITE(..., ADVANCE='NO') */
     char result_name[256];  /* for FUNCTION ... RESULT(name) */
+    int has_explicit_result_type;
     char format_str[512];   /* for WRITE format */
     char parent_type_name[64]; /* for TYPE, EXTENDS(parent) */
     /* children */
@@ -224,6 +226,7 @@ typedef struct OfortNode {
     char param_type_names[OFORT_MAX_PARAMS][64];
     int param_intents[OFORT_MAX_PARAMS];
     int param_optional[OFORT_MAX_PARAMS];
+    int param_values[OFORT_MAX_PARAMS];
     int param_n_dims[OFORT_MAX_PARAMS];
     int n_params;
     char type_param_names[OFORT_MAX_PARAMS][64];
@@ -297,6 +300,14 @@ void ofort_set_trace_assign(OfortInterpreter *interp, int enabled);
 
 /* If enabled, PRINT/WRITE output to unit 6 is emitted as it is produced. */
 void ofort_set_live_stdout(OfortInterpreter *interp, int enabled);
+
+/* If enabled, reading a declared but never assigned scalar is an error. */
+void ofort_set_strict_uninitialized(OfortInterpreter *interp, int enabled);
+
+/* Debug initializers for otherwise uninitialized INTEGER, REAL/DOUBLE, and CHARACTER declarations. */
+void ofort_set_init_integer(OfortInterpreter *interp, int enabled, long long value);
+void ofort_set_init_real(OfortInterpreter *interp, int enabled, double value);
+void ofort_set_init_character(OfortInterpreter *interp, int enabled, const char *value);
 
 /* Set parser standard mode. Default is OFORT_STD_LEGACY. */
 void ofort_set_standard_mode(OfortInterpreter *interp, OfortStandardMode mode);
