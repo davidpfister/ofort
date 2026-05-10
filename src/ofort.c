@@ -45,6 +45,7 @@ typedef struct {
     int is_parameter; /* PARAMETER = const */
     int intent;       /* 0=none,1=IN,2=OUT,3=INOUT */
     int is_value;
+    int is_initialized;
     int char_len;     /* declared CHARACTER length, 0 if not CHARACTER */
     int present;      /* 0 for absent OPTIONAL dummy arguments */
     int is_allocatable;
@@ -168,6 +169,13 @@ struct OfortInterpreter {
     int fast_mode;
     int specialized_fast_paths;
     int trace_assign;
+    int strict_uninitialized;
+    int init_integer_enabled;
+    long long init_integer_value;
+    int init_real_enabled;
+    double init_real_value;
+    int init_character_enabled;
+    char init_character_value[OFORT_MAX_STRLEN];
     uint64_t fast_rng_state;
     int line_profile_enabled;
     double *line_profile_seconds;
@@ -888,6 +896,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                 if (!s->vars[i].is_alias) free_value(&s->vars[i].val);
                 s->vars[i].val = alias_val;
                 s->vars[i].is_alias = 1;
+                s->vars[i].is_initialized = alias_val.type != FVAL_VOID;
                 return &s->vars[i];
             }
             if (s->vars[i].is_allocatable && s->vars[i].val.type != FVAL_ARRAY &&
@@ -899,6 +908,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                 if (!s->vars[i].is_alias) free_value(&s->vars[i].val);
                 s->vars[i].val = val;
                 s->vars[i].is_alias = 0;
+                s->vars[i].is_initialized = 0;
                 s->vars[i].pointer_associated = 0;
                 s->vars[i].pointer_target[0] = '\0';
                 s->vars[i].pointer_has_slice = 0;
@@ -921,6 +931,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
             if (!s->vars[i].is_alias) free_value(&s->vars[i].val);
             s->vars[i].val = val;
             s->vars[i].is_alias = 0;
+            s->vars[i].is_initialized = val.type != FVAL_VOID;
             if (s->vars[i].is_pointer) s->vars[i].pointer_associated = 1;
             return &s->vars[i];
         }
@@ -953,6 +964,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                     if (!ps->vars[i].is_alias) free_value(&ps->vars[i].val);
                     ps->vars[i].val = alias_val;
                     ps->vars[i].is_alias = 1;
+                    ps->vars[i].is_initialized = alias_val.type != FVAL_VOID;
                     return &ps->vars[i];
                 }
                 if (ps->vars[i].is_allocatable && ps->vars[i].val.type != FVAL_ARRAY &&
@@ -964,6 +976,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                     if (!ps->vars[i].is_alias) free_value(&ps->vars[i].val);
                     ps->vars[i].val = val;
                     ps->vars[i].is_alias = 0;
+                    ps->vars[i].is_initialized = 0;
                     ps->vars[i].pointer_associated = 0;
                     ps->vars[i].pointer_target[0] = '\0';
                     ps->vars[i].pointer_has_slice = 0;
@@ -986,6 +999,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                 if (!ps->vars[i].is_alias) free_value(&ps->vars[i].val);
                 ps->vars[i].val = val;
                 ps->vars[i].is_alias = 0;
+                ps->vars[i].is_initialized = val.type != FVAL_VOID;
                 if (ps->vars[i].is_pointer) ps->vars[i].pointer_associated = 1;
                 return &ps->vars[i];
             }
@@ -1020,6 +1034,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
     v->is_parameter = 0;
     v->intent = 0;
     v->is_value = 0;
+    v->is_initialized = val.type != FVAL_VOID;
     v->char_len = val.type == FVAL_CHARACTER && val.v.s ? (int)strlen(val.v.s) : 0;
     v->present = 1;
     v->is_allocatable = 0;
@@ -1057,6 +1072,7 @@ static OfortVar *declare_var(OfortInterpreter *I, const char *name, OfortValue v
             if (!s->vars[i].is_alias) free_value(&s->vars[i].val);
             s->vars[i].val = val;
             s->vars[i].is_alias = 0;
+            s->vars[i].is_initialized = val.type != FVAL_VOID;
             s->vars[i].char_len = val.type == FVAL_CHARACTER && val.v.s ? (int)strlen(val.v.s) : 0;
             s->vars[i].present = val.type != FVAL_VOID;
             s->vars[i].scalar_allocated = 0;
@@ -1075,6 +1091,7 @@ static OfortVar *declare_var(OfortInterpreter *I, const char *name, OfortValue v
     v->is_parameter = 0;
     v->intent = 0;
     v->is_value = 0;
+    v->is_initialized = val.type != FVAL_VOID;
     v->char_len = val.type == FVAL_CHARACTER && val.v.s ? (int)strlen(val.v.s) : 0;
     v->present = val.type != FVAL_VOID;
     v->is_allocatable = 0;
@@ -1110,6 +1127,7 @@ static OfortVar *declare_alias_var(OfortInterpreter *I, const char *name, OfortV
     v->is_parameter = target->is_parameter;
     v->intent = target->intent;
     v->is_value = target->is_value;
+    v->is_initialized = target->is_initialized;
     v->char_len = target->char_len;
     v->present = target->present;
     v->is_allocatable = target->is_allocatable;
@@ -1539,6 +1557,7 @@ static void restore_saved_vars(OfortInterpreter *I, OfortFunc *func) {
         v->is_parameter = func->saved_vars[i].is_parameter;
         v->intent = func->saved_vars[i].intent;
         v->is_value = func->saved_vars[i].is_value;
+        v->is_initialized = func->saved_vars[i].is_initialized;
         v->char_len = func->saved_vars[i].char_len;
         v->present = func->saved_vars[i].present;
         v->is_allocatable = func->saved_vars[i].is_allocatable;
@@ -1578,6 +1597,7 @@ static void store_saved_vars(OfortFunc *func, OfortScope *scope) {
         dst->is_parameter = src->is_parameter;
         dst->intent = src->intent;
         dst->is_value = src->is_value;
+        dst->is_initialized = src->is_initialized;
         dst->char_len = src->char_len;
         dst->present = src->present;
         dst->is_allocatable = src->is_allocatable;
@@ -1605,6 +1625,7 @@ static void copy_imported_var_attrs(OfortVar *dst, const OfortVar *src) {
     dst->is_parameter = src->is_parameter;
     dst->intent = src->intent;
     dst->is_value = src->is_value;
+    dst->is_initialized = src->is_initialized;
     dst->char_len = src->char_len;
     dst->present = src->present;
     dst->is_allocatable = src->is_allocatable;
@@ -8780,6 +8801,75 @@ static OfortValue default_value(OfortValType vtype, int char_len) {
     }
 }
 
+static int decl_has_explicit_initializer(OfortNode *n) {
+    return n && n->n_children > 0 && n->children[0] != NULL;
+}
+
+static OfortValue make_repeated_character_initializer(const char *text, int char_len) {
+    char *buf;
+    size_t text_len;
+    OfortValue v;
+    if (char_len < 1) char_len = 1;
+    buf = (char *)calloc((size_t)char_len + 1, 1);
+    if (!buf) return make_character("");
+    text = text ? text : "";
+    text_len = strlen(text);
+    for (int i = 0; i < char_len; i++) {
+        buf[i] = text_len > 0 ? text[(size_t)i % text_len] : ' ';
+    }
+    v = make_character(buf);
+    free(buf);
+    return v;
+}
+
+static void apply_debug_decl_initializer(OfortInterpreter *I, OfortValue *val, OfortValType decl_type) {
+    if (!I || !val) return;
+    if (decl_type == FVAL_INTEGER && I->init_integer_enabled) {
+        if (val->type == FVAL_INTEGER) {
+            val->v.i = I->init_integer_value;
+        } else if (val->type == FVAL_ARRAY && val->v.arr.elem_type == FVAL_INTEGER) {
+            if (val->v.arr.int_data) {
+                for (int i = 0; i < val->v.arr.len; i++) val->v.arr.int_data[i] = I->init_integer_value;
+            } else if (val->v.arr.data) {
+                for (int i = 0; i < val->v.arr.len; i++) {
+                    free_value(&val->v.arr.data[i]);
+                    val->v.arr.data[i] = make_integer(I->init_integer_value);
+                }
+            }
+        }
+    } else if ((decl_type == FVAL_REAL || decl_type == FVAL_DOUBLE) && I->init_real_enabled) {
+        if (val->type == FVAL_REAL || val->type == FVAL_DOUBLE) {
+            val->v.r = I->init_real_value;
+        } else if (val->type == FVAL_ARRAY &&
+                   (val->v.arr.elem_type == FVAL_REAL || val->v.arr.elem_type == FVAL_DOUBLE)) {
+            if (val->v.arr.real_data) {
+                for (int i = 0; i < val->v.arr.len; i++) val->v.arr.real_data[i] = I->init_real_value;
+            } else if (val->v.arr.data) {
+                for (int i = 0; i < val->v.arr.len; i++) {
+                    free_value(&val->v.arr.data[i]);
+                    val->v.arr.data[i] = val->v.arr.elem_type == FVAL_DOUBLE ?
+                                         make_double(I->init_real_value) :
+                                         make_real(I->init_real_value);
+                }
+            }
+        }
+    } else if (decl_type == FVAL_CHARACTER && I->init_character_enabled) {
+        if (val->type == FVAL_CHARACTER) {
+            OfortValue init = make_repeated_character_initializer(I->init_character_value,
+                                                                  val->v.s ? (int)strlen(val->v.s) : 1);
+            free_value(val);
+            *val = init;
+        } else if (val->type == FVAL_ARRAY && val->v.arr.elem_type == FVAL_CHARACTER && val->v.arr.data) {
+            for (int i = 0; i < val->v.arr.len; i++) {
+                int char_len = val->v.arr.data[i].v.s ? (int)strlen(val->v.arr.data[i].v.s) : 1;
+                OfortValue init = make_repeated_character_initializer(I->init_character_value, char_len);
+                free_value(&val->v.arr.data[i]);
+                val->v.arr.data[i] = init;
+            }
+        }
+    }
+}
+
 static OfortValue make_array(OfortValType elem_type, int *dims, int n_dims);
 static OfortValue make_array_with_char_len(OfortValType elem_type, int *dims, int n_dims, int char_len);
 static int assign_packed_array_element(OfortValue *arr, int index, OfortValue rhs);
@@ -12253,6 +12343,9 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         if (v->is_pointer) {
             if (!v->pointer_associated && v->val.type == FVAL_VOID) return make_void_val();
             return copy_value(v->val);
+        }
+        if (I->strict_uninitialized && !v->is_initialized) {
+            ofort_error(I, "Variable '%s' is used before it is set at line %d", n->name, n->line);
         }
         return copy_value(v->val);
     }
@@ -17031,6 +17124,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             val = default_value(n->val_type, n->val_type == FVAL_CHARACTER ? decl_char_len : n->char_len);
         }
 
+        if (!decl_has_explicit_initializer(n) &&
+            n->type != FND_PARAMDECL && !n->is_parameter &&
+            !n->is_allocatable && !n->is_pointer) {
+            apply_debug_decl_initializer(I, &val, n->val_type);
+        }
+
         if (n->val_type == FVAL_CHARACTER)
             val = resize_character_value(val, decl_char_len);
 
@@ -17085,6 +17184,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         if (val_is_alias) v->is_alias = 1;
         if (n->is_parameter || n->type == FND_PARAMDECL) v->is_parameter = 1;
         v->is_value = n->is_value;
+        v->is_initialized = decl_has_explicit_initializer(n) ||
+                            n->type == FND_PARAMDECL ||
+                            n->is_parameter ||
+                            val_is_alias ||
+                            n->is_allocatable ||
+                            n->is_pointer;
         v->is_allocatable = n->is_allocatable;
         v->scalar_allocated = 0;
         v->declared_type = n->val_type;
@@ -17172,6 +17277,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         if (is_null_func_call_node(rhs_node)) {
             free_value(&ptr->val);
             ptr->val = make_void_val();
+            ptr->is_initialized = 1;
             ptr->pointer_associated = 0;
             ptr->pointer_target[0] = '\0';
             ptr->pointer_has_slice = 0;
@@ -17187,6 +17293,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         free_value(&ptr->val);
         ptr->val = rhs;
         ptr->pointer_associated = 1;
+        ptr->is_initialized = 1;
         copy_cstr(ptr->pointer_target, sizeof(ptr->pointer_target), target_name);
         ptr->pointer_has_slice = has_slice;
         ptr->pointer_slice_start = slice_start;
@@ -17234,6 +17341,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     if (!I->where_mask && v->val.v.arr.real_data && rhs.v.arr.real_data) {
                         memcpy(v->val.v.arr.real_data, rhs.v.arr.real_data,
                                sizeof(double) * (size_t)v->val.v.arr.len);
+                        v->is_initialized = 1;
                         trace_assignment_value(I, lhs, rhs);
                         free_value(&rhs);
                         break;
@@ -17241,6 +17349,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     if (!I->where_mask && v->val.v.arr.int_data && rhs.v.arr.int_data) {
                         memcpy(v->val.v.arr.int_data, rhs.v.arr.int_data,
                                sizeof(long long) * (size_t)v->val.v.arr.len);
+                        v->is_initialized = 1;
                         trace_assignment_value(I, lhs, rhs);
                         free_value(&rhs);
                         break;
@@ -17301,6 +17410,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         }
                     }
                 }
+                v->is_initialized = 1;
                 trace_assignment_value(I, lhs, rhs);
                 free_value(&rhs);
             } else {
@@ -17314,6 +17424,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (var->is_protected) ofort_error(I, "Cannot assign to PROTECTED variable '%s'", lhs->name);
             if (var->val.type == FVAL_CHARACTER) {
                 assign_character_substring(I, var, lhs, &rhs);
+                var->is_initialized = 1;
                 trace_assignment_value(I, lhs, rhs);
                 free_value(&rhs);
                 break;
@@ -17322,6 +17433,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 ofort_error(I, "'%s' is not an array", lhs->name);
 
             assign_array_ref(I, var, lhs, &rhs);
+            var->is_initialized = 1;
             trace_assignment_value(I, lhs, rhs);
             free_value(&rhs);
         } else if (lhs->type == FND_ARRAY_REF) {
@@ -24676,6 +24788,34 @@ void ofort_set_live_stdout(OfortInterpreter *interp, int enabled) {
 void ofort_set_standard_mode(OfortInterpreter *interp, OfortStandardMode mode) {
     if (interp) {
         interp->standard_mode = mode;
+    }
+}
+
+void ofort_set_strict_uninitialized(OfortInterpreter *interp, int enabled) {
+    if (interp) {
+        interp->strict_uninitialized = enabled ? 1 : 0;
+    }
+}
+
+void ofort_set_init_integer(OfortInterpreter *interp, int enabled, long long value) {
+    if (interp) {
+        interp->init_integer_enabled = enabled ? 1 : 0;
+        interp->init_integer_value = value;
+    }
+}
+
+void ofort_set_init_real(OfortInterpreter *interp, int enabled, double value) {
+    if (interp) {
+        interp->init_real_enabled = enabled ? 1 : 0;
+        interp->init_real_value = value;
+    }
+}
+
+void ofort_set_init_character(OfortInterpreter *interp, int enabled, const char *value) {
+    if (interp) {
+        interp->init_character_enabled = enabled ? 1 : 0;
+        copy_cstr(interp->init_character_value, sizeof(interp->init_character_value),
+                  value ? value : "");
     }
 }
 
