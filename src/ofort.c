@@ -3471,10 +3471,20 @@ static int source_ends_with_bare_end(OfortInterpreter *I) {
     return q == p || *q == '!';
 }
 
-static void consume_end(OfortInterpreter *I, const char *what) {
+static void consume_end_named(OfortInterpreter *I, const char *what, const char *expected_name) {
+    OfortToken *end_name = NULL;
     if (what && check_end(I, what) && peek(I)->type == FTOK_IDENT) {
         advance(I);
-        if (token_can_be_name(peek(I))) advance(I);
+        if (token_can_be_name(peek(I))) end_name = advance(I);
+        if (expected_name && expected_name[0] && end_name) {
+            char got_upper[256];
+            char expected_upper[256];
+            str_upper(got_upper, token_name_text(end_name), sizeof(got_upper));
+            str_upper(expected_upper, expected_name, sizeof(expected_upper));
+            if (strcmp(got_upper, expected_upper) != 0) {
+                ofort_error(I, "Expected label '%s' for END %s statement", expected_name, what);
+            }
+        }
         return;
     }
     if (what && I->consumed_bare_end) {
@@ -3482,14 +3492,31 @@ static void consume_end(OfortInterpreter *I, const char *what) {
         return;
     }
     if (what && check(I, FTOK_EOF)) {
+        if (source_ends_with_bare_end(I)) return;
+        if (strcmp(what, "SUBROUTINE") == 0 ||
+            strcmp(what, "FUNCTION") == 0 ||
+            strcmp(what, "MODULE") == 0 ||
+            strcmp(what, "SUBMODULE") == 0 ||
+            strcmp(what, "PROCEDURE") == 0 ||
+            strcmp(what, "BLOCK") == 0) {
+            return;
+        }
         for (int pos = I->n_tokens - 1; pos >= 0; pos--) {
             OfortTokenType t = I->tokens[pos].type;
             if (t == FTOK_EOF || t == FTOK_NEWLINE || t == FTOK_SEMICOLON) continue;
-            if (t == FTOK_END) return;
+            if (t == FTOK_END &&
+                (strcmp(what, "PROGRAM") == 0 ||
+                 strcmp(what, "SUBROUTINE") == 0 ||
+                 strcmp(what, "FUNCTION") == 0 ||
+                 strcmp(what, "MODULE") == 0 ||
+                 strcmp(what, "SUBMODULE") == 0 ||
+                 strcmp(what, "PROCEDURE") == 0 ||
+                 strcmp(what, "BLOCK") == 0)) {
+                return;
+            }
             break;
         }
-        if (source_ends_with_bare_end(I)) return;
-        return;
+        ofort_error(I, "Unexpected end of file: missing END %s", what);
     }
     expect(I, FTOK_END);
     if (what) {
@@ -3498,9 +3525,22 @@ static void consume_end(OfortInterpreter *I, const char *what) {
         if (t->type != FTOK_NEWLINE && t->type != FTOK_EOF) {
             advance(I); /* skip PROGRAM/DO/IF/etc. */
             /* optionally skip name after END PROGRAM name */
-            if (token_can_be_name(peek(I))) advance(I);
+            if (token_can_be_name(peek(I))) end_name = advance(I);
+            if (expected_name && expected_name[0] && end_name) {
+                char got_upper[256];
+                char expected_upper[256];
+                str_upper(got_upper, token_name_text(end_name), sizeof(got_upper));
+                str_upper(expected_upper, expected_name, sizeof(expected_upper));
+                if (strcmp(got_upper, expected_upper) != 0) {
+                    ofort_error(I, "Expected label '%s' for END %s statement", expected_name, what);
+                }
+            }
         }
     }
+}
+
+static void consume_end(OfortInterpreter *I, const char *what) {
+    consume_end_named(I, what, NULL);
 }
 
 /* ── Expression parsing (precedence climbing) ── */
@@ -3767,6 +3807,7 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
                 pos++;
             }
             if (has_type_spec) {
+                n->has_explicit_result_type = 1;
                 while (!check(I, FTOK_DCOLON) && !check(I, FTOK_RBRACKET) && !check(I, FTOK_EOF)) {
                     advance(I);
                 }
@@ -4825,8 +4866,8 @@ static OfortNode *parse_if(OfortInterpreter *I) {
         int ecap = 0;
         while (!check_end(I, "IF") && peek(I)->type != FTOK_EOF) {
             skip_newlines(I);
-            if (check_end(I, "IF")) break;
-            OfortNode *s = parse_statement(I);
+        if (check_end(I, "IF")) break;
+        OfortNode *s = parse_statement(I);
             if (s) {
                 if (else_body->n_stmts >= ecap) {
                     ecap = ecap ? ecap * 2 : 8;
@@ -4843,6 +4884,8 @@ static OfortNode *parse_if(OfortInterpreter *I) {
 
     if (check_end(I, "IF")) {
         consume_end(I, "IF");
+    } else if (check(I, FTOK_EOF)) {
+        ofort_error(I, "Unexpected end of file: missing END IF");
     }
 
     return n;
@@ -5967,9 +6010,7 @@ static OfortNode *parse_block_data(OfortInterpreter *I) {
     n->children[0] = parse_block_until_end(I, "BLOCK");
     I->in_spec_section = prev_spec_section;
     n->n_children = 1;
-    if (check(I, FTOK_END) || check_end(I, "BLOCK")) {
-        skip_to_next_line(I);
-    }
+    consume_end(I, "BLOCK");
     return n;
 }
 
@@ -6605,7 +6646,7 @@ static OfortNode *parse_subroutine(OfortInterpreter *I) {
         n->children[0] = parse_block_until_end(I, "SUBROUTINE");
         I->in_spec_section = prev_spec_section;
         n->n_children = 1;
-        consume_end(I, "SUBROUTINE");
+        consume_end_named(I, "SUBROUTINE", n->name);
     }
     return n;
 }
@@ -6667,7 +6708,7 @@ static OfortNode *parse_function_with_type(OfortInterpreter *I, OfortValType res
         n->children[0] = parse_block_until_end(I, "FUNCTION");
         I->in_spec_section = prev_spec_section;
         n->n_children = 1;
-        consume_end(I, "FUNCTION");
+        consume_end_named(I, "FUNCTION", n->name);
     }
     return n;
 }
@@ -6718,7 +6759,7 @@ static OfortNode *parse_module(OfortInterpreter *I) {
         n->children[0] = parse_block_until_end(I, "MODULE");
         I->in_spec_section = prev_spec_section;
         n->n_children = 1;
-        consume_end(I, "MODULE");
+        consume_end_named(I, "MODULE", n->name);
     }
     return n;
 }
@@ -6970,7 +7011,7 @@ static OfortNode *parse_type_def(OfortInterpreter *I) {
         }
         skip_newlines(I);
     }
-    consume_end(I, "TYPE");
+    consume_end_named(I, "TYPE", n->name);
     return n;
 }
 
@@ -8330,7 +8371,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         n->line = t->line;
         n->children[0] = parse_block_until_end(I, "PROGRAM");
         n->n_children = 1;
-        consume_end(I, "PROGRAM");
+        consume_end_named(I, "PROGRAM", n->name);
         return n;
     }
 
@@ -13397,6 +13438,15 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         int char_len = 1;
         if (nelem > 0) etype = elems[0].type;
         if (etype == FVAL_CHARACTER && elems[0].v.s) char_len = (int)strlen(elems[0].v.s);
+        if (n->line > 0 && !n->has_explicit_result_type && etype == FVAL_CHARACTER) {
+            for (int i = 1; i < nelem; i++) {
+                int elem_len = elems[i].type == FVAL_CHARACTER && elems[i].v.s ? (int)strlen(elems[i].v.s) : 0;
+                if (elem_len != char_len) {
+                    ofort_error(I, "Different CHARACTER lengths (%d/%d) in array constructor",
+                                char_len, elem_len);
+                }
+            }
+        }
         OfortValue arr = make_array_with_char_len(etype, dims, 1, char_len);
         for (int i = 0; i < nelem; i++) {
             free_value(&arr.v.arr.data[i]);
