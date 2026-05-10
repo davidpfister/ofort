@@ -34,6 +34,8 @@ static int starts_with_word_nocase(const char *line, const char *word);
 static int string_eq_nocase(const char *a, const char *b);
 static int identifier_char(int c);
 static int line_is_terminal_end(const char *start, const char *end);
+static int validate_source_file_terminal_end(const char *path, const char *source);
+static int has_program_unit_header(const char *source);
 static int add_repl_line_to_buffer(char **buf, size_t *len, size_t *cap, const char *line);
 static int source_defines_name(const char *source, const char *name);
 static int replace_source_line(char **buf, size_t *len, size_t *cap, int line_no, const char *text);
@@ -1740,6 +1742,107 @@ static int validate_repl_line_before_append(const char *source, const char *line
     return 1;
 }
 
+static const char *skip_repl_string_literal(const char *p, const char *end, int *literal_len) {
+    char quote;
+    int len = 0;
+
+    if (!p || p >= end || (*p != '\'' && *p != '"')) return NULL;
+    quote = *p++;
+    while (p < end) {
+        if (*p == quote) {
+            if (p + 1 < end && p[1] == quote) {
+                len++;
+                p += 2;
+                continue;
+            }
+            if (literal_len) *literal_len = len;
+            return p + 1;
+        }
+        len++;
+        p++;
+    }
+    return NULL;
+}
+
+static int rewrite_repl_character_constructor_shortcut(char *line, size_t line_size) {
+    const char *start;
+    const char *p;
+    const char *end;
+    const char *close;
+    const char *tail;
+    char rewritten[4096];
+    int first_len = -1;
+    int max_len = 0;
+    int n_elems = 0;
+    int mixed = 0;
+    size_t prefix_len;
+    size_t body_len;
+
+    if (!line || line_size == 0) return 0;
+    start = line;
+    while ((start = strchr(start, '[')) != NULL) {
+        int in_string = 0;
+        char quote = '\0';
+        const char *q;
+        for (q = line; q < start; q++) {
+            if (in_string) {
+                if (*q == quote) {
+                    if (q + 1 < start && q[1] == quote) q++;
+                    else in_string = 0;
+                }
+            } else if (*q == '\'' || *q == '"') {
+                in_string = 1;
+                quote = *q;
+            }
+        }
+        if (!in_string) break;
+        start++;
+    }
+    if (!start) return 0;
+
+    p = start + 1;
+    end = line + strlen(line);
+    while (p < end && isspace((unsigned char)*p)) p++;
+    {
+        const char *dc = strstr(p, "::");
+        const char *rb = strchr(p, ']');
+        if (!rb) return 0;
+        if (dc && dc < rb) return 0;
+    }
+
+    for (;;) {
+        int lit_len = 0;
+        const char *after;
+        while (p < end && isspace((unsigned char)*p)) p++;
+        after = skip_repl_string_literal(p, end, &lit_len);
+        if (!after) return 0;
+        if (first_len < 0) first_len = lit_len;
+        if (lit_len != first_len) mixed = 1;
+        if (lit_len > max_len) max_len = lit_len;
+        n_elems++;
+        p = after;
+        while (p < end && isspace((unsigned char)*p)) p++;
+        if (*p == ',') {
+            p++;
+            continue;
+        }
+        if (*p == ']') break;
+        return 0;
+    }
+    close = p;
+    tail = close + 1;
+    if (n_elems < 2 || !mixed || max_len <= 0) return 0;
+
+    prefix_len = (size_t)(start - line);
+    body_len = (size_t)(close - (start + 1));
+    if (prefix_len + body_len + strlen(tail) + 48 >= sizeof(rewritten)) return 0;
+    snprintf(rewritten, sizeof(rewritten), "%.*s[character(len=%d) :: %.*s]%s",
+             (int)prefix_len, line, max_len, (int)body_len, start + 1, tail);
+    if (strlen(rewritten) + 1 > line_size) return 0;
+    strcpy(line, rewritten);
+    return max_len;
+}
+
 static int parse_save_command(const char *line, const char *command,
                               char *path, size_t path_size, int *has_path,
                               int *overwrite) {
@@ -2418,6 +2521,10 @@ static int run_ofort_file_to_path(const char *source_path, const char *out_path)
         return 2;
     }
     normalize_newlines(source);
+    if (!validate_source_file_terminal_end(source_path, source)) {
+        free(source);
+        return 1;
+    }
     source = maybe_wrap_loose_source(source);
     if (!source) {
         return 2;
@@ -2466,6 +2573,10 @@ static int check_ofort_file(const char *source_path, int quiet, int label_failur
         return 2;
     }
     normalize_newlines(source);
+    if (!validate_source_file_terminal_end(source_path, source)) {
+        free(source);
+        return 1;
+    }
     source = maybe_wrap_loose_source(source);
     if (!source) {
         return 2;
@@ -2542,6 +2653,9 @@ static int run_each_file(const char *const *paths, int npaths, int limit, int ma
             char *source = read_source_file(paths[i]);
             if (!source) {
                 rc = 2;
+            } else if (!validate_source_file_terminal_end(paths[i], source)) {
+                rc = 1;
+                free(source);
             } else {
                 rc = execute_source_text(source, 0, 0, command_argc, command_args, start, NULL);
                 free(source);
@@ -4219,6 +4333,14 @@ static int run_interactive(const char *load_path, int run_after_load) {
             }
         }
         rewrite_repl_print_shortcut(line, sizeof(line));
+        {
+            int rewritten_char_len = rewrite_repl_character_constructor_shortcut(line, sizeof(line));
+            if (rewritten_char_len > 0 && g_warnings_enabled) {
+                fprintf(stderr,
+                        "warning: rewrote mixed-length character constructor as character(len=%d)\n",
+                        rewritten_char_len);
+            }
+        }
 
         if (!validate_repl_line_before_append(buf ? buf : "", line)) {
             last_rc = 1;
@@ -4448,6 +4570,13 @@ static char *read_source_file(const char *path) {
         }
     }
     return source;
+}
+
+static int validate_source_file_terminal_end(const char *path, const char *source) {
+    if (source_has_terminal_end(source)) return 1;
+    if (has_program_unit_header(source)) return 1;
+    fprintf(stderr, "Unexpected end of file in '%s'\n", path ? path : "stdin");
+    return 0;
 }
 
 static char *read_files_concatenated(const char *const *paths, int npaths, SourceMap *source_map) {
@@ -4992,6 +5121,13 @@ int main(int argc, char **argv) {
         source_map_free(&source_map);
         path_list_free(&source_paths);
         return 2;
+    }
+    if (source_paths.count > 0 &&
+        !validate_source_file_terminal_end(source_paths.count == 1 ? source_paths.items[0] : "combined source", source)) {
+        free(source);
+        source_map_free(&source_map);
+        path_list_free(&source_paths);
+        return 1;
     }
     {
         double start = setup_start > 0.0 ? setup_start : monotonic_seconds();
