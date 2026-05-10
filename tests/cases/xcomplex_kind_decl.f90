@@ -7,3 +7,4 @@ z8 = (3.0, 4.0)
 z16 = (5.0, 6.0)
 a = z8
 print *, kind(z4), kind(z8), kind(z16), kind(a(1,1))
+end

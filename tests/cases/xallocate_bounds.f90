@@ -13,3 +13,4 @@ p(2,1,4) = 13
 print *, lbound(p)
 print *, ubound(p)
 print *, size(p), p(0,-1,3), p(1,0,3), p(2,1,4)
+end

@@ -14,3 +14,4 @@ rewind(unit=11)
 read(11,*) y
 print *, y
 close(11)
+end
