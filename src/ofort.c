@@ -105,6 +105,9 @@ typedef struct {
     OfortNode *field_type_param_exprs[OFORT_MAX_FIELDS][OFORT_MAX_TYPE_ACTUALS];
     int field_n_type_param_exprs[OFORT_MAX_FIELDS];
     int field_dims[OFORT_MAX_FIELDS][7];
+    int field_lower_bounds[OFORT_MAX_FIELDS][7];
+    int field_has_lower_bound[OFORT_MAX_FIELDS][7];
+    OfortNode *field_lower_bound_exprs[OFORT_MAX_FIELDS][7];
     OfortNode *field_dim_exprs[OFORT_MAX_FIELDS][7];
     int field_n_dims[OFORT_MAX_FIELDS];
     int field_is_pointer[OFORT_MAX_FIELDS];
@@ -4706,6 +4709,14 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
             decl->n_children = 1;
         }
 
+        if (!check(I, FTOK_COMMA) && !check(I, FTOK_NEWLINE) &&
+            !check(I, FTOK_SEMICOLON) && !check(I, FTOK_EOF)) {
+            char found[256];
+            describe_token(found, sizeof(found), peek(I));
+            ofort_error(I, "Syntax error at line %d: unexpected %s in declaration",
+                        peek(I)->line, found);
+        }
+
         if (block->n_stmts >= cap) {
             cap = cap ? cap * 2 : 4;
             block->stmts = (OfortNode **)realloc(block->stmts, sizeof(OfortNode *) * cap);
@@ -8746,6 +8757,7 @@ static OfortValue make_array(OfortValType elem_type, int *dims, int n_dims);
 static OfortValue make_array_with_char_len(OfortValType elem_type, int *dims, int n_dims, int char_len);
 static int assign_packed_array_element(OfortValue *arr, int index, OfortValue rhs);
 static OfortValue array_element_value(const OfortValue *arr, int index);
+static void set_array_lower_bounds(OfortValue *arr, int *lower_bounds, int n_dims);
 static OfortValue make_derived_array(OfortInterpreter *I, const char *type_name, int *dims, int n_dims);
 static OfortValue make_derived_array_with_params(OfortInterpreter *I, const char *type_name,
                                                  OfortNode **param_exprs,
@@ -8756,6 +8768,26 @@ static OfortValue default_derived_value_with_params(OfortInterpreter *I, const c
                                                     OfortNode **param_exprs,
                                                     char param_names[OFORT_MAX_PARAMS][256],
                                                     int n_param_exprs);
+
+static void resolve_type_field_shape(OfortInterpreter *I, OfortTypeDef *td, int field,
+                                     int *dims, int *lower_bounds) {
+    for (int d = 0; d < td->field_n_dims[field] && d < 7; d++) {
+        int lower = td->field_has_lower_bound[field][d] ? td->field_lower_bounds[field][d] : 1;
+        if (td->field_dim_exprs[field][d]) {
+            OfortValue dv = eval_node(I, td->field_dim_exprs[field][d]);
+            dims[d] = (int)val_to_int(dv);
+            free_value(&dv);
+        } else {
+            dims[d] = td->field_dims[field][d];
+        }
+        if (td->field_has_lower_bound[field][d] && td->field_lower_bound_exprs[field][d]) {
+            OfortValue lv = eval_node(I, td->field_lower_bound_exprs[field][d]);
+            lower = (int)val_to_int(lv);
+            free_value(&lv);
+        }
+        lower_bounds[d] = lower;
+    }
+}
 
 static OfortValue default_derived_value(OfortInterpreter *I, const char *type_name) {
     OfortTypeDef *td = find_type_def(I, type_name);
@@ -8775,6 +8807,7 @@ static OfortValue default_derived_value(OfortInterpreter *I, const char *type_na
         int field_kind = 0;
         int field_char_len = td->field_char_lens[i];
         int field_dims[7];
+        int field_lower_bounds[7] = {1, 1, 1, 1, 1, 1, 1};
         OfortValType field_type = td->field_types[i];
         memcpy(field_dims, td->field_dims[i], sizeof(field_dims));
         if (td->field_kind_exprs[i]) {
@@ -8790,13 +8823,7 @@ static OfortValue default_derived_value(OfortInterpreter *I, const char *type_na
         }
         if (field_char_len < 0) field_char_len = 0;
         if (field_char_len >= OFORT_MAX_STRLEN) field_char_len = OFORT_MAX_STRLEN - 1;
-        for (int d = 0; d < td->field_n_dims[i] && d < 7; d++) {
-            if (td->field_dim_exprs[i][d]) {
-                OfortValue dv = eval_node(I, td->field_dim_exprs[i][d]);
-                field_dims[d] = (int)val_to_int(dv);
-                free_value(&dv);
-            }
-        }
+        resolve_type_field_shape(I, td, i, field_dims, field_lower_bounds);
         copy_cstr(v.v.dt.field_names[i], sizeof(v.v.dt.field_names[i]), td->field_names[i]);
         if (td->field_is_allocatable[i]) {
             if (td->field_n_dims[i] > 0) {
@@ -8825,9 +8852,11 @@ static OfortValue default_derived_value(OfortInterpreter *I, const char *type_na
                                                                   NULL,
                                                                   td->field_n_type_param_exprs[i],
                                                                   field_dims, td->field_n_dims[i]);
+                set_array_lower_bounds(&v.v.dt.fields[i], field_lower_bounds, td->field_n_dims[i]);
             } else {
                 v.v.dt.fields[i] = make_array_with_char_len(field_type, field_dims,
                                                             td->field_n_dims[i], field_char_len);
+                set_array_lower_bounds(&v.v.dt.fields[i], field_lower_bounds, td->field_n_dims[i]);
             }
         } else if (field_type == FVAL_DERIVED && td->field_type_names[i][0]) {
             v.v.dt.fields[i] = default_derived_value_with_params(I, td->field_type_names[i],
@@ -13077,6 +13106,10 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             v.v.dt.field_names = (char(*)[64])calloc(td->n_fields, sizeof(char[64]));
             copy_cstr(v.v.dt.type_name, sizeof(v.v.dt.type_name), td->name);
             for (int i = 0; i < td->n_fields; i++) {
+                int field_dims[7];
+                int field_lower_bounds[7] = {1, 1, 1, 1, 1, 1, 1};
+                memcpy(field_dims, td->field_dims[i], sizeof(field_dims));
+                resolve_type_field_shape(I, td, i, field_dims, field_lower_bounds);
                 strcpy(v.v.dt.field_names[i], td->field_names[i]);
                 if (i < nargs) {
                     if (td->field_n_dims[i] > 0 && args[i].type != FVAL_ARRAY) {
@@ -13086,11 +13119,12 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                             field_char_len = (int)strlen(args[i].v.s);
                         if (td->field_types[i] == FVAL_DERIVED && td->field_type_names[i][0]) {
                             v.v.dt.fields[i] = make_derived_array(I, td->field_type_names[i],
-                                                                   td->field_dims[i], td->field_n_dims[i]);
+                                                                   field_dims, td->field_n_dims[i]);
                         } else {
-                            v.v.dt.fields[i] = make_array_with_char_len(td->field_types[i], td->field_dims[i],
+                            v.v.dt.fields[i] = make_array_with_char_len(td->field_types[i], field_dims,
                                                                         td->field_n_dims[i], field_char_len);
                         }
+                        set_array_lower_bounds(&v.v.dt.fields[i], field_lower_bounds, td->field_n_dims[i]);
                         for (int j = 0; j < v.v.dt.fields[i].v.arr.len; j++) {
                             OfortValue elem = copy_value(args[i]);
                             elem = coerce_assignment_value(I, td->field_names[i], td->field_types[i], elem);
@@ -13123,9 +13157,11 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 } else if (td->field_n_dims[i] > 0) {
                     if (td->field_types[i] == FVAL_DERIVED && td->field_type_names[i][0]) {
                         v.v.dt.fields[i] = make_derived_array(I, td->field_type_names[i],
-                                                               td->field_dims[i], td->field_n_dims[i]);
+                                                               field_dims, td->field_n_dims[i]);
+                        set_array_lower_bounds(&v.v.dt.fields[i], field_lower_bounds, td->field_n_dims[i]);
                     } else {
-                        v.v.dt.fields[i] = make_array(td->field_types[i], td->field_dims[i], td->field_n_dims[i]);
+                        v.v.dt.fields[i] = make_array(td->field_types[i], field_dims, td->field_n_dims[i]);
+                        set_array_lower_bounds(&v.v.dt.fields[i], field_lower_bounds, td->field_n_dims[i]);
                     }
                 } else if (td->field_types[i] == FVAL_DERIVED && td->field_type_names[i][0]) {
                     v.v.dt.fields[i] = default_derived_value(I, td->field_type_names[i]);
@@ -16293,7 +16329,11 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 memcpy(td->field_type_param_exprs[i], parent->field_type_param_exprs[i],
                        sizeof(td->field_type_param_exprs[i]));
                 memcpy(td->field_dims[i], parent->field_dims[i], sizeof(td->field_dims[i]));
+                memcpy(td->field_lower_bounds[i], parent->field_lower_bounds[i], sizeof(td->field_lower_bounds[i]));
+                memcpy(td->field_has_lower_bound[i], parent->field_has_lower_bound[i], sizeof(td->field_has_lower_bound[i]));
                 memcpy(td->field_dim_exprs[i], parent->field_dim_exprs[i], sizeof(td->field_dim_exprs[i]));
+                memcpy(td->field_lower_bound_exprs[i], parent->field_lower_bound_exprs[i],
+                       sizeof(td->field_lower_bound_exprs[i]));
             }
             td->n_bindings = parent->n_bindings;
             for (int i = 0; i < parent->n_bindings; i++) {
@@ -16403,6 +16443,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         td->field_is_pointer[td->n_fields] = d->is_pointer;
                         td->field_is_allocatable[td->n_fields] = d->is_allocatable;
                         memcpy(td->field_dims[td->n_fields], d->dims, sizeof(td->field_dims[td->n_fields]));
+                        memcpy(td->field_lower_bounds[td->n_fields], d->lower_bounds,
+                               sizeof(td->field_lower_bounds[td->n_fields]));
+                        memcpy(td->field_has_lower_bound[td->n_fields], d->has_lower_bound,
+                               sizeof(td->field_has_lower_bound[td->n_fields]));
+                        memcpy(td->field_lower_bound_exprs[td->n_fields], d->lower_bound_exprs,
+                               sizeof(td->field_lower_bound_exprs[td->n_fields]));
                         for (int fd = 0; fd < d->n_dims && fd < 7 && fd < d->n_stmts; fd++) {
                             td->field_dim_exprs[td->n_fields][fd] = d->stmts ? d->stmts[fd] : NULL;
                         }
@@ -16469,6 +16515,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 td->field_is_pointer[td->n_fields] = s->is_pointer;
                 td->field_is_allocatable[td->n_fields] = s->is_allocatable;
                 memcpy(td->field_dims[td->n_fields], s->dims, sizeof(td->field_dims[td->n_fields]));
+                memcpy(td->field_lower_bounds[td->n_fields], s->lower_bounds,
+                       sizeof(td->field_lower_bounds[td->n_fields]));
+                memcpy(td->field_has_lower_bound[td->n_fields], s->has_lower_bound,
+                       sizeof(td->field_has_lower_bound[td->n_fields]));
+                memcpy(td->field_lower_bound_exprs[td->n_fields], s->lower_bound_exprs,
+                       sizeof(td->field_lower_bound_exprs[td->n_fields]));
                 for (int fd = 0; fd < s->n_dims && fd < 7 && fd < s->n_stmts; fd++) {
                     td->field_dim_exprs[td->n_fields][fd] = s->stmts ? s->stmts[fd] : NULL;
                 }

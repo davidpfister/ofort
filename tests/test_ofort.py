@@ -1,9 +1,12 @@
-from pathlib import Path
+﻿from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 
 import pytest
+
+from scripts.analyze_ofort_symbols import DEFAULT_SOURCE, build_report, keyword_name_test_source
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -64,6 +67,375 @@ def case_files():
             "ximplicit_typing_ranges.f90",
         }
     )
+
+
+def test_keywords_can_be_variable_names_like_gfortran(tmp_path):
+    gfortran = shutil.which("gfortran")
+    if not gfortran:
+        pytest.skip("gfortran is required as the keyword-name oracle")
+
+    keywords = build_report(DEFAULT_SOURCE)["keywords"]
+    source = tmp_path / "keyword_names.f90"
+    exe = tmp_path / ("keyword_names.exe" if sys.platform.startswith("win") else "keyword_names")
+    source.write_text(keyword_name_test_source(keywords), encoding="utf-8")
+
+    gfortran_compile = subprocess.run(
+        [gfortran, str(source), "-o", str(exe)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=15,
+    )
+    assert gfortran_compile.returncode == 0, gfortran_compile.stdout + gfortran_compile.stderr
+
+    expected = subprocess.run(
+        [str(exe)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+    assert expected.returncode == 0, expected.stdout + expected.stderr
+
+    result = subprocess.run(
+        [str(OFORT), str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stderr == ""
+    assert result.stdout.split() == expected.stdout.split()
+
+
+def test_namelist_read_write_roundtrip(tmp_path):
+    source = tmp_path / "xnamelist.f90"
+    source.write_text(
+        """
+program test_namelist
+   implicit none
+
+   integer, parameter :: dp = kind(1.0d0)
+   integer :: i, n
+   real(kind=dp) :: x, y
+   logical :: flag
+   character(len=20) :: title
+   integer :: a(3)
+   real(kind=dp) :: b(2, 2)
+
+   namelist /params/ n, x, y, flag, title, a, b
+
+   n = 0
+   x = 0.0_dp
+   y = 0.0_dp
+   flag = .false.
+   title = "unset"
+   a = 0
+   b = 0.0_dp
+
+   write(*, nml=params)
+
+   open(unit=10, file="test_namelist.in", status="replace", action="write")
+   write(10, '(a)') "&params"
+   write(10, '(a)') " n = 5,"
+   write(10, '(a)') " x = 1.25,"
+   write(10, '(a)') " y = -3.5,"
+   write(10, '(a)') " flag = .true.,"
+   write(10, '(a)') " title = 'compiler test',"
+   write(10, '(a)') " a = 10, 20, 30,"
+   write(10, '(a)') " b = 1.0, 2.0, 3.0, 4.0"
+   write(10, '(a)') "/"
+   close(10)
+
+   open(unit=11, file="test_namelist.in", status="old", action="read")
+   read(11, nml=params)
+   close(11)
+
+   print *, "values after reading namelist"
+   print *, "n     =", n
+   print *, "x     =", x
+   print *, "y     =", y
+   print *, "flag  =", flag
+   print *, "title =", trim(title)
+   print *, "a     =", a
+   print *, "b     ="
+   do i = 1, 2
+      print *, b(i, :)
+   end do
+
+   write(*, nml=params)
+end program test_namelist
+""",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), str(source)],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stderr == ""
+    out = result.stdout
+    assert out.count("&params") == 2
+    assert "values after reading namelist" in out
+    assert "n     = 5" in out
+    assert "x     = 1.25" in out
+    assert "y     = -3.5" in out
+    assert "flag  = T" in out
+    assert "title = compiler test" in out
+    assert "a     = 10 20 30" in out
+    assert "1 3" in out
+    assert "2 4" in out
+    assert " title = \"compiler test       \"," in out
+
+
+def test_namelist_group_name_imported_from_module(tmp_path):
+    source = tmp_path / "xnamelist_module.f90"
+    source.write_text(
+        """
+module mod0
+implicit none
+real :: a, b
+namelist /aa/ a, b
+end module mod0
+
+use mod0
+implicit none
+a = 1.0
+b = 2.0
+write(6, aa)
+end
+""",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), str(source)],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stderr == ""
+    assert "&aa" in result.stdout
+    assert " a = 1" in result.stdout
+    assert " b = 2" in result.stdout
+
+
+def test_namelist_group_name_use_rename(tmp_path):
+    source = tmp_path / "xnamelist_rename.f90"
+    source.write_text(
+        """
+module mod0
+implicit none
+real :: a, b
+namelist /aa/ a, b
+end module mod0
+
+module mod1
+use mod0, xxx => aa
+end module mod1
+
+use mod1
+implicit none
+a = 3.0
+b = 4.0
+write(6, xxx)
+end
+""",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), str(source)],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stderr == ""
+    assert "&xxx" in result.stdout
+    assert " a = 3" in result.stdout
+    assert " b = 4" in result.stdout
+
+
+def test_extends_inherits_fields_and_dispatches_dynamically(tmp_path):
+    source = tmp_path / "xextends_min.f90"
+    source.write_text(
+        """
+module shape_mod
+implicit none
+
+type :: shape
+   character(len=20) :: name = "shape"
+contains
+   procedure :: describe => describe_shape
+   procedure :: area => area_shape
+end type shape
+
+type, extends(shape) :: circle
+   real :: radius = 0.0
+contains
+   procedure :: describe => describe_circle
+   procedure :: area => area_circle
+end type circle
+
+contains
+
+subroutine describe_shape(this)
+   class(shape), intent(in) :: this
+   print *, "shape", trim(this%name)
+end subroutine describe_shape
+
+function area_shape(this) result(y)
+   class(shape), intent(in) :: this
+   real :: y
+   y = 0.0
+end function area_shape
+
+subroutine describe_circle(this)
+   class(circle), intent(in) :: this
+   print *, "circle", trim(this%name), this%radius
+end subroutine describe_circle
+
+function area_circle(this) result(y)
+   class(circle), intent(in) :: this
+   real :: y
+   y = this%radius * this%radius
+end function area_circle
+
+subroutine print_shape_info(s)
+   class(shape), intent(in) :: s
+   call s%describe()
+   print *, "area", s%area()
+end subroutine print_shape_info
+
+end module shape_mod
+
+program main
+use shape_mod
+implicit none
+
+type(shape) :: s
+type(circle) :: c
+
+s%name = "plain"
+c%name = "unit"
+c%radius = 2.0
+
+call s%describe()
+print *, s%area()
+call c%describe()
+print *, c%area()
+call print_shape_info(s)
+call print_shape_info(c)
+end program main
+""",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), str(source)],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stderr == ""
+    assert result.stdout.split() == [
+        "shape", "plain",
+        "0",
+        "circle", "unit", "2",
+        "4",
+        "shape", "plain",
+        "area", "0",
+        "circle", "unit", "2",
+        "area", "4",
+    ]
+
+
+def test_check_registers_bare_main_contained_functions(tmp_path):
+    source = tmp_path / "contained_function_check.f90"
+    source.write_text(
+        """
+implicit none
+integer :: n
+n = f(2)
+contains
+integer function f(x)
+   integer, intent(in) :: x
+   f = x
+end function
+end
+""",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), "--check", str(source)],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == "ofort check passed\n"
+    assert result.stderr == ""
+
+
+def test_recursive_allocatable_derived_component_is_unallocated_by_default(tmp_path):
+    source = tmp_path / "recursive_alloc_component.f90"
+    source.write_text(
+        """
+implicit none
+type node
+   real :: x = 1.0
+   type(node), allocatable :: next
+end type
+type wrapper
+   type(node) :: first
+end type
+type(wrapper) :: w
+print *, w%first%x
+end
+""",
+        encoding="utf-8",
+    )
+
+    check = subprocess.run(
+        [str(OFORT), "--check", str(source)],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+    run = subprocess.run(
+        [str(OFORT), str(source)],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert check.returncode == 0, check.stdout + check.stderr
+    assert check.stdout == "ofort check passed\n"
+    assert check.stderr == ""
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert run.stdout.strip() == "1"
+    assert run.stderr == ""
 
 
 @pytest.mark.parametrize("source", case_files(), ids=lambda p: p.stem)
@@ -567,6 +939,55 @@ def test_multiple_source_files_are_concatenated(tmp_path):
     assert result.returncode == 0, result.stderr
     assert result.stderr == ""
     assert result.stdout.split() == ["42"]
+
+
+def test_extensionless_source_argument_tries_f90(tmp_path):
+    source = tmp_path / "xshortcut.f90"
+    source.write_text(
+        "program xshortcut\n"
+        "  print *, 42\n"
+        "end program xshortcut\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), str(tmp_path / "xshortcut")],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "42\n"
+
+
+def test_existing_extensionless_source_argument_wins_over_f90(tmp_path):
+    source = tmp_path / "xshortcut"
+    source_f90 = tmp_path / "xshortcut.f90"
+    source.write_text(
+        "program xshortcut\n"
+        "  print *, 7\n"
+        "end program xshortcut\n",
+        encoding="utf-8",
+    )
+    source_f90.write_text(
+        "program xshortcut\n"
+        "  print *, 99\n"
+        "end program xshortcut\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "7\n"
 
 
 def test_manifest_source_files_are_concatenated(tmp_path):
@@ -2951,3 +3372,210 @@ def test_batch_runner_rejects_bad_max_lines(tmp_path):
     assert result.returncode == 2
     assert result.stdout == ""
     assert "--max-lines must be non-negative" in result.stderr
+
+
+def test_fixed_form_source_by_extension(tmp_path):
+    source = tmp_path / "xfixed.f"
+    source.write_text(
+        "      program x\n"
+        "      integer i\n"
+        "      i = 3\n"
+        "      print *, i\n"
+        "      end\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stderr == ""
+    assert result.stdout.split() == ["3"]
+
+
+def test_fixed_form_forced_on_stdin():
+    source = (
+        "      program x\n"
+        "      print *, 12\n"
+        "      end\n"
+    )
+
+    result = subprocess.run(
+        [str(OFORT), "--fixed-form"],
+        cwd=ROOT,
+        input=source,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stderr == ""
+    assert result.stdout.split() == ["12"]
+
+
+def test_save_free_writes_converted_f90(tmp_path):
+    source = tmp_path / "xfixed_save.f"
+    saved = tmp_path / "xfixed_save.f90"
+    source.write_text(
+        "      program x\n"
+        "      integer i\n"
+        "      i = 7\n"
+        "      print *, i\n"
+        "      end\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), "--save-free", str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stderr == ""
+    assert saved.exists()
+    assert "program x" in saved.read_text(encoding="utf-8").lower()
+    assert result.stdout.split()[-1] == "7"
+
+
+def test_compact_endtype_with_name_checks(tmp_path):
+    source = tmp_path / "xcompact_endtype.f90"
+    source.write_text(
+        "module m\n"
+        "  type t\n"
+        "    integer :: i\n"
+        "  endtype t\n"
+        "end module\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), "--check", str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_implicit_parameterized_type_and_unlimited_type_check(tmp_path):
+    source = tmp_path / "ximplicit_parameterized_type.f90"
+    source.write_text(
+        "module m\n"
+        "  type t(k)\n"
+        "    integer, kind :: k = 4\n"
+        "    integer(k) :: i\n"
+        "  end type\n"
+        "end module\n"
+        "subroutine s(a, b)\n"
+        "  use m\n"
+        "  implicit type(t(2))(a), class(t)(c)\n"
+        "  type(*) :: b\n"
+        "end subroutine\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), "--check", str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_semantic_check_allows_module_and_local_type_constructors(tmp_path):
+    source = tmp_path / "xtype_constructor_check.f90"
+    source.write_text(
+        "module m\n"
+        "  implicit none\n"
+        "  type ty\n"
+        "    integer :: i = 1\n"
+        "    integer :: j = 2\n"
+        "  end type\n"
+        "end module\n"
+        "program main\n"
+        "  use m\n"
+        "  implicit none\n"
+        "  type con\n"
+        "    type(ty) :: x\n"
+        "    integer :: k\n"
+        "  end type\n"
+        "  type(ty) :: a\n"
+        "  type(con) :: b\n"
+        "  a = ty(3, 4)\n"
+        "  b = con(ty(5, 6), 7)\n"
+        "end program\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), "--check", str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_old_style_character_dimension_then_length_check(tmp_path):
+    source = tmp_path / "xold_character_decl.f90"
+    source.write_text(
+        "subroutine s(a, b, c)\n"
+        "  integer :: n\n"
+        "  parameter (n = 3)\n"
+        "  character a(n)*(*)\n"
+        "  character*10 b, c(:)*(*)\n"
+        "end subroutine\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), "--check", str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_derived_type_dimension_assumed_size_check(tmp_path):
+    source = tmp_path / "xtype_dimension_star.f90"
+    source.write_text(
+        "module m\n"
+        "  type v\n"
+        "    integer :: y\n"
+        "  end type\n"
+        "contains\n"
+        "  subroutine s(z)\n"
+        "    type(v), dimension(*) :: z\n"
+        "  end subroutine\n"
+        "end module\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(OFORT), "--check", str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr

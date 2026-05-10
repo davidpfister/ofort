@@ -20,12 +20,21 @@ development. It is not a production Fortran compiler.
 - `src/ofort_internal.h` contains internal declarations shared inside `src`.
 - `src/ofort_values.c` contains value helper routines split out from the main
   interpreter implementation.
+- `src/ofort_stats.c` and `include/ofort_stats.h` contain C-backed helper
+  routines used by `ofort_statistics_mod` and related extension-module
+  intrinsics.
+- `src/ofort_fixed_form.c` and `include/ofort_fixed_form.h` contain the fixed
+  source form to free source form converter used by `ofort`.
 - `tests/test_ofort.py` contains the main pytest suite.
 - `tests/cases` contains focused Fortran regression programs. Most stdout
   regression cases use a `name.f90` source file plus a sibling `name.out`
   expected-output file.
 - `scripts/xofort.py` is a batch runner for trying many source files one at a
   time.
+- `scripts/analyze_ofort_symbols.py` analyzes internal token/keyword handling
+  and is used by the test suite.
+- `tools/fixed2free.c` builds a small standalone fixed-form to free-form
+  converter.
 - `ofort_gui.py` is a small Tkinter GUI wrapper around `ofort.exe`.
 - `include/ofort_c_api.h` and `src/ofort_c_api.c` provide a small C ABI wrapper
   suitable for language bindings.
@@ -66,8 +75,10 @@ rather than standard-complete.
   numbered `do while`, `exit`, `cycle`, `goto`, computed `goto`, `forall`,
   `stop`, and `return`
 - `format` statements, formatted `print`/`write`, `read`, `open`, `close`,
-  `rewind`, internal I/O, simple external files, and simple unformatted stream
-  I/O
+  `rewind`, `backspace`, `endfile`, internal I/O, simple external files, and
+  simple unformatted stream I/O
+- free source form plus automatic fixed source form conversion for `.f`,
+  `.for`, and related fixed-form inputs
 - simple preprocessing support for `#define` macro substitution in source files
 - explicitly imported `ofort` extension modules, currently including
   `ofort_random_mod`, `ofort_la_mod`, `ofort_io_mod`, and
@@ -104,6 +115,10 @@ old alternate returns, and selected extension-style calls.
 
 `REAL` and `DOUBLE PRECISION` are distinguished by type tag and kind, but both
 are stored internally as C `double`.
+
+Major modern Fortran features not currently implemented include coarrays and
+`select type`. Some syntax from these areas may be diagnosed explicitly rather
+than accepted.
 
 ## Intrinsics
 
@@ -145,6 +160,12 @@ The generated executable is `ofort.exe` on Windows.
 `make` writes a small `ofort.build` file describing the compiler used for the
 last build. That file is generated and should not be committed.
 
+Build the standalone fixed-form converter:
+
+```powershell
+make fixed2free.exe
+```
+
 ## Run
 
 Run one source file:
@@ -171,6 +192,7 @@ Run each file matched by a Windows glob as a separate program:
 ```powershell
 .\ofort.exe --each "tests\cases\x*.f90"
 .\ofort.exe --each --check "tests\cases\x*.f90"
+.\ofort.exe --each --check --quiet --max-fail 10 "tests\cases\x*.f90"
 ```
 
 Check syntax and semantic registration without running the program:
@@ -191,6 +213,9 @@ Enable execution timing:
 .\ofort.exe --time x.f90
 .\ofort.exe --time-detail x.f90
 ```
+
+In `--each --quiet --time` mode, `ofort` prints only the final summary and one
+total elapsed time line.
 
 Print execution time by source line:
 
@@ -232,6 +257,31 @@ Warnings are enabled by default. Use `-w` to suppress them:
 
 ```powershell
 .\ofort.exe -w x.f90
+```
+
+### Fixed Source Form
+
+`ofort` accepts free source form by default and automatically treats common
+fixed-form extensions such as `.f` and `.for` as fixed source form. Use
+`--fixed-form` or `--free-form` to override auto-detection:
+
+```powershell
+.\ofort.exe --fixed-form oldcode.f
+.\ofort.exe --free-form modern.f90
+```
+
+The internal converter is shared with the standalone `fixed2free.exe` tool:
+
+```powershell
+make fixed2free.exe
+.\fixed2free.exe oldcode.f > oldcode.f90
+```
+
+To save the converted free-form source next to the original input while running
+`ofort`, use:
+
+```powershell
+.\ofort.exe --save-free oldcode.f
 ```
 
 ## Batch Runner
@@ -420,6 +470,10 @@ In interactive mode only, a bare expression line is evaluated immediately
 against the current source buffer and prints its value. For example, after
 entering `x = 3`, a line containing only `x` displays `3` immediately. Bare
 expression lines are not added to the source buffer.
+
+The REPL preflights source after each entered program line. Lines with syntax
+errors, such as malformed declarations, are rejected and are not kept in the
+editable source buffer.
 
 When an interactive session exits with a non-empty source buffer, the buffer is
 saved automatically as `main.f90`, or `main1.f90`, `main2.f90`, and so on if

@@ -1,4 +1,5 @@
 #include "ofort.h"
+#include "ofort_fixed_form.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +27,7 @@
 static void normalize_newlines(char *source);
 static char *maybe_wrap_loose_source(char *source);
 static char *read_file(const char *path);
+static char *read_source_file(const char *path);
 static char *copy_string(const char *text);
 static const char *skip_space(const char *line);
 static int starts_with_word_nocase(const char *line, const char *word);
@@ -52,6 +54,16 @@ typedef struct {
     int count;
     int cap;
 } SourceMap;
+
+typedef enum {
+    SOURCE_FORM_AUTO = 0,
+    SOURCE_FORM_FREE,
+    SOURCE_FORM_FIXED
+} SourceFormMode;
+
+static SourceFormMode g_source_form = SOURCE_FORM_AUTO;
+static int g_save_free_form = 0;
+static int g_quiet = 0;
 
 static int append_text(char **buf, size_t *len, size_t *cap, const char *text) {
     size_t n = strlen(text);
@@ -1896,7 +1908,7 @@ static int execute_source_text_on_interpreter(OfortInterpreter *interp, const ch
 }
 
 static int run_ofort_file_to_path(const char *source_path, const char *out_path) {
-    char *source = read_file(source_path);
+    char *source = read_source_file(source_path);
     FILE *fp;
     OfortInterpreter *interp;
     int rc;
@@ -1944,7 +1956,7 @@ static int run_ofort_file_to_path(const char *source_path, const char *out_path)
 
 static int check_ofort_file(const char *source_path, int quiet, int label_failures) {
     double setup_start = monotonic_seconds();
-    char *source = read_file(source_path);
+    char *source = read_source_file(source_path);
     OfortInterpreter *interp;
     int rc;
     double setup_elapsed;
@@ -1991,25 +2003,28 @@ static int check_ofort_file(const char *source_path, int quiet, int label_failur
     return rc == 0 ? 0 : 1;
 }
 
-static int run_each_file(const char *const *paths, int npaths, int limit, int syntax_check,
+static int run_each_file(const char *const *paths, int npaths, int limit, int max_fail, int syntax_check,
                          int command_argc, char **command_args, int time_operation,
                          int quiet) {
     int failures = 0;
-    int checked = npaths;
+    int checked = 0;
+    int max_to_check = npaths;
+    int stopped_by_max_fail = 0;
+    double batch_start = monotonic_seconds();
     const char **failed_paths;
 
-    if (limit >= 0 && limit < checked) {
-        checked = limit;
+    if (limit >= 0 && limit < max_to_check) {
+        max_to_check = limit;
     }
 
-    failed_paths = (const char **)calloc((size_t)(checked > 0 ? checked : 1), sizeof(*failed_paths));
+    failed_paths = (const char **)calloc((size_t)(max_to_check > 0 ? max_to_check : 1), sizeof(*failed_paths));
 
     if (!failed_paths) {
         fprintf(stderr, "out of memory\n");
         return 2;
     }
 
-    for (int i = 0; i < checked; i++) {
+    for (int i = 0; i < max_to_check; i++) {
         int rc;
         double start = monotonic_seconds();
         if (!quiet && i > 0) {
@@ -2023,7 +2038,7 @@ static int run_each_file(const char *const *paths, int npaths, int limit, int sy
         if (syntax_check) {
             rc = check_ofort_file(paths[i], quiet, quiet);
         } else {
-            char *source = read_file(paths[i]);
+            char *source = read_source_file(paths[i]);
             if (!source) {
                 rc = 2;
             } else {
@@ -2031,17 +2046,26 @@ static int run_each_file(const char *const *paths, int npaths, int limit, int sy
                 free(source);
             }
         }
-        if (time_operation && !g_time_detail) {
+        if (time_operation && !quiet && !g_time_detail) {
             print_elapsed_time(start);
         }
         if (rc != 0) {
             failed_paths[failures] = paths[i];
             failures++;
+            if (max_fail > 0 && failures >= max_fail) {
+                stopped_by_max_fail = 1;
+                checked++;
+                break;
+            }
         }
+        checked++;
     }
 
     if (!quiet || failures > 0) {
         printf("\n");
+    }
+    if (stopped_by_max_fail) {
+        printf("stopped after %d failures\n", failures);
     }
     printf("checked %d files: %d passed, %d failed\n", checked, checked - failures, failures);
     if (failures > 0) {
@@ -2049,6 +2073,9 @@ static int run_each_file(const char *const *paths, int npaths, int limit, int sy
         for (int i = 0; i < failures; i++) {
             printf("  %s\n", failed_paths[i]);
         }
+    }
+    if (time_operation && quiet && !g_time_detail) {
+        printf("\ntime: %.4f s\n", monotonic_seconds() - batch_start);
     }
 
     free(failed_paths);
@@ -2230,7 +2257,29 @@ static int execute_repl_source_prefix(OfortInterpreter *interp, const char *sour
 static int execute_repl_expression(OfortInterpreter *interp, const char *source,
                                    size_t *executed_len, const char *expr_line) {
     int rc = execute_repl_pending_source(interp, source, executed_len);
+    const char *p;
+    char *wrapped = NULL;
     if (rc != 0) {
+        return rc;
+    }
+    p = skip_space(expr_line);
+    if (isdigit((unsigned char)*p)) {
+        size_t len = strlen(expr_line);
+        while (len > 0 && (expr_line[len - 1] == '\n' || expr_line[len - 1] == '\r')) {
+            len--;
+        }
+        wrapped = (char *)malloc(len + 4);
+        if (!wrapped) {
+            fprintf(stderr, "out of memory\n");
+            return 2;
+        }
+        wrapped[0] = '(';
+        memcpy(wrapped + 1, expr_line, len);
+        wrapped[len + 1] = ')';
+        wrapped[len + 2] = '\n';
+        wrapped[len + 3] = '\0';
+        rc = execute_source_text_on_interpreter(interp, wrapped, 1, 1, 0, NULL);
+        free(wrapped);
         return rc;
     }
     return execute_source_text_on_interpreter(interp, expr_line, 1, 1, 0, NULL);
@@ -2367,7 +2416,7 @@ static char *strip_terminal_end_line(char *source) {
 
 static int load_interactive_file(const char *path, char **buf, size_t *len,
                                  size_t *cap, char **footer) {
-    char *source = read_file(path);
+    char *source = read_source_file(path);
     char *new_footer;
 
     if (!source) {
@@ -3544,6 +3593,7 @@ static int run_interactive(const char *load_path, int run_after_load) {
             int trace_immediate = (g_trace_assign && line_indent == 0 && is_trace_assign_immediate_line(line));
             int declaration_after_execution = (executed_len > 0 && is_repl_declaration_line(line));
             size_t old_len = len;
+            size_t old_executed_len = executed_len;
             if (repl_line_pre_dedent(line) && line_indent > 0) {
                 line_indent--;
             }
@@ -3552,6 +3602,14 @@ static int run_interactive(const char *load_path, int run_after_load) {
                 free(footer);
                 ofort_destroy(repl_interp);
                 return 2;
+            }
+            last_rc = repl_preflight_check_source(buf ? buf : "", footer,
+                                                 source_line_count(buf ? buf : ""));
+            if (last_rc != 0) {
+                len = old_len;
+                if (buf) buf[len] = '\0';
+                executed_len = old_executed_len;
+                continue;
             }
             if (declaration_after_execution) {
                 executed_len = 0;
@@ -3563,11 +3621,6 @@ static int run_interactive(const char *load_path, int run_after_load) {
                     free(footer);
                     return 2;
                 }
-            }
-            last_rc = repl_preflight_check_source(buf ? buf : "", footer,
-                                                 source_line_count(buf ? buf : ""));
-            if (last_rc != 0) {
-                continue;
             }
             if (trace_immediate) {
                 if (executed_len == 0 && old_len > 0) {
@@ -3617,6 +3670,136 @@ static char *read_file(const char *path) {
     return source;
 }
 
+static int source_path_is_fixed_form(const char *path) {
+    const char *slash1;
+    const char *slash2;
+    const char *base;
+    const char *dot;
+    char ext[32];
+    int i;
+
+    if (g_source_form == SOURCE_FORM_FIXED) return 1;
+    if (g_source_form == SOURCE_FORM_FREE) return 0;
+    if (!path) return 0;
+    slash1 = strrchr(path, '\\');
+    slash2 = strrchr(path, '/');
+    base = slash1 > slash2 ? slash1 + 1 : slash2 ? slash2 + 1 : path;
+    dot = strrchr(base, '.');
+    if (!dot) return 0;
+    for (i = 0; dot[i] && i < (int)sizeof(ext) - 1; i++) {
+        ext[i] = (char)tolower((unsigned char)dot[i]);
+    }
+    ext[i] = '\0';
+    return strcmp(ext, ".f") == 0 || strcmp(ext, ".for") == 0 || strcmp(ext, ".ftn") == 0;
+}
+
+static int path_has_fixed_form_extension(const char *path) {
+    const char *slash1;
+    const char *slash2;
+    const char *base;
+    const char *dot;
+    char ext[32];
+    int i;
+
+    if (!path) return 0;
+    slash1 = strrchr(path, '\\');
+    slash2 = strrchr(path, '/');
+    base = slash1 > slash2 ? slash1 + 1 : slash2 ? slash2 + 1 : path;
+    dot = strrchr(base, '.');
+    if (!dot) return 0;
+    for (i = 0; dot[i] && i < (int)sizeof(ext) - 1; i++) {
+        ext[i] = (char)tolower((unsigned char)dot[i]);
+    }
+    ext[i] = '\0';
+    return strcmp(ext, ".f") == 0 || strcmp(ext, ".for") == 0 || strcmp(ext, ".ftn") == 0;
+}
+
+static char *free_form_save_path(const char *path) {
+    const char *slash1;
+    const char *slash2;
+    const char *base;
+    const char *dot;
+    size_t stem_len;
+    size_t out_len;
+    char *out;
+
+    if (!path) return NULL;
+    slash1 = strrchr(path, '\\');
+    slash2 = strrchr(path, '/');
+    base = slash1 > slash2 ? slash1 + 1 : slash2 ? slash2 + 1 : path;
+    dot = strrchr(base, '.');
+    if (dot && path_has_fixed_form_extension(path)) {
+        stem_len = (size_t)(dot - path);
+        out_len = stem_len + 4;
+        out = (char *)malloc(out_len + 1);
+        if (!out) return NULL;
+        memcpy(out, path, stem_len);
+        memcpy(out + stem_len, ".f90", 5);
+        return out;
+    }
+
+    out_len = strlen(path) + 9;
+    out = (char *)malloc(out_len + 1);
+    if (!out) return NULL;
+    sprintf(out, "%s.free.f90", path);
+    return out;
+}
+
+static int save_converted_free_form(const char *path, const char *source) {
+    char *out_path;
+    FILE *fp;
+
+    if (!path || !source) return 0;
+    out_path = free_form_save_path(path);
+    if (!out_path) {
+        fprintf(stderr, "%s: failed to allocate --save-free path\n", path);
+        return 0;
+    }
+    fp = fopen(out_path, "wb");
+    if (!fp) {
+        fprintf(stderr, "%s: failed to write --save-free output %s\n", path, out_path);
+        free(out_path);
+        return 0;
+    }
+    fputs(source, fp);
+    fclose(fp);
+    if (!g_quiet) {
+        printf("Saved free-form source to %s\n", out_path);
+    }
+    free(out_path);
+    return 1;
+}
+
+static char *convert_fixed_source_text(char *source, const char *path) {
+    OfortFixedFormOptions opts = {72, 1, 0};
+    char *error = NULL;
+    char *converted;
+
+    if (!source) return NULL;
+    converted = ofort_fixed_to_free(source, path, &opts, &error);
+    free(source);
+    if (!converted) {
+        fprintf(stderr, "%s: %s\n", path ? path : "stdin", error ? error : "fixed-form conversion failed");
+        free(error);
+        return NULL;
+    }
+    normalize_newlines(converted);
+    return converted;
+}
+
+static char *read_source_file(const char *path) {
+    char *source = read_file(path);
+    if (!source) return NULL;
+    normalize_newlines(source);
+    if (source_path_is_fixed_form(path)) {
+        source = convert_fixed_source_text(source, path);
+        if (source && g_save_free_form) {
+            save_converted_free_form(path, source);
+        }
+    }
+    return source;
+}
+
 static char *read_files_concatenated(const char *const *paths, int npaths, SourceMap *source_map) {
     char *source = NULL;
     size_t len = 0;
@@ -3624,13 +3807,12 @@ static char *read_files_concatenated(const char *const *paths, int npaths, Sourc
     int next_line = 1;
 
     for (int i = 0; i < npaths; i++) {
-        char *part = read_file(paths[i]);
+        char *part = read_source_file(paths[i]);
         int line_count;
         if (!part) {
             free(source);
             return NULL;
         }
-        normalize_newlines(part);
         line_count = source_text_line_count(part);
         if (!source_map_add(source_map, paths[i], next_line, line_count)) {
             free(part);
@@ -3761,8 +3943,8 @@ static char *maybe_wrap_loose_source(char *source) {
 }
 
 static void print_usage(const char *program) {
-    fprintf(stderr, "usage: %s [--version] [-w] [--quiet] [--std=f2023|--std=legacy] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--trace-assign] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
-    fprintf(stderr, "       %s --each [--check] [--quiet] [--limit n] [options] file-or-glob [file-or-glob ...] [-- args...]\n", program);
+    fprintf(stderr, "usage: %s [--version] [-w] [--quiet] [--std=f2023|--std=legacy] [--fast] [--no-specialize] [--fixed-form|--free-form] [--save-free] [--time|--time-detail] [--profile-lines] [--trace-assign] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
+    fprintf(stderr, "       %s --each [--check] [--quiet] [--limit n] [--max-fail n] [options] file-or-glob [file-or-glob ...] [-- args...]\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load file.f90\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load-run file.f90\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --check file.f90\n", program);
@@ -3778,8 +3960,11 @@ static void print_usage(const char *program) {
     fprintf(stderr, "       --time-detail prints setup, lex, parse, register, execute, and total times\n");
     fprintf(stderr, "       --profile-lines prints elapsed execution time by source line\n");
     fprintf(stderr, "       --trace-assign prints assignment trace diagnostics\n");
+    fprintf(stderr, "       --fixed-form treats input as fixed source form; --free-form forces free source form\n");
+    fprintf(stderr, "       --save-free saves converted fixed-form input beside the source as .f90\n");
     fprintf(stderr, "       --each treats each file or Windows glob match as a separate program\n");
     fprintf(stderr, "       --limit n checks at most n files in --each mode\n");
+    fprintf(stderr, "       --max-fail n stops --each mode after n failed files; 0 means no limit\n");
     fprintf(stderr, "       @file reads source file names from a manifest, one path per line\n");
     fprintf(stderr, "       --implicit-typing, --legacy-implicit uses I-N integer/rest real implicit typing (default)\n");
     fprintf(stderr, "       --no-implicit-typing rejects undeclared variables unless declared or covered by IMPLICIT\n");
@@ -3850,6 +4035,7 @@ int main(int argc, char **argv) {
     int each_mode = 0;
     int each_check = 0;
     int each_limit = -1;
+    int each_max_fail = 0;
     int quiet = 0;
     double setup_start = 0.0;
     int i;
@@ -3881,6 +4067,7 @@ int main(int argc, char **argv) {
             g_warnings_enabled = 0;
         } else if (strcmp(argv[i], "--quiet") == 0) {
             quiet = 1;
+            g_quiet = 1;
         } else if (strcmp(argv[i], "--std=f2023") == 0 || strcmp(argv[i], "-std=f2023") == 0 ||
                    strcmp(argv[i], "--std=f2018") == 0 || strcmp(argv[i], "-std=f2018") == 0) {
             g_standard_mode = OFORT_STD_F2023;
@@ -3906,6 +4093,12 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--trace-assign") == 0) {
             g_trace_assign = 1;
             g_specialized_fast_paths = 0;
+        } else if (strcmp(argv[i], "--fixed-form") == 0) {
+            g_source_form = SOURCE_FORM_FIXED;
+        } else if (strcmp(argv[i], "--free-form") == 0) {
+            g_source_form = SOURCE_FORM_FREE;
+        } else if (strcmp(argv[i], "--save-free") == 0) {
+            g_save_free_form = 1;
         } else if (strcmp(argv[i], "--each") == 0) {
             each_mode = 1;
         } else if (strcmp(argv[i], "--limit") == 0) {
@@ -3924,6 +4117,22 @@ int main(int argc, char **argv) {
                 return 2;
             }
             each_limit = (int)parsed_limit;
+        } else if (strcmp(argv[i], "--max-fail") == 0) {
+            char *endptr;
+            long parsed_max_fail;
+            if (++i >= argc) {
+                fprintf(stderr, "--max-fail requires a non-negative integer\n");
+                path_list_free(&source_paths);
+                return 2;
+            }
+            parsed_max_fail = strtol(argv[i], &endptr, 10);
+            if (endptr == argv[i] || *endptr != '\0' ||
+                parsed_max_fail < 0 || parsed_max_fail > 2147483647L) {
+                fprintf(stderr, "--max-fail requires a non-negative integer\n");
+                path_list_free(&source_paths);
+                return 2;
+            }
+            each_max_fail = (int)parsed_max_fail;
         } else if (strcmp(argv[i], "--") == 0) {
             program_args = &argv[i + 1];
             program_argc = argc - i - 1;
@@ -4000,6 +4209,12 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    if (!each_mode && each_max_fail > 0) {
+        fprintf(stderr, "--max-fail is only valid with --each\n");
+        path_list_free(&source_paths);
+        return 2;
+    }
+
     if (check_path) {
         double start = monotonic_seconds();
         int rc = check_with_gfortran(check_path);
@@ -4031,7 +4246,7 @@ int main(int argc, char **argv) {
             path_list_free(&source_paths);
             return 2;
         }
-        rc = run_each_file(source_paths.items, source_paths.count, each_limit, each_check,
+        rc = run_each_file(source_paths.items, source_paths.count, each_limit, each_max_fail, each_check,
                            program_argc, program_args, time_operation, quiet);
         path_list_free(&source_paths);
         return rc;
@@ -4046,6 +4261,10 @@ int main(int argc, char **argv) {
     } else {
         setup_start = monotonic_seconds();
         source = read_stream(stdin, "stdin");
+        if (source) normalize_newlines(source);
+        if (source && g_source_form == SOURCE_FORM_FIXED) {
+            source = convert_fixed_source_text(source, "stdin");
+        }
     }
     if (!source) {
         source_map_free(&source_map);

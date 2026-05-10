@@ -21,7 +21,9 @@ extern "C" {
 #endif
 
 /* Maximum limits */
-#define OFORT_MAX_VARS      512
+#define OFORT_MAX_VARS      4096
+#define OFORT_MAX_SAVED_VARS 256
+#define OFORT_MAX_MODULE_VARS 512
 #define OFORT_MAX_FUNCS     128
 #define OFORT_MAX_STACK     64
 #define OFORT_MAX_OUTPUT    65536
@@ -30,7 +32,7 @@ extern "C" {
 #define OFORT_MAX_TOKENS    32768
 #define OFORT_MAX_CHILDREN  16
 #define OFORT_MAX_PARAMS    256
-#define OFORT_MAX_MODULES   32
+#define OFORT_MAX_MODULES   256
 #define OFORT_MAX_FIELDS    32
 
 typedef enum {
@@ -62,7 +64,7 @@ typedef enum {
     FTOK_PARAMETER, FTOK_INTENT, FTOK_IN, FTOK_OUT, FTOK_INOUT,
     FTOK_RESULT, FTOK_SAVE, FTOK_DATA,
     /* I/O keywords */
-    FTOK_PRINT, FTOK_WRITE, FTOK_READ, FTOK_OPEN, FTOK_CLOSE, FTOK_REWIND, FTOK_INQUIRE,
+    FTOK_PRINT, FTOK_WRITE, FTOK_READ, FTOK_OPEN, FTOK_CLOSE, FTOK_REWIND, FTOK_BACKSPACE, FTOK_ENDFILE, FTOK_WAIT, FTOK_INQUIRE,
     /* logical literal keywords */
     FTOK_TRUE, FTOK_FALSE,
     /* operators */
@@ -156,10 +158,11 @@ typedef enum {
     FND_TYPE_DEF,
     FND_IF, FND_DO_LOOP, FND_DO_WHILE, FND_DO_FOREVER, FND_DO_CONCURRENT, FND_FORALL, FND_WHERE, FND_SELECT_CASE, FND_SELECT_RANK, FND_CASE_BLOCK,
     FND_RETURN, FND_EXIT, FND_CYCLE, FND_STOP, FND_GOTO, FND_CONTINUE,
-    FND_CALL, FND_PRINT, FND_WRITE, FND_READ_STMT, FND_OPEN, FND_CLOSE, FND_REWIND, FND_INQUIRE,
-    FND_ALLOCATE, FND_DEALLOCATE, FND_USE, FND_ACCESS, FND_INTERFACE,
+    FND_CALL, FND_PRINT, FND_WRITE, FND_READ_STMT, FND_OPEN, FND_CLOSE, FND_REWIND, FND_BACKSPACE, FND_ENDFILE, FND_WAIT, FND_INQUIRE,
+    FND_NAMELIST,
+    FND_ALLOCATE, FND_DEALLOCATE, FND_USE, FND_ACCESS, FND_ATTR_STMT, FND_INTERFACE,
     FND_EXPR_STMT,
-    FND_DATA,
+    FND_DATA, FND_EQUIVALENCE,
     FND_FORMAT,
     FND_STMT_FUNCTION,
     /* expressions */
@@ -203,9 +206,11 @@ typedef struct OfortNode {
     int is_optional;
     int is_elemental;
     int is_pure;
+    int access_attr;        /* 0=none, 1=PUBLIC, 2=PRIVATE */
     int no_advance;         /* WRITE(..., ADVANCE='NO') */
     char result_name[256];  /* for FUNCTION ... RESULT(name) */
     char format_str[512];   /* for WRITE format */
+    char parent_type_name[64]; /* for TYPE, EXTENDS(parent) */
     /* children */
     struct OfortNode *children[OFORT_MAX_CHILDREN];
     int n_children;
