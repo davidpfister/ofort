@@ -31,6 +31,7 @@ static char *read_source_file(const char *path);
 static char *copy_string(const char *text);
 static const char *skip_space(const char *line);
 static int starts_with_word_nocase(const char *line, const char *word);
+static int string_eq_nocase(const char *a, const char *b);
 static int identifier_char(int c);
 static int line_is_terminal_end(const char *start, const char *end);
 static int add_repl_line_to_buffer(char **buf, size_t *len, size_t *cap, const char *line);
@@ -585,6 +586,372 @@ static void list_source(const char *source) {
         }
         line_no++;
     }
+}
+
+static void list_source_plain(const char *source) {
+    if (source && *source) {
+        fputs(source, stdout);
+        if (source[strlen(source) - 1] != '\n') {
+            fputc('\n', stdout);
+        }
+    }
+}
+
+typedef struct {
+    char prefix[64];
+    char names[1024];
+    int used;
+} ReplDeclGroup;
+
+static int simple_decl_prefix_allowed(const char *prefix) {
+    return string_eq_nocase(prefix, "integer") ||
+           string_eq_nocase(prefix, "logical") ||
+           string_eq_nocase(prefix, "real") ||
+           string_eq_nocase(prefix, "double precision") ||
+           string_eq_nocase(prefix, "complex");
+}
+
+static void trim_span(const char **start, const char **end) {
+    while (*start < *end && isspace((unsigned char)**start)) (*start)++;
+    while (*end > *start && isspace((unsigned char)(*end)[-1])) (*end)--;
+}
+
+static int parse_simple_groupable_decl(const char *line, size_t line_len,
+                                       char *prefix, size_t prefix_size,
+                                       char *name, size_t name_size) {
+    const char *start = line;
+    const char *end = line + line_len;
+    const char *dc;
+    const char *ps;
+    const char *pe;
+    const char *ns;
+    const char *ne;
+    size_t len;
+
+    trim_span(&start, &end);
+    if (start >= end || *start == '!') return 0;
+    dc = strstr(start, "::");
+    if (!dc || dc >= end) return 0;
+
+    ps = start;
+    pe = dc;
+    trim_span(&ps, &pe);
+    len = (size_t)(pe - ps);
+    if (len == 0 || len >= prefix_size) return 0;
+    for (const char *p = ps; p < pe; p++) {
+        if (*p == ',' || *p == '(' || *p == ')' || *p == '=') return 0;
+    }
+    memcpy(prefix, ps, len);
+    prefix[len] = '\0';
+    if (!simple_decl_prefix_allowed(prefix)) return 0;
+
+    ns = dc + 2;
+    ne = end;
+    trim_span(&ns, &ne);
+    if (ns >= ne || !(isalpha((unsigned char)*ns) || *ns == '_')) return 0;
+    for (const char *p = ns; p < ne; p++) {
+        if (!identifier_char((unsigned char)*p)) return 0;
+    }
+    len = (size_t)(ne - ns);
+    if (len == 0 || len >= name_size) return 0;
+    memcpy(name, ns, len);
+    name[len] = '\0';
+    return 1;
+}
+
+static int parse_simple_decl_names(const char *line, size_t line_len,
+                                   char *prefix, size_t prefix_size,
+                                   char names[][256], int *n_names) {
+    const char *start = line;
+    const char *end = line + line_len;
+    const char *dc;
+    const char *ps;
+    const char *pe;
+    const char *p;
+    size_t len;
+
+    *n_names = 0;
+    trim_span(&start, &end);
+    if (start >= end || *start == '!') return 0;
+    dc = strstr(start, "::");
+    if (!dc || dc >= end) return 0;
+
+    ps = start;
+    pe = dc;
+    trim_span(&ps, &pe);
+    len = (size_t)(pe - ps);
+    if (len == 0 || len >= prefix_size) return 0;
+    for (const char *q = ps; q < pe; q++) {
+        if (*q == ',' || *q == '(' || *q == ')' || *q == '=') return 0;
+    }
+    memcpy(prefix, ps, len);
+    prefix[len] = '\0';
+    if (!simple_decl_prefix_allowed(prefix)) return 0;
+
+    p = dc + 2;
+    while (p < end) {
+        const char *ns = p;
+        const char *ne;
+        trim_span(&ns, &end);
+        if (ns >= end) return 0;
+        ne = ns;
+        while (ne < end && *ne != ',') ne++;
+        p = ne < end ? ne + 1 : ne;
+        trim_span(&ns, &ne);
+        if (ns >= ne || !(isalpha((unsigned char)*ns) || *ns == '_')) return 0;
+        for (const char *q = ns; q < ne; q++) {
+            if (!identifier_char((unsigned char)*q)) return 0;
+        }
+        len = (size_t)(ne - ns);
+        if (len == 0 || len >= 256 || *n_names >= OFORT_MAX_PARAMS) return 0;
+        memcpy(names[*n_names], ns, len);
+        names[*n_names][len] = '\0';
+        (*n_names)++;
+    }
+    return *n_names > 0;
+}
+
+static int source_line_uses_name(const char *line, size_t line_len, const char *name) {
+    const char *p = line;
+    const char *end = line + line_len;
+    size_t name_len = strlen(name);
+
+    while (p < end) {
+        if (*p == '!') {
+            break;
+        }
+        if (*p == '\'' || *p == '"') {
+            char quote = *p++;
+            while (p < end) {
+                if (*p == quote) {
+                    if (p + 1 < end && p[1] == quote) {
+                        p += 2;
+                        continue;
+                    }
+                    p++;
+                    break;
+                }
+                p++;
+            }
+            continue;
+        }
+        if (isalpha((unsigned char)*p) || *p == '_') {
+            const char *tok = p;
+            size_t tok_len;
+            while (p < end && identifier_char((unsigned char)*p)) p++;
+            tok_len = (size_t)(p - tok);
+            if (tok_len == name_len) {
+                int same = 1;
+                for (size_t i = 0; i < name_len; i++) {
+                    if (tolower((unsigned char)tok[i]) != tolower((unsigned char)name[i])) {
+                        same = 0;
+                        break;
+                    }
+                }
+                if (same) return 1;
+            }
+            continue;
+        }
+        p++;
+    }
+    return 0;
+}
+
+static int source_uses_name_outside_line(const char *source, int skip_line_no, const char *name) {
+    const char *line = source;
+    int line_no = 1;
+
+    while (*line) {
+        const char *end = strchr(line, '\n');
+        size_t line_len = end ? (size_t)(end - line) : strlen(line);
+        if (line_no != skip_line_no && source_line_uses_name(line, line_len, name)) {
+            return 1;
+        }
+        line = end ? end + 1 : line + line_len;
+        line_no++;
+    }
+    return 0;
+}
+
+static int name_in_command_args(const char *name, char **args, int nargs) {
+    for (int i = 0; i < nargs; i++) {
+        if (string_eq_nocase(name, args[i])) return 1;
+    }
+    return 0;
+}
+
+static int list_unused_declarations_in_source(const char *source) {
+    const char *line = source ? source : "";
+    int line_no = 1;
+    int n_unused = 0;
+
+    while (*line) {
+        const char *end = strchr(line, '\n');
+        size_t line_len = end ? (size_t)(end - line) : strlen(line);
+        char prefix[64];
+        char names[OFORT_MAX_PARAMS][256];
+        int n_names = 0;
+        if (parse_simple_decl_names(line, line_len, prefix, sizeof(prefix), names, &n_names)) {
+            for (int i = 0; i < n_names; i++) {
+                if (!source_uses_name_outside_line(source, line_no, names[i])) {
+                    if (n_unused == 0) fputs("unused declarations:\n", stdout);
+                    printf("  %s\n", names[i]);
+                    n_unused++;
+                }
+            }
+        }
+        line = end ? end + 1 : line + line_len;
+        line_no++;
+    }
+    if (n_unused == 0) {
+        fputs("unused declarations: (none)\n", stdout);
+    }
+    return n_unused;
+}
+
+static int rewrite_declarations_remove_names(char **buf, size_t *len, size_t *cap,
+                                             char **remove_names, int n_remove_names,
+                                             int remove_unused) {
+    const char *source = *buf ? *buf : "";
+    const char *line = source;
+    char *out = NULL;
+    size_t out_len = 0;
+    size_t out_cap = 0;
+    int line_no = 1;
+
+    while (*line) {
+        const char *end = strchr(line, '\n');
+        size_t line_len = end ? (size_t)(end - line) : strlen(line);
+        char prefix[64];
+        char names[OFORT_MAX_PARAMS][256];
+        int n_names = 0;
+        if (parse_simple_decl_names(line, line_len, prefix, sizeof(prefix), names, &n_names)) {
+            char rebuilt[4096];
+            size_t rebuilt_len = 0;
+            int kept = 0;
+            int overflow = 0;
+            rebuilt[0] = '\0';
+            for (int i = 0; i < n_names; i++) {
+                int remove = remove_unused ?
+                    !source_uses_name_outside_line(source, line_no, names[i]) :
+                    name_in_command_args(names[i], remove_names, n_remove_names);
+                if (remove) continue;
+                if (kept == 0) {
+                    int n = snprintf(rebuilt, sizeof(rebuilt), "%s :: %s", prefix, names[i]);
+                    if (n < 0 || (size_t)n >= sizeof(rebuilt)) overflow = 1;
+                    else rebuilt_len = (size_t)n;
+                } else {
+                    int n = snprintf(rebuilt + rebuilt_len, sizeof(rebuilt) - rebuilt_len,
+                                     ", %s", names[i]);
+                    if (n < 0 || (size_t)n >= sizeof(rebuilt) - rebuilt_len) overflow = 1;
+                    else rebuilt_len += (size_t)n;
+                }
+                kept++;
+            }
+            if (overflow) {
+                free(out);
+                return 0;
+            }
+            if (kept > 0) {
+                if (!append_text(&out, &out_len, &out_cap, rebuilt) ||
+                    (end && !append_text(&out, &out_len, &out_cap, "\n"))) {
+                    free(out);
+                    return 0;
+                }
+            }
+        } else {
+            if (!append_text_n(&out, &out_len, &out_cap, line, line_len) ||
+                (end && !append_text(&out, &out_len, &out_cap, "\n"))) {
+                free(out);
+                return 0;
+            }
+        }
+        line = end ? end + 1 : line + line_len;
+        line_no++;
+    }
+
+    free(*buf);
+    *buf = out;
+    *len = out_len;
+    *cap = out_cap;
+    return 1;
+}
+
+static int flush_decl_groups(char **out, size_t *out_len, size_t *out_cap,
+                             ReplDeclGroup *groups, int *n_groups) {
+    char line[1400];
+    for (int i = 0; i < *n_groups; i++) {
+        if (!groups[i].used) continue;
+        snprintf(line, sizeof(line), "%s :: %s\n", groups[i].prefix, groups[i].names);
+        if (!append_text(out, out_len, out_cap, line)) return 0;
+        groups[i].used = 0;
+    }
+    *n_groups = 0;
+    return 1;
+}
+
+static int group_declarations_in_source(char **buf, size_t *len, size_t *cap) {
+    const char *source = *buf ? *buf : "";
+    const char *line = source;
+    char *out = NULL;
+    size_t out_len = 0;
+    size_t out_cap = 0;
+    ReplDeclGroup groups[16];
+    int n_groups = 0;
+    memset(groups, 0, sizeof(groups));
+
+    while (*line) {
+        const char *end = strchr(line, '\n');
+        size_t line_len = end ? (size_t)(end - line) : strlen(line);
+        char prefix[64];
+        char name[256];
+        if (parse_simple_groupable_decl(line, line_len, prefix, sizeof(prefix), name, sizeof(name))) {
+            int gi = -1;
+            for (int i = 0; i < n_groups; i++) {
+                if (string_eq_nocase(groups[i].prefix, prefix)) {
+                    gi = i;
+                    break;
+                }
+            }
+            if (gi < 0) {
+                if (n_groups >= (int)(sizeof(groups) / sizeof(groups[0]))) {
+                    if (!flush_decl_groups(&out, &out_len, &out_cap, groups, &n_groups)) {
+                        free(out);
+                        return 0;
+                    }
+                }
+                gi = n_groups++;
+                snprintf(groups[gi].prefix, sizeof(groups[gi].prefix), "%s", prefix);
+                groups[gi].names[0] = '\0';
+                groups[gi].used = 1;
+            }
+            if (groups[gi].names[0]) {
+                if (strlen(groups[gi].names) + strlen(name) + 3 >= sizeof(groups[gi].names)) {
+                    free(out);
+                    return 0;
+                }
+                strcat(groups[gi].names, ", ");
+            }
+            strcat(groups[gi].names, name);
+        } else {
+            if (!flush_decl_groups(&out, &out_len, &out_cap, groups, &n_groups) ||
+                !append_text_n(&out, &out_len, &out_cap, line, line_len) ||
+                (end && !append_text(&out, &out_len, &out_cap, "\n"))) {
+                free(out);
+                return 0;
+            }
+        }
+        line = end ? end + 1 : line + line_len;
+    }
+    if (!flush_decl_groups(&out, &out_len, &out_cap, groups, &n_groups)) {
+        free(out);
+        return 0;
+    }
+    free(*buf);
+    *buf = out;
+    *len = out_len;
+    *cap = out_cap;
+    return 1;
 }
 
 static int file_exists(const char *path) {
@@ -3153,7 +3520,7 @@ static int run_interactive(const char *load_path, int run_after_load) {
 
     if (!g_no_logo) {
         printf("Enter Fortran source.\n");
-        printf("Commands: . runs, .run [n] [-- args] repeats, .time [n] [-- args] times, .runq [n] [-- args] runs and quits, .quit quits and saves, .quit! quits without saving, .save [file] saves, .saveq [file] saves and quits, .clear clears, .prompt text changes the prompt, .del n[:m] deletes lines, .ins n text inserts, .rep n text replaces, .rename old new renames, .list lists, .decl lists declarations, .vars [names] lists values, .info [names] lists details, .shapes [names] lists array shapes, .sizes [names] lists array sizes, .stats [names] lists array stats, .load file loads, .load-run file loads/runs. With --trace-assign, top-level assignments run immediately.\n");
+        printf("Commands: . runs, .run [n] [-- args] repeats, .time [n] [-- args] times, .runq [n] [-- args] runs and quits, .quit quits and saves, .quit! quits without saving, .save [file] saves, .saveq [file] saves and quits, .clear clears, .prompt text changes the prompt, .del n[:m] deletes lines, .ins n text inserts, .rep n text replaces, .rename old new renames, .group-decl groups simple declarations, .unused lists unused simple declarations, .undecl names removes declarations, .drop-unused removes unused simple declarations, .list lists, .list -n lists without line numbers, .decl lists declarations, .vars [names] lists values, .info [names] lists details, .shapes [names] lists array shapes, .sizes [names] lists array sizes, .stats [names] lists array stats, .load file loads, .load-run file loads/runs. With --trace-assign, top-level assignments run immediately.\n");
     }
 
     repl_interp = create_repl_interpreter();
@@ -3519,7 +3886,7 @@ static int run_interactive(const char *load_path, int run_after_load) {
             }
         }
 
-        if (is_command(line, ".list")) {
+        if (is_command(line, ".list") || is_command(line, ".list -n")) {
             char *effective = make_effective_source(buf ? buf : "", footer);
             if (!effective) {
                 free(buf);
@@ -3527,8 +3894,100 @@ static int run_interactive(const char *load_path, int run_after_load) {
                 ofort_destroy(repl_interp);
                 return 2;
             }
-            list_source(effective);
+            if (is_command(line, ".list -n")) {
+                list_source_plain(effective);
+            } else {
+                list_source(effective);
+            }
             free(effective);
+            continue;
+        }
+
+        if (is_command(line, ".group-decl")) {
+            if (!group_declarations_in_source(&buf, &len, &cap)) {
+                fprintf(stderr, "failed to group declarations\n");
+                last_rc = 1;
+                continue;
+            }
+            executed_len = 0;
+            ofort_destroy(repl_interp);
+            repl_interp = create_repl_interpreter();
+            if (!repl_interp) {
+                fprintf(stderr, "failed to create Fortran interpreter\n");
+                free(buf);
+                free(footer);
+                return 2;
+            }
+            last_rc = repl_preflight_check_source(buf ? buf : "", footer,
+                                                 source_line_count(buf ? buf : ""));
+            continue;
+        }
+
+        if (is_command(line, ".unused")) {
+            char *effective = make_effective_source(buf ? buf : "", footer);
+            if (!effective) {
+                free(buf);
+                free(footer);
+                ofort_destroy(repl_interp);
+                return 2;
+            }
+            list_unused_declarations_in_source(effective);
+            free(effective);
+            continue;
+        }
+
+        {
+            char *undecl_args[OFORT_MAX_PARAMS];
+            int n_undecl_args = 0;
+            int parsed = repl_named_command_args(line, ".undecl", undecl_args, &n_undecl_args);
+            if (parsed != 0) {
+                if (parsed > 0) {
+                    if (n_undecl_args == 0) {
+                        fprintf(stderr, ".undecl requires one or more names\n");
+                        last_rc = 1;
+                    } else if (!rewrite_declarations_remove_names(&buf, &len, &cap,
+                                                                  undecl_args, n_undecl_args, 0)) {
+                        fprintf(stderr, "failed to remove declarations\n");
+                        last_rc = 1;
+                    } else {
+                        executed_len = 0;
+                        ofort_destroy(repl_interp);
+                        repl_interp = create_repl_interpreter();
+                        if (!repl_interp) {
+                            fprintf(stderr, "failed to create Fortran interpreter\n");
+                            free_split_args(undecl_args, n_undecl_args);
+                            free(buf);
+                            free(footer);
+                            return 2;
+                        }
+                        last_rc = repl_preflight_check_source(buf ? buf : "", footer,
+                                                             source_line_count(buf ? buf : ""));
+                    }
+                    free_split_args(undecl_args, n_undecl_args);
+                } else {
+                    last_rc = 1;
+                }
+                continue;
+            }
+        }
+
+        if (is_command(line, ".drop-unused")) {
+            if (!rewrite_declarations_remove_names(&buf, &len, &cap, NULL, 0, 1)) {
+                fprintf(stderr, "failed to drop unused declarations\n");
+                last_rc = 1;
+                continue;
+            }
+            executed_len = 0;
+            ofort_destroy(repl_interp);
+            repl_interp = create_repl_interpreter();
+            if (!repl_interp) {
+                fprintf(stderr, "failed to create Fortran interpreter\n");
+                free(buf);
+                free(footer);
+                return 2;
+            }
+            last_rc = repl_preflight_check_source(buf ? buf : "", footer,
+                                                 source_line_count(buf ? buf : ""));
             continue;
         }
 
