@@ -88,6 +88,7 @@ typedef enum {
     FTOK_LPAREN, FTOK_RPAREN,
     FTOK_LBRACKET, FTOK_RBRACKET,  /* (/ and /) for array constructors, or [ ] */
     FTOK_COMMA, FTOK_COLON, FTOK_DCOLON, /* :: */
+    FTOK_QUESTION,      /* ? in Fortran 2023 conditional expressions */
     FTOK_PERCENT,       /* % for derived type member access */
     FTOK_NEWLINE,       /* statement separator */
     FTOK_SEMICOLON,     /* ; alternate statement separator */
@@ -173,6 +174,7 @@ typedef enum {
     FND_EQ, FND_NEQ, FND_LT, FND_GT, FND_LE, FND_GE,
     FND_ADD, FND_SUB, FND_MUL, FND_DIV, FND_POWER, FND_NEGATE,
     FND_CONCAT,
+    FND_CONDITIONAL,
     FND_FUNC_CALL, FND_ARRAY_REF, FND_SLICE, FND_MEMBER,
     FND_INT_LIT, FND_REAL_LIT, FND_STRING_LIT,
     FND_LOGICAL_LIT, FND_COMPLEX_LIT,
