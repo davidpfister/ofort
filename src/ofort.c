@@ -2807,6 +2807,7 @@ static void tokenize(OfortInterpreter *I, const char *src) {
             case ']': t->type = FTOK_RBRACKET; break;
             case ',': t->type = FTOK_COMMA; break;
             case ':': t->type = FTOK_COLON; break;
+            case '?': t->type = FTOK_QUESTION; break;
             case '%': t->type = FTOK_PERCENT; break;
             default:
                 ofort_error(I, "Unexpected character '%c' (0x%02x) at line %d", *p, (unsigned char)*p, line);
@@ -2954,6 +2955,7 @@ static const char *token_type_name(OfortTokenType type) {
         case FTOK_COMMA: return "','";
         case FTOK_COLON: return "':'";
         case FTOK_DCOLON: return "'::'";
+        case FTOK_QUESTION: return "'?'";
         case FTOK_PERCENT: return "'%'";
         case FTOK_NEWLINE: return "end of statement";
         case FTOK_SEMICOLON: return "';'";
@@ -4225,8 +4227,28 @@ static OfortNode *parse_eqv(OfortInterpreter *I) {
     return left;
 }
 
+static OfortNode *parse_conditional(OfortInterpreter *I) {
+    OfortNode *cond = parse_eqv(I);
+    if (!expr_at_stop_token(I) && check(I, FTOK_QUESTION)) {
+        OfortToken *q = advance(I);
+        OfortNode *if_true = parse_expr_until_colon(I);
+        OfortNode *if_false;
+        OfortNode *n;
+        expect(I, FTOK_COLON);
+        if_false = parse_expr(I);
+        n = alloc_node(I, FND_CONDITIONAL);
+        n->children[0] = cond;
+        n->children[1] = if_true;
+        n->children[2] = if_false;
+        n->n_children = 3;
+        n->line = q->line;
+        return n;
+    }
+    return cond;
+}
+
 static OfortNode *parse_expr(OfortInterpreter *I) {
-    return parse_eqv(I);
+    return parse_conditional(I);
 }
 
 static OfortNode *parse_expr_until_colon(OfortInterpreter *I) {
@@ -12608,6 +12630,13 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         return make_logical(!val_to_logical(v));
     }
 
+    case FND_CONDITIONAL: {
+        OfortValue cond = eval_node(I, n->children[0]);
+        int take_true = val_to_logical(cond);
+        free_value(&cond);
+        return eval_node(I, n->children[take_true ? 1 : 2]);
+    }
+
     case FND_ADD: case FND_SUB: case FND_MUL: case FND_DIV: case FND_POWER: {
         OfortValue left = eval_node(I, n->children[0]);
         OfortValue right = eval_node(I, n->children[1]);
@@ -15837,6 +15866,21 @@ static int static_expr_type(OfortInterpreter *I, OfortNode *n, OfortValType *typ
         case FND_NEGATE:
         case FND_NOT:
             return static_expr_type(I, n->children[0], type_out);
+        case FND_CONDITIONAL:
+            if (!static_expr_type(I, n->children[1], &left_type) ||
+                !static_expr_type(I, n->children[2], &right_type)) {
+                return 0;
+            }
+            if (left_type == right_type) *type_out = left_type;
+            else if ((left_type == FVAL_REAL || left_type == FVAL_DOUBLE || left_type == FVAL_INTEGER) &&
+                     (right_type == FVAL_REAL || right_type == FVAL_DOUBLE || right_type == FVAL_INTEGER)) {
+                if (left_type == FVAL_DOUBLE || right_type == FVAL_DOUBLE) *type_out = FVAL_DOUBLE;
+                else if (left_type == FVAL_REAL || right_type == FVAL_REAL) *type_out = FVAL_REAL;
+                else *type_out = FVAL_INTEGER;
+            } else {
+                return 0;
+            }
+            return 1;
         case FND_ADD:
         case FND_SUB:
         case FND_MUL:
